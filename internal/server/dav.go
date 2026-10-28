@@ -144,7 +144,7 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request, res reso
 		return
 	}
 	// parse requested props (allprop if empty body / no propfind element)
-	props, err := parsePropfind(r.Body)
+	props, propnames, err := parsePropfind(r.Body)
 	if err != nil {
 		http.Error(w, "bad propfind: "+err.Error(), http.StatusBadRequest)
 		return
@@ -177,7 +177,7 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request, res reso
 		// !svn/bln/<rev> is the baseline collection; !svn/bln/<rev>/<path>
 		// addresses a concrete node inside it.
 		if res.path != "" && res.path != "/" {
-			if err := s.propNode(&b, repo, base, res.repo, rev, path, props, false); err != nil {
+			if err := s.propNode(&b, repo, base, res.repo, rev, path, props, propnames, false); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -192,7 +192,7 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request, res reso
 			}
 		}
 	default:
-		if err := s.propNode(&b, repo, base, res.repo, rev, path, props, false); err != nil {
+		if err := s.propNode(&b, repo, base, res.repo, rev, path, props, propnames, false); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -279,7 +279,7 @@ func (s *Server) propBaselineColl(b *strings.Builder, repo *fs.Repo, base, name 
 }
 
 // propNode writes props for a concrete node (file or dir) at (rev,path).
-func (s *Server) propNode(b *strings.Builder, repo *fs.Repo, base, name string, rev uint64, path string, props []Name, publicHref bool) error {
+func (s *Server) propNode(b *strings.Builder, repo *fs.Repo, base, name string, rev uint64, path string, props []Name, propnames, publicHref bool) error {
 	nr, err := repo.Resolve(rev, path)
 	if err != nil {
 		if errors.Is(err, fs.ErrPathNotFound) {
@@ -291,6 +291,26 @@ func (s *Server) propNode(b *strings.Builder, repo *fs.Repo, base, name string, 
 			return nil
 		}
 		return err
+	}
+	if propnames {
+		// svn proplist: emit property names only (empty elements), excluding
+		// the internal svn:entry so the client shows user props (svn:mime-type).
+		b.WriteString("  <D:response>\n")
+		b.WriteString("    <D:href>" + base + privateHref(rev, path) + "</D:href>\n")
+		b.WriteString("    <D:propstat>\n      <D:prop>\n")
+		b.WriteString("      <D:resourcetype/>\n")
+		b.WriteString("      <D:getetag/>\n")
+		b.WriteString("      <D:version-name/>\n")
+		b.WriteString("      <D:creator-displayname/>\n")
+		for k := range nr.Props {
+			if strings.HasPrefix(k, "svn:") && k != "svn:date" && k != "svn:author" {
+				local := strings.TrimPrefix(k, "svn:")
+				b.WriteString("      <" + local + ` xmlns="svn:"/>` + "\n")
+			}
+		}
+		b.WriteString("      </D:prop>\n      <D:status>HTTP/1.1 200 OK</D:status>\n    </D:propstat>\n")
+		b.WriteString("  </D:response>\n")
+		return nil
 	}
 	href := base + privateHref(rev, path)
 	if publicHref {
@@ -317,6 +337,12 @@ func (s *Server) propNode(b *strings.Builder, repo *fs.Repo, base, name string, 
 	b.WriteString("      <S:baseline-relative-path>" + escapePath(strings.TrimPrefix(path, "/")) + "</S:baseline-relative-path>\n")
 	b.WriteString("      <D:creator-displayname>" + propVal(nr.Props, "svn:author") + "</D:creator-displayname>\n")
 	writeSvnEntryProps(b, nr, rev, path)
+	for k, v := range nr.Props {
+		if strings.HasPrefix(k, "svn:") && k != "svn:date" && k != "svn:author" {
+			local := strings.TrimPrefix(k, "svn:")
+			b.WriteString("      <" + local + ` xmlns="svn:">` + xmlEscape(v) + "</" + local + ">\n")
+		}
+	}
 	if nr.Kind == fs.KindFile {
 		text, err := repo.GetText(nr.Node)
 		if err != nil {
@@ -328,7 +354,8 @@ func (s *Server) propNode(b *strings.Builder, repo *fs.Repo, base, name string, 
 			mime = "text/plain"
 		}
 		b.WriteString("      <D:getcontenttype>" + mime + "</D:getcontenttype>\n")
-		b.WriteString("      <svn:size>" + strconv.Itoa(len(text)) + "</svn:size>\n")
+		// svn:size is delivered via update-report (S:size), not propfind:
+		// exposing it here makes svn proplist list it as a user property.
 	} else {
 		children, err := repo.ListDir(rev, path)
 		if err == nil {
@@ -355,7 +382,7 @@ func (s *Server) propChildren(b *strings.Builder, repo *fs.Repo, base, name stri
 	}
 	for _, c := range children {
 		cpath := path + "/" + c.Name
-		if err := s.propNode(b, repo, base, name, rev, cpath, props, true); err != nil {
+		if err := s.propNode(b, repo, base, name, rev, cpath, props, false, true); err != nil {
 			return err
 		}
 		if depth == "infinity" {
@@ -372,22 +399,26 @@ func (s *Server) propChildren(b *strings.Builder, repo *fs.Repo, base, name stri
 
 // --- propfind request parsing ---
 
-func parsePropfind(body io.Reader) ([]Name, error) {
+func parsePropfind(body io.Reader) ([]Name, bool, error) {
 	data, err := io.ReadAll(io.LimitReader(body, 1<<20))
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if len(strings.TrimSpace(string(data))) == 0 {
-		return nil, nil // allprop default
+		return nil, false, nil // allprop default
+	}
+	// propnames: list property names only (svn proplist).
+	if strings.Contains(string(data), "<propnames") || strings.Contains(string(data), "<D:propnames") {
+		return nil, true, nil
 	}
 	var top struct {
 		XMLName xml.Name
 		Inner   string `xml:",innerxml"`
 	}
 	if err := xml.Unmarshal(data, &top); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	// Look for <D:prop> children; if none, it's allprop/propname.
+	// Look for <D:prop> children; if none, it's allprop.
 	var props []Name
 	dec := xml.NewDecoder(strings.NewReader(top.Inner))
 	for {
@@ -399,7 +430,7 @@ func parsePropfind(body io.Reader) ([]Name, error) {
 			props = append(props, Name{NS: se.Name.Space, Local: se.Name.Local})
 		}
 	}
-	return props, nil
+	return props, false, nil
 }
 
 // --- misc helpers ---
@@ -450,7 +481,7 @@ func writeSvnEntryProps(b *strings.Builder, nr *fs.NodeRev, rev uint64, path str
 	if nr.Kind == fs.KindDir {
 		kind = "dir"
 	}
-	b.WriteString("      <svn:entry rev=\"" + strconv.FormatUint(rev, 10) + "\" kind=\"" + kind + "\" >\n")
+	b.WriteString("      <svn:entry rev=\"" + strconv.FormatUint(rev, 10) + "\" kind=\"" + kind + "\">\n")
 	b.WriteString("        <svn:node-kind>" + kind + "</svn:node-kind>\n")
 	b.WriteString("        <svn:path>" + xmlEscape(path) + "</svn:path>\n")
 	if nr.CopyFrom != nil {

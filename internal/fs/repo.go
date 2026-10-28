@@ -493,6 +493,17 @@ func (r *Repo) applyChange(root *tnode, ch *Change) error {
 				t.baseText = old.data
 				t.copyFrom = old.copyFrom
 				t.copyFromPath = old.copyFromPath
+				// A props-only change (PROPPATCH) carries no new text; keep the
+				// base revision's content so the commit does not empty the file.
+				if len(t.data) == 0 {
+					t.data = append([]byte(nil), old.data...)
+				}
+				// A content-only change (PUT with no PROPPATCH) carries no
+				// props; keep the base revision's props so svn:mime-type etc
+				// survive a subsequent content edit.
+				if len(ch.Props) == 0 {
+					t.props = copyProps(old.props)
+				}
 			}
 			parent.children[name] = t
 		} else {
@@ -507,6 +518,9 @@ func (r *Repo) applyChange(root *tnode, ch *Change) error {
 				t.copyFromPath = old.copyFromPath
 				for n, c := range old.children {
 					t.children[n] = c
+				}
+				if len(ch.Props) == 0 {
+					t.props = copyProps(old.props)
 				}
 			}
 			parent.children[name] = t

@@ -242,6 +242,17 @@ func (s *Server) handleProppatch(w http.ResponseWriter, r *http.Request, res res
 			return
 		}
 		ch := tx.changeFor(res.path)
+		// A node-property PROPPATCH may be the only change to this path (no
+		// PUT/MKCOL); inherit its kind from the base revision so the commit
+		// stores a file/dir rather than a zero-kind node (which would commit
+		// the file as a directory).
+		if ch.kind == 0 && tx.baseRev > 0 {
+			if r2, ok2 := s.openRepoOnly(w, res.repo); ok2 {
+				if nr, err := r2.Resolve(tx.baseRev, res.path); err == nil {
+					ch.kind = nr.Kind
+				}
+			}
+		}
 		if ch.props == nil {
 			ch.props = map[string]string{}
 		}
