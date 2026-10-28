@@ -51,7 +51,7 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request, res resour
 	case "file-revs-report", "get-file-revs-report", "get-file-revs":
 		s.reportFileRevs(w, repo, base, res.path, body)
 	case "get-locations", "get-locations-segments":
-		s.notImpl(w, "REPORT "+root.XMLName.Local)
+		s.reportGetLocations(w, repo, base, res.path, body)
 	default:
 		http.Error(w, "unsupported REPORT: "+root.XMLName.Local, http.StatusBadRequest)
 	}
@@ -107,6 +107,31 @@ func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name s
 		http.Error(w, "target revision does not exist", http.StatusBadRequest)
 		return
 	}
+	// Client's WC baseline revision comes from <S:entry rev="N"> (svn diff), or
+	// <S:revision>; used so the txdelta is sent as a delta from the baseline
+	// revision's text rather than an empty base.
+	var baseRev uint64
+	if e, ok := root.child("entry"); ok {
+		if v := e.attr("rev"); v != "" {
+			if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+				baseRev = n
+			}
+		}
+	}
+	if baseRev == 0 {
+		if br, ok := root.child("revision"); ok {
+			v := br.attr("rev")
+			if v == "" {
+				v = strings.TrimSpace(br.Content)
+			}
+			if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+				baseRev = n
+			}
+		}
+	}
+	if baseRev > head {
+		baseRev = 0
+	}
 	// src path (the checkout root inside the repo)
 	rootPath := "/"
 	if sp, ok := root.child("src-path"); ok {
@@ -119,7 +144,7 @@ func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name s
 	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
 	b.WriteString(`<S:update-report xmlns:S="svn:" xmlns:D="` + NS_DAV + `">` + "\n")
 	b.WriteString("  <S:target-revision rev=\"" + strconv.FormatUint(rev, 10) + "\"/>\n")
-	if err := s.updateWalkDir(&b, repo, base, rev, rootPath, "open-directory", true); err != nil {
+	if err := s.updateWalkDir(&b, repo, base, rev, baseRev, rootPath, "open-directory", true); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -150,8 +175,10 @@ func writeEntryProps(b *strings.Builder, repo *fs.Repo, rev uint64) {
 }
 
 // updateWalkDir emits a directory node and its children (add-directory /
-// add-file with fulltext txdelta), walking the whole subtree at rev.
-func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, rev uint64, path, openEl string, wrap bool) error {
+// add-file with fulltext txdelta), walking the whole subtree at rev. baseRev
+// is the client's WC baseline revision (from <S:revision>); when > 0 the file
+// txdelta is sent as a delta from the baseline revision's text (svn diff).
+func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, rev uint64, baseRev uint64, path, openEl string, wrap bool) error {
 	if wrap {
 		b.WriteString("  <S:" + openEl + " rev=\"" + strconv.FormatUint(rev, 10) + "\">\n")
 	}
@@ -170,7 +197,7 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 			b.WriteString("      <D:checked-in><D:href>" + xmlEscape(bc) + "</D:href></D:checked-in>\n")
 			writeEntryProps(b, repo, rev)
 			writeNodeProps(b, c.Props)
-			if err := s.updateWalkDir(b, repo, base, rev, cpath, "add-directory", false); err != nil {
+			if err := s.updateWalkDir(b, repo, base, rev, baseRev, cpath, "add-directory", false); err != nil {
 				return err
 			}
 			b.WriteString("    </S:add-directory>\n")
@@ -188,7 +215,15 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 				return err
 			}
 			writeNodeProps(b, nr.Props)
-			delta, err := svndiff.Encode(nil, text)
+			var baseText []byte
+			if baseRev > 0 && baseRev != rev {
+				if bnr, berr := repo.Resolve(baseRev, cpath); berr == nil && bnr.Kind == fs.KindFile {
+					if bt, gerr := repo.GetText(bnr.Node); gerr == nil {
+						baseText = bt
+					}
+				}
+			}
+			delta, err := svndiff.Encode(baseText, text)
 			if err != nil {
 				return err
 			}
@@ -597,6 +632,69 @@ func (s *Server) reportFileRevs(w http.ResponseWriter, repo *fs.Repo, base, urlP
 		b.WriteString("  </S:file-rev>\n")
 	}
 	b.WriteString("</S:file-revs-report>\n")
+	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+	fmt.Fprint(w, b.String())
+}
+
+// reportGetLocations answers a get-locations REPORT: the repos path lineage of
+// resPath between location-revision and peg-revision. svn diff uses it to
+// locate a path at an older revision (rename tracking). Without copies the
+// path is constant; a copy point switches the lineage to its copy source.
+func (s *Server) reportGetLocations(w http.ResponseWriter, repo *fs.Repo, base string, resPath string, body []byte) {
+	var root xmlEl
+	if err := xml.Unmarshal(body, &root); err != nil {
+		http.Error(w, "bad get-locations", http.StatusBadRequest)
+		return
+	}
+	path := resPath
+	if sp, ok := root.child("path"); ok && strings.TrimSpace(sp.Content) != "" {
+		path = strings.TrimSpace(sp.Content)
+	}
+	head, err := repo.Head()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	peg := head
+	if pr, ok := root.child("peg-revision"); ok {
+		if n, err := strconv.ParseUint(strings.TrimSpace(pr.Content), 10, 64); err == nil {
+			peg = n
+		}
+	}
+	loc := peg
+	if lr, ok := root.child("location-revision"); ok {
+		if n, err := strconv.ParseUint(strings.TrimSpace(lr.Content), 10, 64); err == nil {
+			loc = n
+		}
+	}
+	if loc > peg {
+		loc, peg = peg, loc
+	}
+	// Build the lineage: the path as it existed at each revision from peg down
+	// to loc, following copyFrom sources at copy points.
+	lineage := map[uint64]string{}
+	cur := path
+	for rev := peg; rev >= loc && rev >= 1; rev-- {
+		lineage[rev] = cur
+		if nr, err := repo.Resolve(rev, cur); err == nil && nr.CopyFrom != nil {
+			if nr.CopyFrom.Rev < rev && nr.CopyFromPath != "" {
+				cur = nr.CopyFromPath
+			}
+		} else if err != nil {
+			break
+		}
+	}
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
+	b.WriteString(`<S:get-locations-report xmlns:S="svn:" xmlns:D="` + NS_DAV + `">` + "\n")
+	for rev := loc; rev <= peg; rev++ {
+		p, ok := lineage[rev]
+		if !ok {
+			p = path
+		}
+		b.WriteString(`  <S:location path="` + xmlEscape(p) + `" rev="` + strconv.FormatUint(rev, 10) + `"/>` + "\n")
+	}
+	b.WriteString("</S:get-locations-report>\n")
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 	fmt.Fprint(w, b.String())
 }
