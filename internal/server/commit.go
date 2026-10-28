@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"svngod/internal/fs"
 	"svngod/internal/svndiff"
@@ -111,8 +112,16 @@ func (s *Server) handleCheckout(w http.ResponseWriter, r *http.Request, res reso
 	tx := a.txn
 	s.mu.Unlock()
 
-	// Return the working resource root for this transaction.
-	w.Header().Set("Location", s.absURL(r, res.repo, "/!svn/txn/"+tx.id+"/"))
+	// Return the working resource for this transaction: the checked-out
+	// resource path (e.g. CHECKOUT bln/1/hello.txt -> txn/<id>/hello.txt),
+	// or the txn root when checking out the VCC / whole baseline.
+	target := "/!svn/txn/" + tx.id
+	if res.path != "" && res.path != "/" {
+		target += res.path
+	} else {
+		target += "/"
+	}
+	w.Header().Set("Location", s.absURL(r, res.repo, target))
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 	w.WriteHeader(http.StatusCreated)
 	fmt.Fprintf(w, `<?xml version="1.0" encoding="utf-8"?><D:checkout-response xmlns:D="%s"></D:checkout-response>`, NS_DAV)
@@ -339,7 +348,30 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 	}
 	ch := tx.changeFor(res.path)
 	ch.kind = fs.KindFile
-	if strings.Contains(r.Header.Get("Content-Type"), "svndiff") {
+	// Existing file at the base revision => this PUT modifies it (204);
+	// otherwise it creates it (201).
+	isNew := true
+	if tx.baseRev > 0 {
+		if repo, rok := s.openRepoOnly(w, res.repo); rok {
+			if nr, err := repo.Resolve(tx.baseRev, res.path); err == nil && nr.Kind == fs.KindFile {
+				isNew = false
+				if strings.Contains(r.Header.Get("Content-Type"), "svndiff") {
+					if b, err := repo.GetText(nr.Node); err == nil {
+						// A modifying PUT carries an svndiff delta based on
+						// the checked-out revision of this path.
+						decoded, derr := svndiff.Apply(b, data)
+						if derr != nil {
+							s.mu.Unlock()
+							http.Error(w, "svndiff decode: "+derr.Error(), http.StatusBadRequest)
+							return
+						}
+						data = decoded
+					}
+				}
+			}
+		}
+	}
+	if isNew && strings.Contains(r.Header.Get("Content-Type"), "svndiff") {
 		decoded, derr := svndiff.Apply(nil, data)
 		if derr != nil {
 			s.mu.Unlock()
@@ -354,7 +386,11 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 	}
 	s.mu.Unlock()
 	w.Header().Set("Location", s.absURL(r, res.repo, "/!svn/txn/"+tx.id+res.path))
-	w.WriteHeader(http.StatusCreated)
+	if isNew {
+		w.WriteHeader(http.StatusCreated)
+	} else {
+		w.WriteHeader(http.StatusNoContent)
+	}
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, res resource) {
@@ -434,6 +470,21 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 	tx := a.txn
 	changes := collectChanges(repo, tx)
 	revProps := a.revProps
+	if revProps == nil {
+		revProps = map[string]string{}
+	}
+	// Server-side revision properties: svn:author (the authenticated user)
+	// and svn:date (commit time). The client supplies svn:log via PROPPATCH.
+	if revProps["svn:author"] == "" {
+		if ident := IdentityFrom(r.Context()); ident.Username != "" {
+			revProps["svn:author"] = ident.Username
+		} else {
+			revProps["svn:author"] = "anonymous"
+		}
+	}
+	if revProps["svn:date"] == "" {
+		revProps["svn:date"] = time.Now().UTC().Format("2006-01-02T15:04:05.000000Z")
+	}
 	// stop tracking
 	delete(s.activities, actID)
 	delete(s.txns, tx.id)

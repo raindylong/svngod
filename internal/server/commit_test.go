@@ -42,9 +42,9 @@ func commitRequest(t *testing.T, base, repo, uuid string) {
 	txnRoot := strings.TrimSuffix(loc, "/")
 
 
-	// 4. PUT a modified file
+	// 4. PUT a modified file (returns 204; the path exists at the base rev)
 	resp = doRequest(t, "PUT", txnRoot+"/trunk/README.txt", "hello svn v2\n", "", "", nil)
-	if resp.StatusCode != http.StatusCreated {
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("PUT status=%d", resp.StatusCode)
 	}
 	resp.Body.Close()

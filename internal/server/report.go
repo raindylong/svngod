@@ -271,7 +271,14 @@ func (s *Server) reportLog(w http.ResponseWriter, repo *fs.Repo, base string, bo
 	for _, c := range root.Children {
 		if c.XMLName.Local == "revprop" {
 			anyRevprop = true
-			if n := c.attr("name"); n != "" {
+			// The client names the requested revision property in the element
+			// content (e.g. <S:revprop>svn:author</S:revprop>); tolerate an
+			// attribute form as well.
+			n := c.attr("name")
+			if n == "" {
+				n = strings.TrimSpace(c.Content)
+			}
+			if n != "" {
 				requested[n] = true
 			}
 		}

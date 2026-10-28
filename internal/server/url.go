@@ -87,6 +87,9 @@ func parseResource(basePath, reqPath string) resource {
 		if len(priv) >= 2 {
 			rev, err := strconv.ParseUint(priv[1], 10, 64)
 			if err == nil {
+				if len(priv) >= 3 {
+					return resource{typ: resBaseline, repo: repo, rev: rev, path: "/" + strings.Join(priv[2:], "/")}
+				}
 				return resource{typ: resBaseline, repo: repo, rev: rev}
 			}
 		}
