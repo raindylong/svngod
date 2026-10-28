@@ -453,6 +453,15 @@ func (r *Repo) CommitTxn(changes []Change, revProps map[string]string) (uint64, 
 	}
 	// invalidate cached HEAD-dependent state
 	r.cache.Clear()
+	// Auto-pack the just-completed shard: when N is the last revision of a
+	// shard, its predecessor shard is complete and gets packed. This keeps the
+	// repository at ~O(shards) loose objects instead of O(revisions) — required
+	// to scale to millions of revisions.
+	if N > 0 && N%r.shardSz == 0 {
+		if err := r.PackShard(r.shard(N) - 1); err != nil {
+			return N, err
+		}
+	}
 	return N, nil
 }
 
