@@ -336,7 +336,10 @@ func (s *Server) propNode(b *strings.Builder, repo *fs.Repo, base, name string, 
 	b.WriteString("      <D:checked-in><D:href>" + base + "!svn/bln/" + strconv.FormatUint(rev, 10) + "/" + escapePath(strings.TrimPrefix(path, "/")) + "</D:href></D:checked-in>\n")
 	b.WriteString("      <S:baseline-relative-path>" + escapePath(strings.TrimPrefix(path, "/")) + "</S:baseline-relative-path>\n")
 	b.WriteString("      <D:creator-displayname>" + propVal(nr.Props, "svn:author") + "</D:creator-displayname>\n")
-	writeSvnEntryProps(b, nr, rev, path)
+	// svn:entry is a DAV-internal property; emitting it in a propfind makes
+	// `svn proplist` list it as a user property. update-report already delivers
+	// committed-rev/date/author via S:set-prop, so it is not needed here.
+	// writeSvnEntryProps(b, nr, rev, path)
 	for k, v := range nr.Props {
 		if strings.HasPrefix(k, "svn:") && k != "svn:date" && k != "svn:author" {
 			local := strings.TrimPrefix(k, "svn:")
