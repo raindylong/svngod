@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strconv"
@@ -35,6 +36,7 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request, res resour
 	}
 	var root xmlEl
 	if err := xml.Unmarshal(body, &root); err != nil {
+		log.Printf("REPORT bad XML body=%q err=%v", string(body), err)
 		http.Error(w, "bad REPORT XML: "+err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -46,6 +48,8 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request, res resour
 		s.reportLog(w, repo, base, body)
 	case "list-report":
 		s.reportList(w, repo, base, res.repo, body)
+	case "file-revs-report", "get-file-revs-report", "get-file-revs":
+		s.reportFileRevs(w, repo, base, res.path, body)
 	case "get-locations", "get-locations-segments":
 		s.notImpl(w, "REPORT "+root.XMLName.Local)
 	default:
@@ -519,4 +523,80 @@ func (s *Server) reportList(w http.ResponseWriter, repo *fs.Repo, base, name str
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	io.WriteString(w, b.String())
+}
+
+// --- get-file-revs (svn blame) ---
+
+func (s *Server) reportFileRevs(w http.ResponseWriter, repo *fs.Repo, base, urlPath string, body []byte) {
+	var root xmlEl
+	if err := xml.Unmarshal(body, &root); err != nil {
+		http.Error(w, "bad get-file-revs", http.StatusBadRequest)
+		return
+	}
+	// The client leaves <S:path> empty and addresses the file through the
+	// REPORT URL (e.g. !svn/bln/2/hello.txt); use that path here.
+	path := urlPath
+	if c, ok := root.child("path"); ok && strings.TrimSpace(c.Content) != "" {
+		path = "/" + strings.Trim(strings.TrimSpace(c.Content), "/")
+	}
+	head, _ := repo.Head()
+	start, end := head, uint64(1)
+	if v, ok := root.child("start-revision"); ok {
+		if n, err := strconv.ParseUint(strings.TrimSpace(v.Content), 10, 64); err == nil && n <= head {
+			start = n
+		}
+	}
+	if v, ok := root.child("end-revision"); ok {
+		if n, err := strconv.ParseUint(strings.TrimSpace(v.Content), 10, 64); err == nil && n >= 1 {
+			end = n
+		}
+	}
+	lo, hi := start, end
+	if lo > hi {
+		lo, hi = hi, lo
+	}
+	// Collect ascending (oldest first) revisions where the file exists.
+	type fr struct {
+		rev  uint64
+		text []byte
+	}
+	var revs []fr
+	for r := lo; r <= hi; r++ {
+		nr, err := repo.Resolve(r, path)
+		if err != nil || nr.Kind != fs.KindFile {
+			continue
+		}
+		text, _ := repo.GetText(nr.Node)
+		revs = append(revs, fr{rev: r, text: text})
+	}
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
+	b.WriteString(`<S:file-revs-report xmlns:S="svn:" xmlns:D="` + NS_DAV + `">` + "\n")
+	// Emit oldest-first (forwards blame); each delta rebuilds this revision
+	// from the previous (older) one: base=older text -> this text.
+	for i := 0; i < len(revs); i++ {
+		cur := revs[i]
+		var delta []byte
+		if i > 0 {
+			delta, _ = svndiff.Encode(revs[i-1].text, cur.text)
+		} else {
+			delta, _ = svndiff.Encode(nil, cur.text)
+		}
+		rp, _ := repo.GetRevProps(cur.rev)
+		auth := ""
+		if rp != nil {
+			auth = rp.Props["svn:author"]
+		}
+		b.WriteString("  <S:file-rev path=\"" + xmlEscape(path) + "\" rev=\"" + strconv.FormatUint(cur.rev, 10) + "\">\n")
+		if auth != "" {
+			b.WriteString("    <S:rev-prop name=\"svn:author\">" + xmlEscape(auth) + "</S:rev-prop>\n")
+		}
+		if len(delta) > 0 {
+			b.WriteString("    <S:txdelta>" + base64.StdEncoding.EncodeToString(delta) + "</S:txdelta>\n")
+		}
+		b.WriteString("  </S:file-rev>\n")
+	}
+	b.WriteString("</S:file-revs-report>\n")
+	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+	fmt.Fprint(w, b.String())
 }

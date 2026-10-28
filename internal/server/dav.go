@@ -174,12 +174,21 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request, res reso
 	case resRoot:
 		s.propRoot(&b, repo, base, res.repo, rev, path, props)
 	case resBaseline:
-		s.propBaselineColl(&b, repo, base, res.repo, rev, props)
-		// depth 1/infinity: list the baseline's root directory children.
-		if depth == "1" || depth == "infinity" {
-			if err := s.propChildren(&b, repo, base, res.repo, rev, "/", props, depth); err != nil {
+		// !svn/bln/<rev> is the baseline collection; !svn/bln/<rev>/<path>
+		// addresses a concrete node inside it.
+		if res.path != "" && res.path != "/" {
+			if err := s.propNode(&b, repo, base, res.repo, rev, path, props, false); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
+			}
+		} else {
+			s.propBaselineColl(&b, repo, base, res.repo, rev, props)
+			// depth 1/infinity: list the baseline's root directory children.
+			if depth == "1" || depth == "infinity" {
+				if err := s.propChildren(&b, repo, base, res.repo, rev, "/", props, depth); err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
 			}
 		}
 	default:
@@ -304,7 +313,7 @@ func (s *Server) propNode(b *strings.Builder, repo *fs.Repo, base, name string, 
 	b.WriteString("      <D:getetag>" + etagFor(nr) + "</D:getetag>\n")
 	b.WriteString("      <D:version-controlled-configuration><D:href>" + base + "!svn/vcc/default</D:href></D:version-controlled-configuration>\n")
 	b.WriteString("      <D:version-name>" + strconv.FormatUint(rev, 10) + "</D:version-name>\n")
-	b.WriteString("      <D:checked-in><D:href>" + base + "!svn/bln/" + strconv.FormatUint(rev, 10) + "</D:href></D:checked-in>\n")
+	b.WriteString("      <D:checked-in><D:href>" + base + "!svn/bln/" + strconv.FormatUint(rev, 10) + "/" + escapePath(strings.TrimPrefix(path, "/")) + "</D:href></D:checked-in>\n")
 	b.WriteString("      <S:baseline-relative-path>" + escapePath(strings.TrimPrefix(path, "/")) + "</S:baseline-relative-path>\n")
 	b.WriteString("      <D:creator-displayname>" + propVal(nr.Props, "svn:author") + "</D:creator-displayname>\n")
 	writeSvnEntryProps(b, nr, rev, path)
