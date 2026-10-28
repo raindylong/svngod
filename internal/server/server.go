@@ -92,18 +92,6 @@ func (s *Server) Handler() http.Handler {
 
 // route is the top-level dispatcher: auth, then per-method handling.
 func (s *Server) route(w http.ResponseWriter, r *http.Request) {
-	if s.cfg.Logger != nil {
-		hasAuth := r.Header.Get("Authorization") != ""
-		if r.Method == http.MethodOptions {
-			s.cfg.Logger.Printf("RAW %s %s auth=%v svn-caps=%q user-agent=%q accept=%q",
-				r.Method, r.URL.Path, hasAuth,
-				r.Header.Get("SVN-Client-Capabilities"),
-				r.Header.Get("User-Agent"),
-				r.Header.Get("Accept"))
-		} else {
-			s.cfg.Logger.Printf("RAW %s %s auth=%v", r.Method, r.URL.Path, hasAuth)
-		}
-	}
 	ctx := r.Context()
 	ident, ok := s.authenticate(w, r)
 	if !ok {
