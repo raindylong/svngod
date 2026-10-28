@@ -24,19 +24,58 @@ type Config struct {
 	// "/svn" or "". A repo "demo" is then reachable at BasePath+"/demo/".
 	BasePath string
 
-	// Authenticate is the credential chain (LDAP then local table, or custom).
+	// Global defaults; a per-repo RepoConfig may override any of these.
 	Authenticate *auth.Chain
+	Authorize    *authz.Config
+	OpenRepo     RepoOpener
 
-	// Authorize is the parsed authz file; nil means allow all authenticated
-	// operations (still requires a user for write unless a password file is
-	// absent).
-	Authorize *authz.Config
-
-	// OpenRepo returns a repository by name, or an error if it does not exist.
-	OpenRepo RepoOpener
+	// Repos holds per-repository overrides so distinct repositories can use
+	// different backends (File/S3), different authz files and different auth
+	// chains (e.g. one LDAP server per repo). A repo not listed here uses the
+	// global defaults.
+	Repos []*RepoConfig
 
 	// Logger for request logging; nil disables.
 	Logger *log.Logger
+}
+
+// RepoConfig overrides storage, authorization and authentication for a single
+// repository. Leaving a field nil falls back to the global Config value.
+type RepoConfig struct {
+	Name         string
+	Authenticate *auth.Chain
+	Authorize    *authz.Config
+	OpenRepo     RepoOpener
+}
+
+func (c *Config) repoCfg(name string) *RepoConfig {
+	for i := range c.Repos {
+		if c.Repos[i].Name == name {
+			return c.Repos[i]
+		}
+	}
+	return nil
+}
+
+func (c *Config) authFor(name string) *auth.Chain {
+	if rc := c.repoCfg(name); rc != nil && rc.Authenticate != nil {
+		return rc.Authenticate
+	}
+	return c.Authenticate
+}
+
+func (c *Config) authzFor(name string) *authz.Config {
+	if rc := c.repoCfg(name); rc != nil && rc.Authorize != nil {
+		return rc.Authorize
+	}
+	return c.Authorize
+}
+
+func (c *Config) openerFor(name string) RepoOpener {
+	if rc := c.repoCfg(name); rc != nil && rc.OpenRepo != nil {
+		return rc.OpenRepo
+	}
+	return c.OpenRepo
 }
 
 // Server is the WebDAV/DeltaV HTTP handler for svngod.
@@ -93,18 +132,18 @@ func (s *Server) Handler() http.Handler {
 // route is the top-level dispatcher: auth, then per-method handling.
 func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	ident, ok := s.authenticate(w, r)
+	res := parseResource(s.cfg.BasePath, r.URL.Path)
+
+	ident, ok := s.authenticate(w, r, res.repo)
 	if !ok {
 		return // 401 already written
 	}
 	ctx = context.WithValue(ctx, identityKey{}, ident)
 	r = r.WithContext(ctx)
 
-	res := parseResource(s.cfg.BasePath, r.URL.Path)
-
 	// Authorize: for methods that mutate, require write to the resource path.
 	if !s.authorized(ident.Username, res, r.Method) {
-		if ident.Username == "" && s.cfg.Authenticate != nil {
+		if ident.Username == "" && s.cfg.authFor(res.repo) != nil {
 			// Anonymous was denied: challenge for credentials so the SVN
 			// client retries with Basic auth, instead of a 403 it cannot
 			// recover from. ($anonymous-allowed reads never reach here.)
@@ -159,23 +198,26 @@ var writeMethods = map[string]bool{
 	"MOVE": true, "LOCK": true, "UNLOCK": true,
 }
 
-// authorized applies the authz file (if configured) to the request.
+// authorized applies the authz file (if configured) to the request, honoring
+// a per-repository override.
 func (s *Server) authorized(user string, res resource, method string) bool {
-	if s.cfg.Authorize == nil {
+	az := s.cfg.authzFor(res.repo)
+	if az == nil {
 		return true
 	}
-	repo := res.repo
 	path := res.path
 	if path == "" {
 		path = "/"
 	}
 	write := writeMethods[method]
-	return s.cfg.Authorize.Authorize(user, repo, path, write)
+	return az.Authorize(user, res.repo, path, write)
 }
 
-// authenticate parses Basic credentials and runs the auth chain.
-func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (auth.Identity, bool) {
-	if s.cfg.Authenticate == nil {
+// authenticate parses Basic credentials and runs the auth chain selected for
+// the target repository (per-repo override or global).
+func (s *Server) authenticate(w http.ResponseWriter, r *http.Request, repo string) (auth.Identity, bool) {
+	chain := s.cfg.authFor(repo)
+	if chain == nil {
 		return auth.Identity{Username: ""}, true // no auth configured: anonymous
 	}
 	h := r.Header.Get("Authorization")
@@ -195,7 +237,7 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (auth.Iden
 	if !ok {
 		return auth.Identity{}, s.unauthorized(w)
 	}
-	id, err := s.cfg.Authenticate.Authenticate(r.Context(), user, pass)
+	id, err := chain.Authenticate(r.Context(), user, pass)
 	if err != nil {
 		return auth.Identity{}, s.unauthorized(w)
 	}
@@ -211,11 +253,12 @@ func (s *Server) unauthorized(w http.ResponseWriter) bool {
 // --- helpers ---
 
 func (s *Server) repo(w http.ResponseWriter, res resource) (*fs.Repo, bool) {
-	if s.cfg.OpenRepo == nil {
+	opener := s.cfg.openerFor(res.repo)
+	if opener == nil {
 		http.Error(w, "no repositories configured", http.StatusInternalServerError)
 		return nil, false
 	}
-	r, err := s.cfg.OpenRepo(res.repo)
+	r, err := opener(res.repo)
 	if err != nil {
 		if errors.Is(err, fs.ErrRepoNotFound) {
 			http.NotFound(w, nil)

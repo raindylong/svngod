@@ -118,7 +118,14 @@ func main() {
 	fl.StringVar(&o.bucket, "bucket", "", "S3 bucket")
 	fl.StringVar(&o.prefix, "prefix", "", "S3 repo prefix")
 	fl.BoolVar(&o.useSSL, "ssl", false, "use https for S3")
+	var configPath string
+	fl.StringVar(&configPath, "config", "", "JSON config file (multi-repo; overrides flags)")
 	_ = fl.Parse(os.Args[1:])
+
+	if configPath != "" {
+		runMultiRepo(configPath)
+		return
+	}
 
 	if o.repoRoot == "" {
 		log.Fatal("--repo-root required")
@@ -157,6 +164,32 @@ func main() {
 
 	log.Printf("svngod listening on %s (base %s, repo-root %s)", o.addr, o.basePath, o.repoRoot)
 	if err := http.ListenAndServe(o.addr, srv.Handler()); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// runMultiRepo starts a server configured from a JSON file with one or more
+// repositories, each with its own storage backend, authz file and auth chain.
+func runMultiRepo(configPath string) {
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		log.Fatalf("load config: %v", err)
+	}
+	repos, err := cfg.repoConfigs()
+	if err != nil {
+		log.Fatalf("build repos: %v", err)
+	}
+	addr := cfg.Addr
+	if addr == "" {
+		addr = ":8080"
+	}
+	srv := server.New(server.Config{
+		BasePath: cfg.BasePath,
+		Repos:    repos,
+		Logger:   log.New(os.Stderr, "svngod ", log.LstdFlags),
+	})
+	log.Printf("svngod listening on %s (base %s, %d repos)", addr, cfg.BasePath, len(repos))
+	if err := http.ListenAndServe(addr, srv.Handler()); err != nil {
 		log.Fatal(err)
 	}
 }

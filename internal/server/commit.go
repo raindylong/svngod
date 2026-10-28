@@ -158,7 +158,12 @@ func extractActivityFromBody(r *http.Request) string {
 }
 
 func (s *Server) openRepoOnly(w http.ResponseWriter, name string) (*fs.Repo, bool) {
-	r, err := s.cfg.OpenRepo(name)
+	opener := s.cfg.openerFor(name)
+	if opener == nil {
+		http.Error(w, "no repositories configured", http.StatusInternalServerError)
+		return nil, false
+	}
+	r, err := opener(name)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return nil, false
@@ -453,8 +458,10 @@ func (s *Server) handleMkcol(w http.ResponseWriter, r *http.Request, res resourc
 // --- MERGE (finalize the commit) ---
 
 func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resource) {
-	if res.typ != resVcc && res.typ != resRoot {
-		http.Error(w, "MERGE must target the version-controlled configuration", http.StatusBadRequest)
+	// The client MERGEs to the shallowest modified path (repo root, a subdir,
+	// or the VCC); the whole transaction is committed regardless of target.
+	if res.typ != resVcc && res.typ != resRoot && res.typ != resPublic {
+		http.Error(w, "MERGE must target a version-controlled resource", http.StatusBadRequest)
 		return
 	}
 	repo, ok := s.repo(w, res)
