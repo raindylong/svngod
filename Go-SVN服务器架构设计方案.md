@@ -25,4 +25,10 @@
 - 前置决定性修复（git 7cbd916）：**懒加载增量提交**——CommitTxn 不再递归加载整棵 HEAD 树，只沿变更路径 ensureDir/ensureData 按需展开，未变更子树保持原 NodeID 零读取 → S3 提交从卡死 60s+ 修复到 0.293s。
 - 协议层（git 3b3efb4）：清理 PUT/update-report 诊断日志（原 cfg.Logger nil 导致单测 panic）。
 - 读回一致性：fs 单测全过；svn import/co 200 文件读回字节一致。
-- git：`5ebda18`(svndiff) → `0f91de0`(co修复) → `4e270eb`(update-report perf) → `1968cfb`(CAS) → `7cbd916`(懒加载) → `3b3efb4`(日志清理) → `b32079c`(loadbulk 分目录)。
+- git：`5ebda18`(svndiff) → `0f91de0`(co修复) → `4e270eb`(update-report perf) → `1968cfb`(CAS) → `7cbd916`(懒加载) → `3b3efb4`(日志清理) → `b32079c`(loadbulk 分目录) → `dd97592`(双后端对比文档) → `4d13a69`(PROPFIND O(n²) 修复)。
+
+### PROPFIND 大目录 O(n²) 修复（决定性，git 4d13a69）
+- 根因：propChildren 逐 child 调 propNode(path)，propNode 内部 `repo.Resolve(rev, path)` **从根重展开整个父目录** → 大目录 N 个 child 展开 N 次 → O(n²)。
+- 修复：ListDir 已返回每个 child 的 NodeRev 字段（Kind/ID/Props），propNode 改为接受**预解析 NodeRev**，propChildren 直传跳过 Resolve → **线性 O(n)**。
+- 实测：svn ls 200 文件 **2.84s → 0.668s（4.3 倍）**；svn ls 1000 文件 9.24s（服务器线性，慢在客户端解析 1000 条 XML）。
+- 注：PUT（nodeCache 按不可变 id 缓存 NodeRev+ByName）与 REPORT update-report（indexTree 预取 + child NodeID 直取）**本身已线性**，协议层无 O(n²) 遗留。

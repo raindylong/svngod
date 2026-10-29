@@ -101,8 +101,63 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, res resource)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+	// Range support: serve a partial payload with 206 (used for resumable /
+	// chunked downloads of large files). We still reconstruct the full text in
+	// memory (fs.GetText), but avoid transmitting the whole body.
+	if rng := r.Header.Get("Range"); rng != "" {
+		if start, end, ok := parseRange(rng, len(text)); ok {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(text)))
+			w.Header().Set("Content-Length", strconv.Itoa(end-start+1))
+			w.WriteHeader(http.StatusPartialContent)
+			w.Write(text[start : end+1])
+			return
+		}
+	}
 	w.WriteHeader(http.StatusOK)
 	w.Write(text)
+}
+
+// parseRange parses a single "bytes=start-end" range (suffix ranges bytes=-N
+// are accepted by treating -N as "last N bytes"). Returns ok=false if the
+// header is absent, malformed, or unsatifiable (multi-range not supported).
+func parseRange(h string, size int) (start, end int, ok bool) {
+	p := strings.TrimPrefix(strings.TrimSpace(h), "bytes=")
+	if p == h {
+		return 0, 0, false
+	}
+	dash := strings.IndexByte(p, '-')
+	if dash < 0 {
+		return 0, 0, false
+	}
+	sStr, eStr := p[:dash], p[dash+1:]
+	if eStr == "" {
+		// bytes=start- : from start to EOF
+		st, err := strconv.Atoi(sStr)
+		if err != nil || st < 0 || st >= size {
+			return 0, 0, false
+		}
+		return st, size - 1, true
+	}
+	if sStr == "" {
+		// bytes=-N : last N bytes
+		n, err := strconv.Atoi(eStr)
+		if err != nil || n <= 0 || size == 0 {
+			return 0, 0, false
+		}
+		if n > size {
+			n = size
+		}
+		return size - n, size - 1, true
+	}
+	st, err1 := strconv.Atoi(sStr)
+	en, err2 := strconv.Atoi(eStr)
+	if err1 != nil || err2 != nil || st < 0 || en < st || st >= size {
+		return 0, 0, false
+	}
+	if en >= size {
+		en = size - 1
+	}
+	return st, en, true
 }
 
 // errPathNotFound marks an unresolvable path (mapped to 404).
