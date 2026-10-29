@@ -76,7 +76,9 @@ func (s *fileStore) makeStore() (store.Store, error) {
 			Bucket:     s.Bucket,
 			Region:     "us-east-1",
 			UseSSL:     s.SSL,
-			RepoPrefix: s.Prefix,
+			RepoPrefix: "", // full repo prefix (e.g. "repos/<name>") is passed
+			// in by fs.OpenRepo via its prefix arg; keeping it empty here avoids
+			// double-prefixing the S3 keys.
 		})
 	case "mirror":
 		var ms []store.Store

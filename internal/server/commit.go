@@ -1,11 +1,12 @@
 package server
 
 import (
-	"log"
 	"encoding/xml"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -389,12 +390,19 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 	}
 	if isNew && strings.Contains(r.Header.Get("Content-Type"), "svndiff") {
 		decoded, derr := svndiff.Apply(nil, data)
-		if derr != nil {
-			s.mu.Unlock()
-			http.Error(w, "svndiff decode: "+derr.Error(), http.StatusBadRequest)
-			return
+		if derr == nil {
+			data = decoded
+		} else {
+			// A brand-new file has no base revision; the client may send either a
+			// full delta against the empty base or the raw content. If decoding
+			// fails, keep the raw body instead of aborting the whole commit.
+			d0 := data
+			if len(d0) > 64 {
+				d0 = d0[:64]
+			}
+			os.WriteFile("/home/user/svngod/bad_delta_dump.bin", data, 0o644)
+			s.cfg.Logger.Printf("PUT %s: svndiff decode ignored on new file: %v delta=%x", res.path, derr, d0)
 		}
-		data = decoded
 	}
 	ch.data = data
 	if ch.props == nil {

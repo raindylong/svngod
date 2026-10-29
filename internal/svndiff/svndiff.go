@@ -17,9 +17,26 @@ package svndiff
 
 import (
 	"bytes"
+	"compress/zlib"
 	"errors"
 	"fmt"
+	"io"
 )
+
+// maybeInflate decompresses b when it carries a zlib header; a stream without
+// one is returned unchanged. svn clients send the ins/data sections of an
+// svndiff window zlib-compressed by default.
+func maybeInflate(b []byte) ([]byte, error) {
+	if len(b) >= 2 && b[0] == 0x78 && b[1]&0x20 == 0 {
+		r, err := zlib.NewReader(bytes.NewReader(b))
+		if err != nil {
+			return nil, err
+		}
+		defer r.Close()
+		return io.ReadAll(r)
+	}
+	return b, nil
+}
 
 const (
 	v0HeaderLen = 4
@@ -66,28 +83,30 @@ func Version(data []byte) int {
 // --- length encoding (svn__encode_uint / svn__decode_uint) ---
 
 // writeUint encodes val using subversion's variable-length integer encoding.
+// Each following byte carries 7 bits; the lead byte's top bits encode the length
+// (0x80→2 bytes, 0xc0→3, 0xe0→4, 0xf0→5), matching svn__encode_uint in svndiff.c.
 func writeUint(buf *bytes.Buffer, val uint64) {
 	switch {
 	case val < 0x80:
 		buf.WriteByte(byte(val))
 	case val < 0x4000:
-		buf.WriteByte(byte(0x80 | (val >> 8)))
-		buf.WriteByte(byte(val))
+		buf.WriteByte(byte(0x80 | (val >> 7)))
+		buf.WriteByte(byte(val & 0x7f))
 	case val < 0x200000:
-		buf.WriteByte(byte(0xc0 | (val >> 16)))
-		buf.WriteByte(byte(val >> 8))
-		buf.WriteByte(byte(val))
+		buf.WriteByte(byte(0xc0 | (val >> 14)))
+		buf.WriteByte(byte((val >> 7) & 0x7f))
+		buf.WriteByte(byte(val & 0x7f))
 	case val < 0x10000000:
-		buf.WriteByte(byte(0xe0 | (val >> 24)))
-		buf.WriteByte(byte(val >> 16))
-		buf.WriteByte(byte(val >> 8))
-		buf.WriteByte(byte(val))
+		buf.WriteByte(byte(0xe0 | (val >> 21)))
+		buf.WriteByte(byte((val >> 14) & 0x7f))
+		buf.WriteByte(byte((val >> 7) & 0x7f))
+		buf.WriteByte(byte(val & 0x7f))
 	default:
 		buf.WriteByte(0xf0)
-		buf.WriteByte(byte(val >> 24))
-		buf.WriteByte(byte(val >> 16))
-		buf.WriteByte(byte(val >> 8))
-		buf.WriteByte(byte(val))
+		buf.WriteByte(byte((val >> 24) & 0x7f))
+		buf.WriteByte(byte((val >> 16) & 0x7f))
+		buf.WriteByte(byte((val >> 8) & 0x7f))
+		buf.WriteByte(byte(val & 0x7f))
 	}
 }
 
@@ -107,25 +126,25 @@ func readUint(b []byte) (uint64, int, error) {
 		if len(b) < 2 {
 			return 0, 0, ioErrUnexpectedEOF
 		}
-		v = uint64(c&0x3f)<<8 | uint64(b[1])
+		v = uint64(c&0x7f)<<7 | uint64(b[1]&0x7f)
 		n = 2
 	case c&0xe0 == 0xc0:
 		if len(b) < 3 {
 			return 0, 0, ioErrUnexpectedEOF
 		}
-		v = uint64(c&0x1f)<<16 | uint64(b[1])<<8 | uint64(b[2])
+		v = uint64(c&0x3f)<<14 | uint64(b[1]&0x7f)<<7 | uint64(b[2]&0x7f)
 		n = 3
 	case c&0xf0 == 0xe0:
 		if len(b) < 4 {
 			return 0, 0, ioErrUnexpectedEOF
 		}
-		v = uint64(c&0x0f)<<24 | uint64(b[1])<<16 | uint64(b[2])<<8 | uint64(b[3])
+		v = uint64(c&0x1f)<<21 | uint64(b[1]&0x7f)<<14 | uint64(b[2]&0x7f)<<7 | uint64(b[3]&0x7f)
 		n = 4
 	default:
 		if len(b) < 5 {
 			return 0, 0, ioErrUnexpectedEOF
 		}
-		v = uint64(b[1])<<24 | uint64(b[2])<<16 | uint64(b[3])<<8 | uint64(b[4])
+		v = uint64(c&0x0f)<<28 | uint64(b[1]&0x7f)<<21 | uint64(b[2]&0x7f)<<14 | uint64(b[3]&0x7f)<<7 | uint64(b[4]&0x7f)
 		n = 5
 	}
 	return v, n, nil
@@ -296,9 +315,18 @@ func Apply(src, delta []byte) ([]byte, error) {
 			return nil, ioErrUnexpectedEOF
 		}
 		sview := src[sviewOffset : sviewOffset+sviewLen]
-		ins := delta[p : p+int(insLen)]
+		// The instruction and new-data sections may be zlib-compressed
+		// (svn clients send them compressed by default); decompress when
+		// they carry a zlib header, otherwise treat them as raw.
+		ins, err := maybeInflate(delta[p : p+int(insLen)])
+		if err != nil {
+			return nil, fmt.Errorf("svndiff: bad instruction zlib: %w", err)
+		}
 		p += int(insLen)
-		data := delta[p : p+int(dataLen)]
+		data, err := maybeInflate(delta[p : p+int(dataLen)])
+		if err != nil {
+			return nil, fmt.Errorf("svndiff: bad data zlib: %w", err)
+		}
 		p += int(dataLen)
 
 		tview := make([]byte, 0, tviewLen)
@@ -342,8 +370,9 @@ func Apply(src, delta []byte) ([]byte, error) {
 				if offset >= uint64(cur) {
 					return nil, errors.New("svndiff: target copy out of bounds")
 				}
-				start := cur - int(offset)
-				// overlapping copy: byte-by-byte
+				// svn semantics: offset is an absolute position in tview
+				// (svndiff.c: memmove(tview+tpos, tview+offset, length)).
+				start := int(offset)
 				for k := 0; k < int(length); k++ {
 					tview = append(tview, tview[start+k])
 				}
