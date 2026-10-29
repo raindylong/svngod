@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"time"
 
@@ -54,14 +55,45 @@ type fileRepo struct {
 }
 
 type fileStore struct {
-	Type      string `json:"type"` // "file" | "s3"
-	Root      string `json:"root"`
-	Endpoint  string `json:"endpoint"`
-	AccessKey string `json:"access-key"`
-	SecretKey string `json:"secret-key"`
-	Bucket    string `json:"bucket"`
-	Prefix    string `json:"prefix"`
-	SSL       bool   `json:"ssl"`
+	Type      string      `json:"type"` // "file" | "s3" | "mirror"
+	Root      string      `json:"root"`
+	Endpoint  string      `json:"endpoint"`
+	AccessKey string      `json:"access-key"`
+	SecretKey string      `json:"secret-key"`
+	Bucket    string      `json:"bucket"`
+	Prefix    string      `json:"prefix"`
+	SSL       bool        `json:"ssl"`
+	Mirrors   []fileStore `json:"mirrors"` // type=mirror: primary + standby backends
+}
+
+func (s *fileStore) makeStore() (store.Store, error) {
+	switch s.Type {
+	case "s3":
+		return store.NewS3Store(store.S3Config{
+			Endpoint:   s.Endpoint,
+			AccessKey:  s.AccessKey,
+			SecretKey:  s.SecretKey,
+			Bucket:     s.Bucket,
+			Region:     "us-east-1",
+			UseSSL:     s.SSL,
+			RepoPrefix: s.Prefix,
+		})
+	case "mirror":
+		var ms []store.Store
+		for i := range s.Mirrors {
+			st, err := s.Mirrors[i].makeStore()
+			if err != nil {
+				return nil, err
+			}
+			ms = append(ms, st)
+		}
+		if len(ms) < 2 {
+			return nil, fmt.Errorf("mirror storage requires at least 2 backends (got %d)", len(ms))
+		}
+		return store.NewMirror(ms), nil
+	default:
+		return store.NewFileStore(s.Root)
+	}
 }
 
 type fileAuth struct {
@@ -94,18 +126,7 @@ func loadConfig(path string) (*fileConfig, error) {
 }
 
 func (r *fileRepo) makeStore() (store.Store, error) {
-	if r.Storage.Type == "s3" {
-		return store.NewS3Store(store.S3Config{
-			Endpoint:   r.Storage.Endpoint,
-			AccessKey:  r.Storage.AccessKey,
-			SecretKey:  r.Storage.SecretKey,
-			Bucket:     r.Storage.Bucket,
-			Region:     "us-east-1",
-			UseSSL:     r.Storage.SSL,
-			RepoPrefix: r.Storage.Prefix,
-		})
-	}
-	return store.NewFileStore(r.Storage.Root)
+	return r.Storage.makeStore()
 }
 
 func (r *fileRepo) repoPrefix(name string) string {
