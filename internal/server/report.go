@@ -144,7 +144,9 @@ func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name s
 	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
 	b.WriteString(`<S:update-report xmlns:S="svn:" xmlns:D="` + NS_DAV + `">` + "\n")
 	b.WriteString("  <S:target-revision rev=\"" + strconv.FormatUint(rev, 10) + "\"/>\n")
-	if err := s.updateWalkDir(&b, repo, base, rev, baseRev, rootPath, "open-directory", true); err != nil {
+	rp, _ := repo.GetRevProps(rev)
+	uuid, _ := repo.UUID()
+	if err := s.updateWalkDir(&b, repo, base, rev, baseRev, rootPath, "open-directory", true, rp, uuid); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -157,10 +159,8 @@ func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name s
 // writeEntryProps emits svn:entry properties for a node. svn's update editor
 // derives the working-copy changed_rev/date/author/uuid from these; without
 // svn:entry:committed-rev the client aborts with an invalid-revision assert.
-func writeEntryProps(b *strings.Builder, repo *fs.Repo, rev uint64) {
-	rp, err := repo.GetRevProps(rev)
-	uuid, _ := repo.UUID()
-	if err == nil {
+func writeEntryProps(b *strings.Builder, rp *fs.RevProps, uuid string, rev uint64) {
+	if rp != nil {
 		if date := rp.Props["svn:date"]; date != "" {
 			b.WriteString(`<S:set-prop name="svn:entry:committed-date">` + xmlEscape(date) + `</S:set-prop>` + "\n")
 		}
@@ -178,11 +178,11 @@ func writeEntryProps(b *strings.Builder, repo *fs.Repo, rev uint64) {
 // add-file with fulltext txdelta), walking the whole subtree at rev. baseRev
 // is the client's WC baseline revision (from <S:revision>); when > 0 the file
 // txdelta is sent as a delta from the baseline revision's text (svn diff).
-func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, rev uint64, baseRev uint64, path, openEl string, wrap bool) error {
+func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, rev uint64, baseRev uint64, path, openEl string, wrap bool, rp *fs.RevProps, uuid string) error {
 	if wrap {
 		b.WriteString("  <S:" + openEl + " rev=\"" + strconv.FormatUint(rev, 10) + "\">\n")
 	}
-	writeEntryProps(b, repo, rev)
+	writeEntryProps(b, rp, uuid, rev)
 	children, err := repo.ListDir(rev, path)
 	if err != nil {
 		return err
@@ -195,9 +195,9 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 			bc := base + "!svn/bc/" + strconv.FormatUint(rev, 10) + "/" + strings.TrimPrefix(cpath, "/")
 			b.WriteString("    <S:add-directory name=\"" + xmlEscape(c.Name) + "\" bc-url=\"" + xmlEscape(bc) + "\">\n")
 			b.WriteString("      <D:checked-in><D:href>" + xmlEscape(bc) + "</D:href></D:checked-in>\n")
-			writeEntryProps(b, repo, rev)
+			writeEntryProps(b, rp, uuid, rev)
 			writeNodeProps(b, c.Props)
-			if err := s.updateWalkDir(b, repo, base, rev, baseRev, cpath, "add-directory", false); err != nil {
+			if err := s.updateWalkDir(b, repo, base, rev, baseRev, cpath, "add-directory", false, rp, uuid); err != nil {
 				return err
 			}
 			b.WriteString("    </S:add-directory>\n")
@@ -205,7 +205,7 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 			b.WriteString("    <S:add-file name=\"" + xmlEscape(c.Name) + "\">\n")
 			bc := base + "!svn/bc/" + strconv.FormatUint(rev, 10) + "/" + strings.TrimPrefix(cpath, "/")
 			b.WriteString("      <D:checked-in><D:href>" + xmlEscape(bc) + "</D:href></D:checked-in>\n")
-			writeEntryProps(b, repo, rev)
+			writeEntryProps(b, rp, uuid, rev)
 			nr, err := repo.Resolve(rev, cpath)
 			if err != nil {
 				return err
