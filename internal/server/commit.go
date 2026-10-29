@@ -363,6 +363,12 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// diagnostics: log exact body header to confirm svndiff version/compression
+	d0 := data
+	if len(d0) > 16 {
+		d0 = d0[:16]
+	}
+	s.cfg.Logger.Printf("PUT %s: ct=%q len=%d head=%x", res.path, r.Header.Get("Content-Type"), len(data), d0)
 	ch := tx.changeFor(res.path)
 	ch.kind = fs.KindFile
 	// Existing file at the base revision => this PUT modifies it (204);

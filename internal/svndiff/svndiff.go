@@ -21,6 +21,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+
+	"github.com/pierrec/lz4/v4"
 )
 
 // maybeInflate decompresses b when it carries a zlib header; a stream without
@@ -36,6 +38,39 @@ func maybeInflate(b []byte) ([]byte, error) {
 		return io.ReadAll(r)
 	}
 	return b, nil
+}
+
+// decompressSeg decompresses an svndiff ins/data section according to the
+// window version: v0 raw (tolerating an incidental zlib header), v1 zlib,
+// v2 lz4 block.
+func decompressSeg(version byte, b []byte) ([]byte, error) {
+	switch version {
+	case 1:
+		r, err := zlib.NewReader(bytes.NewReader(b))
+		if err != nil {
+			return nil, err
+		}
+		defer r.Close()
+		return io.ReadAll(r)
+	case 2:
+		dst := make([]byte, 1<<20) // 1 MiB initial guess
+		n, err := lz4.UncompressBlock(b, dst)
+		if err == nil && n > 0 {
+			return dst[:n], nil
+		}
+		dst = make([]byte, 1<<28) // 256 MiB fallback
+		n, err = lz4.UncompressBlock(b, dst)
+		if err == nil && n > 0 {
+			return dst[:n], nil
+		}
+		// svn 1.14 sends "v2" windows with *uncompressed* ins/data sections
+		// over HTTP when the window is a simple insert (see
+		// send_simple_insertion_window, which never compresses). Fall back to
+		// treating the section as raw bytes.
+		return b, nil
+	default:
+		return maybeInflate(b)
+	}
 }
 
 const (
@@ -269,15 +304,15 @@ func Encode(src, tgt []byte) ([]byte, error) {
 
 // --- decoder ---
 
-// Apply reconstructs tgt by applying delta to src. Only v0 is supported;
-// v1 (zlib) and v2 (lz4) return an error.
+// Apply reconstructs tgt by applying delta to src. v0 uses raw ins/data,
+// v1 uses zlib and v2 uses lz4 compression for the ins/data sections.
 func Apply(src, delta []byte) ([]byte, error) {
 	if !IsDelta(delta) {
 		return nil, errors.New("svndiff: not a svndiff delta")
 	}
 	version := delta[3]
-	if version != 0 {
-		return nil, fmt.Errorf("svndiff: version %d not supported (only v0)", version)
+	if version > 2 {
+		return nil, fmt.Errorf("svndiff: unsupported version %d", version)
 	}
 
 	p := v0HeaderLen
@@ -315,17 +350,17 @@ func Apply(src, delta []byte) ([]byte, error) {
 			return nil, ioErrUnexpectedEOF
 		}
 		sview := src[sviewOffset : sviewOffset+sviewLen]
-		// The instruction and new-data sections may be zlib-compressed
-		// (svn clients send them compressed by default); decompress when
-		// they carry a zlib header, otherwise treat them as raw.
-		ins, err := maybeInflate(delta[p : p+int(insLen)])
+		// Decompress the instruction and new-data sections according to the
+		// svndiff version: v0 raw (tolerating an incidental zlib header),
+		// v1 zlib, v2 lz4.
+		ins, err := decompressSeg(version, delta[p:p+int(insLen)])
 		if err != nil {
-			return nil, fmt.Errorf("svndiff: bad instruction zlib: %w", err)
+			return nil, fmt.Errorf("svndiff: bad instruction section: %w", err)
 		}
 		p += int(insLen)
-		data, err := maybeInflate(delta[p : p+int(dataLen)])
+		data, err := decompressSeg(version, delta[p:p+int(dataLen)])
 		if err != nil {
-			return nil, fmt.Errorf("svndiff: bad data zlib: %w", err)
+			return nil, fmt.Errorf("svndiff: bad data section: %w", err)
 		}
 		p += int(dataLen)
 

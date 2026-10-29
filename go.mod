@@ -14,6 +14,7 @@ require (
 	github.com/klauspost/cpuid/v2 v2.2.8 // indirect
 	github.com/minio/md5-simd v1.1.2 // indirect
 	github.com/minio/minio-go/v7 v7.0.80 // indirect
+	github.com/pierrec/lz4/v4 v4.1.33 // indirect
 	github.com/rs/xid v1.6.0 // indirect
 	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/net v0.57.0 // indirect
