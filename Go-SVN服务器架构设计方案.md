@@ -15,7 +15,14 @@
 - **分批提交策略**：拆 30×1000 文件小事务，每批独立 commit 成功、HEAD 稳定递增，规避环境对长时进程的杀。
 - 环境周期性杀长时 svngod → 守护脚本（guard.sh）自动重启 svngod/RustFS。
 
-### 双后端对比（进行中）
-- 本地盘（19996）：分批落盘推进中。
-- S3/RustFS（19997）：分批落盘推进中。
-- 待完成后测 co/up，产出本地盘 vs RustFS 稳定性/效率对比报告。
+### 双后端对比（完成，2026-10-30）
+- **服务端直写落盘工具 loadbulk**（cmd/loadbulk）：经 fs 层直接提交 chunk0..29，绕开 svn CLI 大目录逐文件 PROPFIND 的客户端瓶颈。
+- **O(n²) 优化（决定性）**：扁平根 30000 文件时，每次提交需重写 root 全量 children → O(n²)（前 12000 文件约 5 分钟，每批递增到 41s）。改为**每 chunk 独立子目录 cN**（root 仅 30 个子目录）→ **线性稳定**。
+- **30000×50K 双后端落盘**：
+  - 本地盘：**75.6s**（30 批×1000 文件，0.37–1.09s/批，线性、零错误）
+  - S3/RustFS：**100.7s**（0.57–2.32s/批，线性、零错误；S3 网络 RTT 略高 ~33%，符合预期）
+  - 对比 svn CLI 1000 文件 2 分钟 → 服务端直写 ~0.7s/批（本地盘），**快约 170 倍**
+- 前置决定性修复（git 7cbd916）：**懒加载增量提交**——CommitTxn 不再递归加载整棵 HEAD 树，只沿变更路径 ensureDir/ensureData 按需展开，未变更子树保持原 NodeID 零读取 → S3 提交从卡死 60s+ 修复到 0.293s。
+- 协议层（git 3b3efb4）：清理 PUT/update-report 诊断日志（原 cfg.Logger nil 导致单测 panic）。
+- 读回一致性：fs 单测全过；svn import/co 200 文件读回字节一致。
+- git：`5ebda18`(svndiff) → `0f91de0`(co修复) → `4e270eb`(update-report perf) → `1968cfb`(CAS) → `7cbd916`(懒加载) → `3b3efb4`(日志清理) → `b32079c`(loadbulk 分目录)。
