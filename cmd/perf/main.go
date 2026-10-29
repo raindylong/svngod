@@ -37,10 +37,13 @@ func main() {
 	}
 	rp := map[string]string{"svn:author": "perf", "svn:date": time.Now().UTC().Format("2006-01-02T15:04:05.000000Z")}
 
-	if _, err := repo.CommitTxn([]fs.Change{
+	var last uint64
+	if rev0, err := repo.CommitTxn(0, []fs.Change{
 		{Path: "/hello.txt", Action: fs.ActionAdd, Kind: fs.KindFile, Data: []byte("v1\n")},
 	}, rp); err != nil {
 		panic(err)
+	} else {
+		last = rev0
 	}
 
 	start := time.Now()
@@ -49,11 +52,13 @@ func main() {
 	for i := 2; i <= n; i++ {
 		t0 := time.Now()
 		text := []byte(fmt.Sprintf("v%d\n", i))
-		if _, err := repo.CommitTxn([]fs.Change{
+		rev, err := repo.CommitTxn(last, []fs.Change{
 			{Path: "/hello.txt", Action: fs.ActionModify, Kind: fs.KindFile, Data: text},
-		}, rp); err != nil {
+		}, rp)
+		if err != nil {
 			panic(err)
 		}
+		last = rev
 		d := time.Since(t0)
 		batch += d
 		if i%1000 == 0 {

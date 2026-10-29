@@ -513,7 +513,7 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 	delete(s.txns, tx.id)
 	s.mu.Unlock()
 
-	rev, err := repo.CommitTxn(changes, revProps)
+	rev, err := repo.CommitTxn(tx.baseRev, changes, revProps)
 	if err != nil {
 		log.Printf("CommitTxn failed: %v", err)
 		for _, c := range changes {

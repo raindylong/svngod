@@ -60,6 +60,7 @@ func main() {
 	}
 
 	var total int
+	var last uint64
 	loadStart := time.Now()
 	for chunk := 0; chunk <= 29; chunk++ {
 		chdir := filepath.Join(*dir, fmt.Sprintf("chunk%d", chunk))
@@ -86,11 +87,12 @@ func main() {
 			})
 		}
 		t0 := time.Now()
-		rev, err := r.CommitTxn(changes, rp)
+		rev, err := r.CommitTxn(last, changes, rp)
 		if err != nil {
 			fmt.Printf("chunk%d FAIL: %v\n", chunk, err)
 			continue
 		}
+		last = rev
 		total += len(changes)
 		fmt.Printf("chunk%d %d files rev=%d %.2fs\n", chunk, len(changes), rev, time.Since(t0).Seconds())
 	}

@@ -50,10 +50,13 @@ func buildSourceRepo(t *testing.T) *fs.Repo {
 			map[string]string{"svn:log": "branch"},
 		},
 	}
+	var last uint64
 	for _, c := range commits {
-		if _, err := r.CommitTxn(c.changes, c.props); err != nil {
+		rev, err := r.CommitTxn(last, c.changes, c.props)
+		if err != nil {
 			t.Fatalf("commit: %v", err)
 		}
+		last = rev
 	}
 	return r
 }

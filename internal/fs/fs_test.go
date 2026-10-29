@@ -123,7 +123,7 @@ func TestRepoCommitRead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rev1, err := repo.CommitTxn([]Change{
+	rev1, err := repo.CommitTxn(0, []Change{
 		{Path: "/README.txt", Action: ActionAdd, Kind: KindFile, Data: []byte("hello svngod")},
 		{Path: "/src/main.go", Action: ActionAdd, Kind: KindFile, Data: []byte("package main")},
 	}, map[string]string{"svn:log": "initial"})
@@ -162,7 +162,7 @@ func TestRepoCommitRead(t *testing.T) {
 	}
 
 	// Modify README → revision 2 (tests delta encoding + reconstruction).
-	rev2, err := repo.CommitTxn([]Change{
+	rev2, err := repo.CommitTxn(rev1, []Change{
 		{Path: "/README.txt", Action: ActionModify, Kind: KindFile, Data: []byte("hello svngod, version 2, with a longer line to force a real delta and exercise the window codec path in svndiff")},
 	}, nil)
 	if err != nil {
@@ -204,7 +204,7 @@ func TestRepoShardBoundaryAndPack(t *testing.T) {
 	var last uint64
 	for i := 0; i < 8; i++ {
 		path := "/f" + string(rune('a'+i))
-		rev, err := repo.CommitTxn([]Change{{Path: path, Action: ActionAdd, Kind: KindFile, Data: []byte("content " + string(rune('a'+i)))}}, nil)
+		rev, err := repo.CommitTxn(last, []Change{{Path: path, Action: ActionAdd, Kind: KindFile, Data: []byte("content " + string(rune('a'+i)))}}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -294,7 +294,7 @@ func TestCommitCopyFromHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.CommitTxn([]Change{
+	if _, err := r.CommitTxn(0, []Change{
 		{Path: "/trunk", Action: ActionAdd, Kind: KindDir},
 		{Path: "/trunk/a.txt", Action: ActionAdd, Kind: KindFile, Data: []byte("alpha")},
 		{Path: "/trunk/sub", Action: ActionAdd, Kind: KindDir},
@@ -305,7 +305,7 @@ func TestCommitCopyFromHistory(t *testing.T) {
 	rev1, _ := r.Head()
 
 	// copy /trunk -> /branches/br from history rev1
-	if _, err := r.CommitTxn([]Change{
+	if _, err := r.CommitTxn(rev1, []Change{
 		{Path: "/branches", Action: ActionAdd, Kind: KindDir},
 		{Path: "/branches/br", Action: ActionCopy, Kind: KindDir, CopyFromPath: "/trunk", CopyFromRev: rev1},
 	}, nil); err != nil {

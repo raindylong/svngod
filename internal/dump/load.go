@@ -74,14 +74,19 @@ func Load(repo *fs.Repo, r io.Reader) error {
 	var props map[string]string
 	var remaining int
 	inRevision := false
+	var lastRev uint64
 
 	flush := func() error {
 		if !inRevision || len(changes) == 0 {
 			return nil
 		}
-		if _, err := repo.CommitTxn(changes, props); err != nil {
+		// Incremental import: each revision commit builds on the previous one so
+		// earlier revisions' tree content is preserved across shard boundaries.
+		rev, err := repo.CommitTxn(lastRev, changes, props)
+		if err != nil {
 			return err
 		}
+		lastRev = rev
 		changes = nil
 		return nil
 	}

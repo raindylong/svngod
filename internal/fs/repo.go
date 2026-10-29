@@ -22,6 +22,7 @@ var ErrRepoNotFound = errors.New("fs: repository not found")
 // ErrPathNotFound is returned by Resolve/ListDir when a path does not exist
 // as of the given revision (mapped to 404 by the DAV layer).
 var ErrPathNotFound = errors.New("fs: path not found")
+var ErrOutOfDate = errors.New("fs: commit base revision is out of date")
 
 // Repo is a versioned repository backed by an object Store.
 type Repo struct {
@@ -32,6 +33,12 @@ type Repo struct {
 
 	mu   sync.Mutex
 	cache *cache.LRU
+	// nodeCache caches decoded node-revs by immutable id so repeated Resolve /
+	// ListDir on the same revision reuse the node (and its ByName index) instead
+	// of re-decoding the block and re-scanning Children each time. cache.LRU is
+	// []byte-only, so this is a dedicated pointer map with its own mutex.
+	nodeCacheMu sync.Mutex
+	nodeCache   map[cache.Key]*NodeRev
 }
 
 // CreateRepo writes a fresh repository (format/uuid/current) and returns it.
@@ -69,7 +76,7 @@ func CreateRepo(st store.Store, prefix string, shardSize, maxDelta uint64) (*Rep
 	}
 	return &Repo{
 		store: st, keys: keys, shardSz: shardSize, maxDelta: maxDelta,
-		cache: cache.New(1 << 16),
+		cache: cache.New(1 << 16), nodeCache: make(map[cache.Key]*NodeRev),
 	}, nil
 }
 
@@ -90,7 +97,7 @@ func OpenRepo(st store.Store, prefix string) (*Repo, error) {
 	}
 	return &Repo{
 		store: st, keys: keys, shardSz: f.ShardSize, maxDelta: f.MaxDeltaChain,
-		cache: cache.New(1 << 16),
+		cache: cache.New(1 << 16), nodeCache: make(map[cache.Key]*NodeRev),
 	}, nil
 }
 
@@ -228,11 +235,34 @@ func (r *Repo) readBlock(rev uint64) (*RevBlock, error) {
 
 // GetNodeRev returns a node-rev by its immutable id.
 func (r *Repo) GetNodeRev(id NodeID) (*NodeRev, error) {
+	k := cache.Key(fmt.Sprintf("nr/%d.%d", id.Rev, id.ID))
+	r.nodeCacheMu.Lock()
+	if v, ok := r.nodeCache[k]; ok {
+		r.nodeCacheMu.Unlock()
+		return v, nil
+	}
+	r.nodeCacheMu.Unlock()
 	rb, err := r.readBlock(id.Rev)
 	if err != nil {
 		return nil, err
 	}
-	return rb.GetNode(id.ID)
+	nr, err := rb.GetNode(id.ID)
+	if err != nil {
+		return nil, err
+	}
+	if nr.Kind == KindDir && nr.ByName == nil {
+		nr.ByName = make(map[string]Child, len(nr.Children))
+		for _, c := range nr.Children {
+			nr.ByName[c.Name] = c
+		}
+	}
+	r.nodeCacheMu.Lock()
+	if len(r.nodeCache) >= 1<<13 {
+		r.nodeCache = make(map[cache.Key]*NodeRev)
+	}
+	r.nodeCache[k] = nr
+	r.nodeCacheMu.Unlock()
+	return nr, nil
 }
 
 // GetText reconstructs a file node-rev's full text (following delta chains).
@@ -303,11 +333,18 @@ func (r *Repo) Resolve(rev uint64, path string) (*NodeRev, error) {
 			return nil, ErrPathNotFound
 		}
 		var next *NodeID
-		for _, c := range cur.Children {
-			if c.Name == seg {
+		if cur.ByName != nil {
+			if c, ok := cur.ByName[seg]; ok {
 				cc := c.ID
 				next = &cc
-				break
+			}
+		} else {
+			for _, c := range cur.Children {
+				if c.Name == seg {
+					cc := c.ID
+					next = &cc
+					break
+				}
 			}
 		}
 		if next == nil {
@@ -344,7 +381,7 @@ func (r *Repo) ListDir(rev uint64, path string) ([]NodeInfo, error) {
 // --- commit ---
 
 // CommitTxn applies the changes as a single new revision and returns its number.
-func (r *Repo) CommitTxn(changes []Change, revProps map[string]string) (uint64, error) {
+func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]string) (uint64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -354,6 +391,13 @@ func (r *Repo) CommitTxn(changes []Change, revProps map[string]string) (uint64, 
 	cur, etag, err := r.readCurrent()
 	if err != nil {
 		return 0, err
+	}
+	// Optimistic concurrency control: the client commits against a base
+	// revision. If the repository head has moved past it (another writer won
+	// the race), refuse so a stale txn cannot clobber newer data (lost update).
+	// baseRev==0 skips the check (internal / bulk-load writers).
+	if baseRev > 0 && baseRev != cur.Head {
+		return 0, ErrOutOfDate
 	}
 	N := cur.Head + 1
 	ctx := context.Background()
@@ -469,6 +513,52 @@ func (r *Repo) CommitTxn(changes []Change, revProps map[string]string) (uint64, 
 		}
 	}
 	return N, nil
+}
+
+// VerifyIssue describes one integrity failure found by Verify.
+type VerifyIssue struct {
+	Path       string
+	Rev        uint64
+	Err        error
+	Rebuildable bool // text delta whose base+delta are intact => can be rebuilt
+}
+
+// Verify walks the HEAD tree, decoding every node-rev (CRC-checked on read)
+// and every file text (delta chain applied), and reports any corruption.
+// Rebuildable=true marks a text whose delta base chain is still readable, so a
+// repair pass could re-derive the payload; other failures need external
+// recovery (mirror copy / backup).
+func (r *Repo) Verify(headRev uint64) ([]VerifyIssue, error) {
+	var issues []VerifyIssue
+	var walk func(path string, rev uint64)
+	walk = func(path string, rev uint64) {
+		nr, err := r.Resolve(rev, path)
+		if err != nil {
+			issues = append(issues, VerifyIssue{Path: path, Rev: rev, Err: err})
+			return
+		}
+		if nr.Kind == KindDir {
+			children, err := r.ListDir(rev, path)
+			if err != nil {
+				issues = append(issues, VerifyIssue{Path: path, Rev: rev, Err: err})
+				return
+			}
+			for _, c := range children {
+				walk(strings.TrimRight(path, "/")+"/"+c.Name, rev)
+			}
+			return
+		}
+		if _, err := r.GetText(nr.Node); err != nil {
+			issues = append(issues, VerifyIssue{
+				Path:       path,
+				Rev:        rev,
+				Err:        err,
+				Rebuildable: nr.TextRep == TextRepDelta && nr.Base != nil,
+			})
+		}
+	}
+	walk("/", headRev)
+	return issues, nil
 }
 
 // applyChange mutates the working tree for one Change.

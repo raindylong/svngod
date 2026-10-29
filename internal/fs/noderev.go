@@ -64,6 +64,10 @@ type NodeRev struct {
 	Text         []byte
 	Base         *NodeID // delta base, when TextRep==TextRepDelta
 	Children     []Child // dir only
+	// ByName is a runtime-only name->Child index for directories, built on
+	// decode/cache; it is NOT persisted (Marshal ignores it) and lets Resolve
+	// find a child in O(1) instead of scanning Children (O(n) on a big dir).
+	ByName map[string]Child
 }
 
 // Marshal serializes the node-rev (with a trailing CRC32 of the body).

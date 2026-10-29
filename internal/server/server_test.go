@@ -27,7 +27,7 @@ func buildRepo(t *testing.T) *fs.Repo {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rev1, err := r.CommitTxn([]fs.Change{
+	rev1, err := r.CommitTxn(0, []fs.Change{
 		{Path: "/trunk", Action: fs.ActionAdd, Kind: fs.KindDir},
 		{Path: "/trunk/README.txt", Action: fs.ActionAdd, Kind: fs.KindFile, Data: []byte("hello svn\n")},
 		{Path: "/trunk/doc", Action: fs.ActionAdd, Kind: fs.KindDir},

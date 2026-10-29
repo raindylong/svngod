@@ -64,7 +64,7 @@ func TestS3RepoEndToEnd(t *testing.T) {
 	}
 	last := uint64(0)
 	for i := 1; i <= 9; i++ {
-		rev, err := repo.CommitTxn([]Change{
+		rev, err := repo.CommitTxn(last, []Change{
 			{Path: "/data" + strconv.Itoa(i) + ".txt", Action: ActionAdd, Kind: KindFile, Data: []byte("content-" + strconv.Itoa(i))},
 		}, map[string]string{"svn:log": "rev " + strconv.Itoa(i)})
 		if err != nil {
