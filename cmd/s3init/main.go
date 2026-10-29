@@ -24,10 +24,18 @@ func main() {
 	if len(os.Args) > 1 {
 		name = os.Args[1]
 	}
+	ak := os.Getenv("RUSTFS_AK")
+	if ak == "" {
+		ak = "test"
+	}
+	sk := os.Getenv("RUSTFS_SK")
+	if sk == "" {
+		sk = "test"
+	}
 	st, err := store.NewS3Store(store.S3Config{
 		Endpoint:   endpoint,
-		AccessKey:  "test",
-		SecretKey:  "test",
+		AccessKey:  ak,
+		SecretKey:  sk,
 		Bucket:     bucket,
 		Region:     "us-east-1",
 		RepoPrefix: "repos",
