@@ -108,6 +108,8 @@ func main() {
 		doDump(&o, repoName, output)
 	case "load":
 		doLoad(&o, repoName, input)
+	case "verify":
+		doVerify(&o, repoName)
 	default:
 		usage()
 		os.Exit(2)
@@ -121,6 +123,7 @@ usage:
   svnadmin create [s3 flags] <repo>
   svnadmin dump   [--output FILE] [s3 flags] <repo>
   svnadmin load   [--input FILE] [s3 flags] <repo>
+  svnadmin verify [s3 flags] <repo>   # integrity walk; prints corrupted nodes
 
 s3 flags: --endpoint H:PORT --access-key K --secret-key S --bucket B [--prefix P] [--ssl]
 `)
@@ -140,6 +143,33 @@ func doCreate(o *options, repoName string) {
 		fatal(err)
 	}
 	fmt.Printf("created repository %q uuid=%s\n", repoName, uuid)
+}
+
+func doVerify(o *options, repoName string) {
+	st, prefix, err := o.repoStore(repoName)
+	if err != nil {
+		fatal(err)
+	}
+	repo, err := fs.OpenRepo(st, prefix)
+	if err != nil {
+		fatal(err)
+	}
+	head, err := repo.Head()
+	if err != nil {
+		fatal(err)
+	}
+	issues, err := repo.Verify(head)
+	if err != nil {
+		fatal(err)
+	}
+	if len(issues) == 0 {
+		fmt.Printf("verify: repository %q at rev %d: no integrity issues\n", repoName, head)
+		return
+	}
+	fmt.Printf("verify: repository %q at rev %d: %d integrity issues\n", repoName, head, len(issues))
+	for _, is := range issues {
+		fmt.Printf("  rev=%d path=%s err=%v rebuildable=%v\n", is.Rev, is.Path, is.Err, is.Rebuildable)
+	}
 }
 
 func doDump(o *options, repoName, output string) {
