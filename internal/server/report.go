@@ -134,11 +134,14 @@ func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name s
 	}
 	// src path (the checkout root inside the repo)
 	rootPath := "/"
+	var spContent string
 	if sp, ok := root.child("src-path"); ok {
+		spContent = sp.Content
 		if p, ok := extractReposPath(sp.Content, base); ok {
 			rootPath = p
 		}
 	}
+	fmt.Printf("DBG update-report rev=%d base=%q src-path=%q rootPath=%q\n", rev, base, spContent, rootPath)
 
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
@@ -260,7 +263,24 @@ func writeNodeProps(b *strings.Builder, props map[string]string) {
 
 // extractReposPath converts a src-path URL back to a repos-relative svn path.
 func extractReposPath(url, base string) (string, bool) {
-	// url like "http://host/svn/demo/trunk" ; base like "http://host/svn/demo/"
+	// base is the absolute repo-root URL, e.g. "http://host/svn/demo/".
+	// src-path is usually a repo-relative path "/svn/demo/s10" (svn CLI),
+	// sometimes an absolute URL. Extract the repo-internal path.
+	// 1) repo path prefix from base (path component after scheme://host)
+	if i := strings.Index(base, "://"); i >= 0 {
+		rest := base[i+3:]
+		if j := strings.Index(rest, "/"); j >= 0 {
+			basePath := rest[j:] // e.g. "/svn/demo/"
+			if strings.HasPrefix(url, basePath) {
+				p := strings.TrimPrefix(url[len(basePath):], "/")
+				if p == "" {
+					return "/", true
+				}
+				return "/" + p, true
+			}
+		}
+	}
+	// 2) absolute URL containing the whole base
 	idx := strings.Index(url, base)
 	if idx < 0 {
 		return "/", false
