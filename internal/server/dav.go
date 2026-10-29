@@ -177,9 +177,18 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request, res reso
 		// !svn/bln/<rev> is the baseline collection; !svn/bln/<rev>/<path>
 		// addresses a concrete node inside it.
 		if res.path != "" && res.path != "/" {
-			if err := s.propNode(&b, repo, base, res.repo, rev, path, props, propnames, false); err != nil {
+			children := depth == "1" || depth == "infinity"
+			// When listing, parent href must use the same !svn/bln prefix as its
+			// children, else the client's svn_fspath__skip_ancestor assertion fails.
+			if err := s.propNode(&b, repo, base, res.repo, rev, path, props, propnames, children); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
+			}
+			if children {
+				if err := s.propChildren(&b, repo, base, res.repo, rev, path, props, depth); err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
 			}
 		} else {
 			s.propBaselineColl(&b, repo, base, res.repo, rev, props)
@@ -192,7 +201,7 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request, res reso
 			}
 		}
 	default:
-		if err := s.propNode(&b, repo, base, res.repo, rev, path, props, propnames, false); err != nil {
+		if err := s.propNode(&b, repo, base, res.repo, rev, path, props, propnames, depth == "1" || depth == "infinity"); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -384,7 +393,10 @@ func (s *Server) propChildren(b *strings.Builder, repo *fs.Repo, base, name stri
 		return err
 	}
 	for _, c := range children {
-		cpath := path + "/" + c.Name
+		// Paths may carry a trailing slash (client requests /d/); join without
+		// introducing "//" so the emitted hrefs stay canonical for the client's
+		// svn_fspath__skip_ancestor assertion.
+		cpath := strings.TrimRight(path, "/") + "/" + c.Name
 		if err := s.propNode(b, repo, base, name, rev, cpath, props, false, true); err != nil {
 			return err
 		}
