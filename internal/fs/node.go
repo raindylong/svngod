@@ -45,6 +45,15 @@ type tnode struct {
 	// per-commit state
 	newID   uint64 // assigned node id for this commit (0 = unassigned)
 	dirty   bool
+
+	// lazy-load flags. A node loaded via lazyLoad keeps its directory children
+	// and file text unexpanded; they are fetched on demand (ensureDir /
+	// ensureData). This is what makes commits incremental: untouched subtrees
+	// keep their original NodeID and are never read, so a small change to a
+	// huge repository costs only the changed path's nodes (critical for
+	// high-RTT backends like S3, where loading the whole HEAD tree dominates).
+	dirLoaded  bool // directory children expanded
+	dataLoaded bool // file full text loaded
 }
 
 func copyProps(m map[string]string) map[string]string {
@@ -58,44 +67,101 @@ func copyProps(m map[string]string) map[string]string {
 	return out
 }
 
-// loadNode recursively loads the subtree rooted at id into a tnode, keeping
-// each node's current node-rev identity and (for files) its full text.
+// loadNode reads a node's current rev and returns a lazy tnode: a directory's
+// children and a file's full text are NOT fetched until ensureDir/ensureData
+// are called. CommitTxn only expands the nodes on the changed path, so
+// untouched subtrees keep their original NodeID and cost zero reads — this is
+// what makes commits incremental and fast on high-RTT backends (S3).
 func (r *Repo) loadNode(id NodeID) (*tnode, error) {
 	nr, err := r.GetNodeRev(id)
 	if err != nil {
 		return nil, err
 	}
 	t := &tnode{
-		kind:       nr.Kind,
-		props:      copyProps(nr.Props),
-		id:         nr.Node,
-		pred:       nr.Pred,
-		deltaDepth: nr.DeltaDepth,
-		textRep:    nr.TextRep,
-		base:       nr.Base,
+		kind:         nr.Kind,
+		props:        copyProps(nr.Props),
+		id:           nr.Node,
+		pred:         nr.Pred,
+		deltaDepth:   nr.DeltaDepth,
+		textRep:      nr.TextRep,
+		base:         nr.Base,
+		copyFromPath: nr.CopyFromPath,
 	}
 	if nr.CopyFrom != nil {
 		cf := *nr.CopyFrom
 		t.copyFrom = &cf
-		t.copyFromPath = nr.CopyFromPath
-	}
-	if nr.Kind == KindFile {
-		text, err := r.GetText(nr.Node)
-		if err != nil {
-			return nil, err
-		}
-		t.data = text
-	} else {
-		t.children = make(map[string]*tnode, len(nr.Children))
-		for _, c := range nr.Children {
-			child, err := r.loadNode(c.ID)
-			if err != nil {
-				return nil, err
-			}
-			t.children[c.Name] = child
-		}
 	}
 	return t, nil
+}
+
+// ensureDir expands a directory's children lazily (idempotent).
+func (r *Repo) ensureDir(t *tnode) error {
+	if t == nil || t.kind != KindDir || t.dirLoaded {
+		return nil
+	}
+	if t.id.IsZero() {
+		// newly created in this commit; children already initialized
+		t.dirLoaded = true
+		return nil
+	}
+	nr, err := r.GetNodeRev(t.id)
+	if err != nil {
+		return err
+	}
+	t.children = make(map[string]*tnode, len(nr.Children))
+	for _, c := range nr.Children {
+		ct, err := r.loadNode(c.ID)
+		if err != nil {
+			return err
+		}
+		t.children[c.Name] = ct
+	}
+	t.dirLoaded = true
+	return nil
+}
+
+// ensureData loads a file's full text lazily (idempotent).
+func (r *Repo) ensureData(t *tnode) error {
+	if t == nil || t.kind != KindFile || t.dataLoaded {
+		return nil
+	}
+	if t.dirty {
+		// working-copy node already holds its final text (set by applyChange or
+		// copied by deepCopy); do not overwrite it with the stored text.
+		t.dataLoaded = true
+		return nil
+	}
+	if t.id.IsZero() {
+		// newly created in this commit; text already in t.data
+		t.dataLoaded = true
+		return nil
+	}
+	txt, err := r.GetText(t.id)
+	if err != nil {
+		return err
+	}
+	t.data = txt
+	t.dataLoaded = true
+	return nil
+}
+
+// ensureFull recursively loads a node and its entire subtree (copy sources).
+func (r *Repo) ensureFull(t *tnode) error {
+	if t == nil {
+		return nil
+	}
+	if t.kind == KindFile {
+		return r.ensureData(t)
+	}
+	if err := r.ensureDir(t); err != nil {
+		return err
+	}
+	for _, c := range t.children {
+		if err := r.ensureFull(c); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // segments splits a path into its components, dropping empty, "." and ".."

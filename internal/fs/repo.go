@@ -400,6 +400,9 @@ func (r *Repo) CommitTxn(changes []Change, revProps map[string]string) (uint64, 
 			nr.CopyFromPath = t.copyFromPath
 		}
 		if t.kind == KindFile {
+			if err := r.ensureData(t); err != nil {
+				return 0, err
+			}
 			sum := md5.Sum(t.data)
 			copy(nr.TextMD5[:], sum[:])
 			if t.id.IsZero() || t.deltaDepth+1 >= r.maxDelta {
@@ -418,6 +421,9 @@ func (r *Repo) CommitTxn(changes []Change, revProps map[string]string) (uint64, 
 				nr.DeltaDepth = t.deltaDepth + 1
 			}
 		} else {
+			if err := r.ensureDir(t); err != nil {
+				return 0, err
+			}
 			for name, c := range t.children {
 				cid := c.id
 				if c.dirty {
@@ -473,6 +479,9 @@ func (r *Repo) applyChange(root *tnode, ch *Change) error {
 	}
 	parent := root
 	for _, seg := range segs[:len(segs)-1] {
+		if err := r.ensureDir(parent); err != nil {
+			return err
+		}
 		child, ok := parent.children[seg]
 		if !ok {
 			child = &tnode{kind: KindDir, props: map[string]string{}, children: map[string]*tnode{}, dirty: true}
@@ -485,15 +494,24 @@ func (r *Repo) applyChange(root *tnode, ch *Change) error {
 
 	switch ch.Action {
 	case ActionDelete:
+		if err := r.ensureDir(parent); err != nil {
+			return err
+		}
 		if _, ok := parent.children[name]; !ok {
 			return errors.New("fs: delete of nonexistent path " + ch.Path)
 		}
 		delete(parent.children, name)
 		parent.dirty = true
 	case ActionAdd, ActionModify:
+		if err := r.ensureDir(parent); err != nil {
+			return err
+		}
 		if ch.Kind == KindFile {
 			t := &tnode{kind: KindFile, props: copyProps(ch.Props), data: append([]byte(nil), ch.Data...), dirty: true}
 			if old, ok := parent.children[name]; ok && old.kind == KindFile {
+				if err := r.ensureData(old); err != nil {
+					return err
+				}
 				t.id = old.id
 				t.pred = old.pred
 				t.deltaDepth = old.deltaDepth
@@ -518,6 +536,9 @@ func (r *Repo) applyChange(root *tnode, ch *Change) error {
 		} else {
 			t := &tnode{kind: KindDir, props: copyProps(ch.Props), children: map[string]*tnode{}, dirty: true}
 			if old, ok := parent.children[name]; ok && old.kind == KindDir {
+				if err := r.ensureDir(old); err != nil {
+					return err
+				}
 				t.id = old.id
 				t.pred = old.pred
 				t.deltaDepth = old.deltaDepth
@@ -544,6 +565,8 @@ func (r *Repo) applyChange(root *tnode, ch *Change) error {
 			if err != nil {
 				return fmt.Errorf("fs: copy source %q rev %d: %w", ch.CopyFromPath, ch.CopyFromRev, err)
 			}
+		} else if err := r.ensureFull(src); err != nil {
+			return err
 		}
 		cp := deepCopy(src)
 		cp.dirty = true
@@ -599,6 +622,9 @@ func (r *Repo) loadHistorySubtree(rev uint64, path string) (*tnode, error) {
 func (r *Repo) resolveNode(root *tnode, path string) (*tnode, error) {
 	cur := root
 	for _, seg := range segments(path) {
+		if err := r.ensureDir(cur); err != nil {
+			return nil, err
+		}
 		next, ok := cur.children[seg]
 		if !ok {
 			return nil, errors.New("no such node")
