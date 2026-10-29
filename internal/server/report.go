@@ -134,14 +134,11 @@ func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name s
 	}
 	// src path (the checkout root inside the repo)
 	rootPath := "/"
-	var spContent string
 	if sp, ok := root.child("src-path"); ok {
-		spContent = sp.Content
 		if p, ok := extractReposPath(sp.Content, base); ok {
 			rootPath = p
 		}
 	}
-	fmt.Printf("DBG update-report rev=%d base=%q src-path=%q rootPath=%q\n", rev, base, spContent, rootPath)
 
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
