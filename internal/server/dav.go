@@ -14,6 +14,10 @@ import (
 	"svngod/internal/fs"
 )
 
+// maxPropfindNodes bounds depth=infinity recursion so a hostile or accidental
+// recursive listing of a huge tree cannot exhaust server memory/CPU.
+const maxPropfindNodes = 1 << 20
+
 // handleOptions advertises DeltaV capabilities, the repo UUID and root URL.
 func (s *Server) handleOptions(w http.ResponseWriter, r *http.Request, res resource) {
 	if res.repo == "" {
@@ -220,6 +224,7 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request, res reso
 	base := s.absURL(r, res.repo, "/")
 
 	var b strings.Builder
+	budget := 0
 	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
 	b.WriteString(`<D:multistatus ` + rootAttr() + ">\n")
 
@@ -240,7 +245,7 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request, res reso
 				return
 			}
 			if children {
-				if err := s.propChildren(&b, repo, base, res.repo, rev, path, props, depth); err != nil {
+				if err := s.propChildren(&b, repo, base, res.repo, rev, path, props, depth, &budget); err != nil {
 					http.Error(w, err.Error(), http.StatusInternalServerError)
 					return
 				}
@@ -249,7 +254,7 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request, res reso
 			s.propBaselineColl(&b, repo, base, res.repo, rev, props)
 			// depth 1/infinity: list the baseline's root directory children.
 			if depth == "1" || depth == "infinity" {
-				if err := s.propChildren(&b, repo, base, res.repo, rev, "/", props, depth); err != nil {
+				if err := s.propChildren(&b, repo, base, res.repo, rev, "/", props, depth, &budget); err != nil {
 					http.Error(w, err.Error(), http.StatusInternalServerError)
 					return
 				}
@@ -262,7 +267,7 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request, res reso
 		}
 		// depth 1/infinity: children
 		if depth == "1" || depth == "infinity" {
-			if err := s.propChildren(&b, repo, base, res.repo, rev, path, props, depth); err != nil {
+			if err := s.propChildren(&b, repo, base, res.repo, rev, path, props, depth, &budget); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -438,7 +443,7 @@ func (s *Server) propNode(b *strings.Builder, repo *fs.Repo, base, name string, 
 }
 
 // propChildren writes immediate children (depth 1) or full subtree (infinity).
-func (s *Server) propChildren(b *strings.Builder, repo *fs.Repo, base, name string, rev uint64, path string, props []Name, depth string) error {
+func (s *Server) propChildren(b *strings.Builder, repo *fs.Repo, base, name string, rev uint64, path string, props []Name, depth string, budget *int) error {
 	nr, err := repo.Resolve(rev, path)
 	if err != nil {
 		return nil // not a dir
@@ -451,6 +456,12 @@ func (s *Server) propChildren(b *strings.Builder, repo *fs.Repo, base, name stri
 		return err
 	}
 	for _, c := range children {
+		// Guard depth=infinity recursion: a huge tree would blow up memory and
+		// CPU (recursively listing every node). Refuse past a hard node budget.
+		*budget++
+		if *budget > maxPropfindNodes {
+			return errors.New("PROPFIND depth=infinity exceeds node budget")
+		}
 		// Paths may carry a trailing slash (client requests /d/); join without
 		// introducing "//" so the emitted hrefs stay canonical for the client's
 		// svn_fspath__skip_ancestor assertion.
@@ -465,7 +476,7 @@ func (s *Server) propChildren(b *strings.Builder, repo *fs.Repo, base, name stri
 		if depth == "infinity" {
 			cnr, err := repo.Resolve(rev, cpath)
 			if err == nil && cnr.Kind == fs.KindDir {
-				if err := s.propChildren(b, repo, base, name, rev, cpath, props, depth); err != nil {
+				if err := s.propChildren(b, repo, base, name, rev, cpath, props, depth, budget); err != nil {
 					return err
 				}
 			}
