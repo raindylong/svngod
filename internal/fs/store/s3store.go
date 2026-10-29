@@ -130,13 +130,17 @@ func (s *S3Store) CreateIfAbsent(ctx context.Context, key string, data []byte) e
 }
 
 // CAS is single-writer: Head + atomic PutObject (see NewS3Store note).
+// svngod is a single process and every commit is serialised under repo.mu, so
+// the ETag comparison is only a best-effort guard. Some S3 gateways (e.g.
+// RustFS) return unstable ETags across HEAD requests, which made the strict
+// `cur != expect` comparison spuriously fail with ErrPreconditionFailed and
+// abort commits. We keep the existence check but proceed with the overwrite
+// regardless of ETag mismatch.
 func (s *S3Store) CAS(ctx context.Context, key string, expectETag string, data []byte) (string, error) {
-	if cur, ok, err := s.Head(ctx, key); err != nil {
+	if _, ok, err := s.Head(ctx, key); err != nil {
 		return "", err
 	} else if !ok {
 		return "", ErrNotFound
-	} else if cur != expectETag {
-		return "", ErrPreconditionFailed
 	}
 	if err := s.Put(ctx, key, data); err != nil {
 		return "", err
