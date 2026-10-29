@@ -98,7 +98,17 @@ func (r *Repo) loadNode(id NodeID) (*tnode, error) {
 	return t, nil
 }
 
-// segments splits a path into its components (strips leading/trailing "/").
+// segments splits a path into its components, dropping empty, "." and ".."
+// segments. Dropping ".." prevents path-traversal attempts (e.g. a request for
+// "/dir/../../secret") from escaping the intended repo subtree: the effective
+// path never contains a parent reference.
 func segments(path string) []string {
-	return strings.FieldsFunc(path, func(r rune) bool { return r == '/' })
+	var out []string
+	for _, s := range strings.FieldsFunc(path, func(r rune) bool { return r == '/' }) {
+		if s == ".." || s == "." || s == "" {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
 }

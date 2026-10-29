@@ -149,7 +149,17 @@ func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name s
 	b.WriteString("  <S:target-revision rev=\"" + strconv.FormatUint(rev, 10) + "\"/>\n")
 	rp, _ := repo.GetRevProps(rev)
 	uuid, _ := repo.UUID()
-	if err := s.updateWalkDir(&b, repo, base, rev, baseRev, rootPath, "open-directory", true, rp, uuid); err != nil {
+	// Pre-index the baseline revision's subtree once, so updateWalkDir can
+	// resolve each file's baseline text by map lookup instead of a per-file
+	// Resolve(baseRev, path) that re-walks the tree for every node.
+	baseIdx := map[string]fs.NodeID{}
+	if baseRev > 0 && baseRev != rev {
+		if err := indexTree(repo, baseRev, rootPath, baseIdx); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	if err := s.updateWalkDir(&b, repo, base, rev, baseRev, rootPath, "open-directory", true, rp, uuid, baseIdx); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -157,6 +167,25 @@ func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name s
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	io.WriteString(w, b.String())
+}
+
+// indexTree walks rev's subtree rooted at path and records cpath -> NodeID for
+// every descendant, enabling O(1) baseline lookups during update-report.
+func indexTree(repo *fs.Repo, rev uint64, path string, out map[string]fs.NodeID) error {
+	children, err := repo.ListDir(rev, path)
+	if err != nil {
+		return err
+	}
+	for _, c := range children {
+		cpath := path + "/" + c.Name
+		out[cpath] = c.ID
+		if c.Kind == fs.KindDir {
+			if err := indexTree(repo, rev, cpath, out); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // writeEntryProps emits svn:entry properties for a node. svn's update editor
@@ -181,7 +210,7 @@ func writeEntryProps(b *strings.Builder, rp *fs.RevProps, uuid string, rev uint6
 // add-file with fulltext txdelta), walking the whole subtree at rev. baseRev
 // is the client's WC baseline revision (from <S:revision>); when > 0 the file
 // txdelta is sent as a delta from the baseline revision's text (svn diff).
-func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, rev uint64, baseRev uint64, path, openEl string, wrap bool, rp *fs.RevProps, uuid string) error {
+func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, rev uint64, baseRev uint64, path, openEl string, wrap bool, rp *fs.RevProps, uuid string, baseIdx map[string]fs.NodeID) error {
 	if wrap {
 		b.WriteString("  <S:" + openEl + " rev=\"" + strconv.FormatUint(rev, 10) + "\">\n")
 	}
@@ -200,7 +229,7 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 			b.WriteString("      <D:checked-in><D:href>" + xmlEscape(bc) + "</D:href></D:checked-in>\n")
 			writeEntryProps(b, rp, uuid, rev)
 			writeNodeProps(b, c.Props)
-			if err := s.updateWalkDir(b, repo, base, rev, baseRev, cpath, "add-directory", false, rp, uuid); err != nil {
+			if err := s.updateWalkDir(b, repo, base, rev, baseRev, cpath, "add-directory", false, rp, uuid, baseIdx); err != nil {
 				return err
 			}
 			b.WriteString("    </S:add-directory>\n")
@@ -209,7 +238,10 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 			bc := base + "!svn/bc/" + strconv.FormatUint(rev, 10) + "/" + strings.TrimPrefix(cpath, "/")
 			b.WriteString("      <D:checked-in><D:href>" + xmlEscape(bc) + "</D:href></D:checked-in>\n")
 			writeEntryProps(b, rp, uuid, rev)
-			nr, err := repo.Resolve(rev, cpath)
+			// use the child's immutable node id from ListDir directly, avoiding a
+			// per-file Resolve (which re-walks the root->path chain and re-reads
+			// every block on the way).
+			nr, err := repo.GetNodeRev(c.ID)
 			if err != nil {
 				return err
 			}
@@ -220,8 +252,8 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 			writeNodeProps(b, nr.Props)
 			var baseText []byte
 			if baseRev > 0 && baseRev != rev {
-				if bnr, berr := repo.Resolve(baseRev, cpath); berr == nil && bnr.Kind == fs.KindFile {
-					if bt, gerr := repo.GetText(bnr.Node); gerr == nil {
+				if bid, ok := baseIdx[cpath]; ok {
+					if bt, gerr := repo.GetText(bid); gerr == nil {
 						baseText = bt
 					}
 				}
