@@ -41,36 +41,68 @@ func maybeInflate(b []byte) ([]byte, error) {
 }
 
 // decompressSeg decompresses an svndiff ins/data section according to the
-// window version: v0 raw (tolerating an incidental zlib header), v1 zlib,
-// v2 lz4 block.
+// window version, using subversion's exact semantics (svn__compress_zlib /
+// svn__compress_lz4 in libsvn_subr/compress_{zlib,lz4}.c):
+//
+//   segment = svn__encode_uint(original_len) ++ payload
+//
+// where payload is the raw (uncompressed) data when the original length is
+// small (< MIN_COMPRESS_SIZE = 512 for zlib) or when compression did not help
+// (compressed_len >= original_len), and a zlib (v1) / lz4 (v2) stream
+// otherwise. v0 sections carry no length prefix and are raw opcodes/data.
+//
+// decoding rule: read the leading varint; if the remaining length equals the
+// stored original length the payload is raw, otherwise decompress the payload
+// into exactly original_len bytes (svn__decompress_zlib / svn__decompress_lz4).
 func decompressSeg(version byte, b []byte) ([]byte, error) {
-	switch version {
-	case 1:
-		r, err := zlib.NewReader(bytes.NewReader(b))
-		if err != nil {
-			return nil, err
-		}
-		defer r.Close()
-		return io.ReadAll(r)
-	case 2:
-		dst := make([]byte, 1<<20) // 1 MiB initial guess
-		n, err := lz4.UncompressBlock(b, dst)
-		if err == nil && n > 0 {
-			return dst[:n], nil
-		}
-		dst = make([]byte, 1<<28) // 256 MiB fallback
-		n, err = lz4.UncompressBlock(b, dst)
-		if err == nil && n > 0 {
-			return dst[:n], nil
-		}
-		// svn 1.14 sends "v2" windows with *uncompressed* ins/data sections
-		// over HTTP when the window is a simple insert (see
-		// send_simple_insertion_window, which never compresses). Fall back to
-		// treating the section as raw bytes.
-		return b, nil
-	default:
+	if version == 0 {
 		return maybeInflate(b)
 	}
+	if len(b) == 0 {
+		return nil, errors.New("svndiff: empty compressed section")
+	}
+	orig, n, err := readUint(b)
+	if err != nil {
+		return nil, err
+	}
+	if orig > 1<<28 {
+		return nil, errors.New("svndiff: decompressed section too large")
+	}
+	payload := b[n:]
+	if len(payload) == int(orig) {
+		return payload, nil // raw, uncompressed
+	}
+	dst := make([]byte, int(orig))
+	if version == 1 {
+		if err := inflateInto(payload, dst); err != nil {
+			return nil, fmt.Errorf("svndiff: zlib: %w", err)
+		}
+		return dst, nil
+	}
+	if version == 2 {
+		if _, err := lz4.UncompressBlock(payload, dst); err != nil {
+			return nil, fmt.Errorf("svndiff: lz4: %w", err)
+		}
+		return dst, nil
+	}
+	return nil, fmt.Errorf("svndiff: unsupported version %d", version)
+}
+
+// inflateInto decompresses a raw-deflate/zlib stream in src into dst (exactly).
+func inflateInto(src, dst []byte) error {
+	r, err := zlib.NewReader(bytes.NewReader(src))
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	got, err := io.ReadFull(r, dst)
+	if err != nil {
+		return err
+	}
+	if got != len(dst) {
+		return errors.New("svndiff: zlib output size mismatch")
+	}
+	return nil
 }
 
 const (
@@ -116,73 +148,45 @@ func Version(data []byte) int {
 }
 
 // --- length encoding (svn__encode_uint / svn__decode_uint) ---
+//
+// Subversion's varint is encoded *little-endian base-128*: every byte carries
+// 7 bits of the value, the high bit of all bytes except the LAST is set (0x80
+// set = "more bytes follow"), and the last byte has the high bit clear. This is
+// the svn__encode_uint/svn__decode_uint scheme in libsvn_subr/encode.c. It is
+// NOT the "first byte selects the width" scheme (0x80→2B, 0xc0→3B, ...) that
+// this package previously implemented.
 
-// writeUint encodes val using subversion's variable-length integer encoding.
-// Each following byte carries 7 bits; the lead byte's top bits encode the length
-// (0x80→2 bytes, 0xc0→3, 0xe0→4, 0xf0→5), matching svn__encode_uint in svndiff.c.
+// writeUint encodes val using subversion's variable-length integer encoding
+// (svn__encode_uint): bytes carry 7 bits each, every byte except the last has
+// bit 7 set, the last byte has bit 7 clear.
 func writeUint(buf *bytes.Buffer, val uint64) {
-	switch {
-	case val < 0x80:
-		buf.WriteByte(byte(val))
-	case val < 0x4000:
-		buf.WriteByte(byte(0x80 | (val >> 7)))
-		buf.WriteByte(byte(val & 0x7f))
-	case val < 0x200000:
-		buf.WriteByte(byte(0xc0 | (val >> 14)))
-		buf.WriteByte(byte((val >> 7) & 0x7f))
-		buf.WriteByte(byte(val & 0x7f))
-	case val < 0x10000000:
-		buf.WriteByte(byte(0xe0 | (val >> 21)))
-		buf.WriteByte(byte((val >> 14) & 0x7f))
-		buf.WriteByte(byte((val >> 7) & 0x7f))
-		buf.WriteByte(byte(val & 0x7f))
-	default:
-		buf.WriteByte(0xf0)
-		buf.WriteByte(byte((val >> 24) & 0x7f))
-		buf.WriteByte(byte((val >> 16) & 0x7f))
-		buf.WriteByte(byte((val >> 8) & 0x7f))
-		buf.WriteByte(byte(val & 0x7f))
+	// Number of bytes: n = 1 + floor(log_128(val)).
+	n := 1
+	v := val >> 7
+	for v > 0 {
+		v >>= 7
+		n++
 	}
+	// High bytes carry 0x80; final byte carries no continuation bit.
+	for i := n - 1; i >= 1; i-- {
+		buf.WriteByte(byte((val>>(uint(i)*7) | 0x80) & 0xff))
+	}
+	buf.WriteByte(byte(val & 0x7f))
 }
 
-// readUint decodes a variable-length integer, returning the value and bytes consumed.
+// readUint decodes a subversion varint (svn__decode_uint), returning the value
+// and the number of bytes consumed. It stops at the first byte with the high
+// bit clear.
 func readUint(b []byte) (uint64, int, error) {
-	if len(b) == 0 {
-		return 0, 0, ioErrUnexpectedEOF
+	var temp uint64
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		if c < 0x80 {
+			return (temp << 7) | uint64(c), i + 1, nil
+		}
+		temp = (temp << 7) | uint64(c&0x7f)
 	}
-	c := b[0]
-	var v uint64
-	var n int
-	switch {
-	case c&0x80 == 0:
-		v = uint64(c & 0x7f)
-		n = 1
-	case c&0xc0 == 0x80:
-		if len(b) < 2 {
-			return 0, 0, ioErrUnexpectedEOF
-		}
-		v = uint64(c&0x7f)<<7 | uint64(b[1]&0x7f)
-		n = 2
-	case c&0xe0 == 0xc0:
-		if len(b) < 3 {
-			return 0, 0, ioErrUnexpectedEOF
-		}
-		v = uint64(c&0x3f)<<14 | uint64(b[1]&0x7f)<<7 | uint64(b[2]&0x7f)
-		n = 3
-	case c&0xf0 == 0xe0:
-		if len(b) < 4 {
-			return 0, 0, ioErrUnexpectedEOF
-		}
-		v = uint64(c&0x1f)<<21 | uint64(b[1]&0x7f)<<14 | uint64(b[2]&0x7f)<<7 | uint64(b[3]&0x7f)
-		n = 4
-	default:
-		if len(b) < 5 {
-			return 0, 0, ioErrUnexpectedEOF
-		}
-		v = uint64(c&0x0f)<<28 | uint64(b[1]&0x7f)<<21 | uint64(b[2]&0x7f)<<14 | uint64(b[3]&0x7f)<<7 | uint64(b[4]&0x7f)
-		n = 5
-	}
-	return v, n, nil
+	return 0, 0, ioErrUnexpectedEOF
 }
 
 var ioErrUnexpectedEOF = errors.New("svndiff: unexpected end of input")
