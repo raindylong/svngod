@@ -180,7 +180,7 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request, res reso
 			children := depth == "1" || depth == "infinity"
 			// When listing, parent href must use the same !svn/bln prefix as its
 			// children, else the client's svn_fspath__skip_ancestor assertion fails.
-			if err := s.propNode(&b, repo, base, res.repo, rev, path, props, propnames, children); err != nil {
+			if err := s.propNode(&b, repo, base, res.repo, rev, path, nil, props, propnames, children); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -201,7 +201,7 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request, res reso
 			}
 		}
 	default:
-		if err := s.propNode(&b, repo, base, res.repo, rev, path, props, propnames, depth == "1" || depth == "infinity"); err != nil {
+		if err := s.propNode(&b, repo, base, res.repo, rev, path, nil, props, propnames, depth == "1" || depth == "infinity"); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -288,18 +288,21 @@ func (s *Server) propBaselineColl(b *strings.Builder, repo *fs.Repo, base, name 
 }
 
 // propNode writes props for a concrete node (file or dir) at (rev,path).
-func (s *Server) propNode(b *strings.Builder, repo *fs.Repo, base, name string, rev uint64, path string, props []Name, propnames, publicHref bool) error {
-	nr, err := repo.Resolve(rev, path)
-	if err != nil {
-		if errors.Is(err, fs.ErrPathNotFound) {
-			// resource does not exist at this rev: emit 404 propstat
-			b.WriteString("  <D:response>\n")
-			b.WriteString("    <D:href>" + base + privateHref(rev, path) + "</D:href>\n")
-			b.WriteString("    <D:status>HTTP/1.1 404 Not Found</D:status>\n")
-			b.WriteString("  </D:response>\n")
-			return nil
+func (s *Server) propNode(b *strings.Builder, repo *fs.Repo, base, name string, rev uint64, path string, nr *fs.NodeRev, props []Name, propnames, publicHref bool) error {
+	if nr == nil {
+		rn, err := repo.Resolve(rev, path)
+		if err != nil {
+			if errors.Is(err, fs.ErrPathNotFound) {
+				// resource does not exist at this rev: emit 404 propstat
+				b.WriteString("  <D:response>\n")
+				b.WriteString("    <D:href>" + base + privateHref(rev, path) + "</D:href>\n")
+				b.WriteString("    <D:status>HTTP/1.1 404 Not Found</D:status>\n")
+				b.WriteString("  </D:response>\n")
+				return nil
+			}
+			return err
 		}
-		return err
+		nr = rn
 	}
 	if propnames {
 		// svn proplist: emit property names only (empty elements), excluding
@@ -397,7 +400,11 @@ func (s *Server) propChildren(b *strings.Builder, repo *fs.Repo, base, name stri
 		// introducing "//" so the emitted hrefs stay canonical for the client's
 		// svn_fspath__skip_ancestor assertion.
 		cpath := strings.TrimRight(path, "/") + "/" + c.Name
-		if err := s.propNode(b, repo, base, name, rev, cpath, props, false, true); err != nil {
+		// ListDir already returned each child's NodeRev fields; pass the
+		// pre-parsed rev so propNode does not re-Resolve (which would expand the
+		// whole parent dir per child => O(n^2) on a big directory).
+		cnr := &fs.NodeRev{Node: c.ID, Kind: c.Kind, Props: c.Props}
+		if err := s.propNode(b, repo, base, name, rev, cpath, cnr, props, false, true); err != nil {
 			return err
 		}
 		if depth == "infinity" {
