@@ -27,8 +27,17 @@
 - 读回一致性：fs 单测全过；svn import/co 200 文件读回字节一致。
 - git：`5ebda18`(svndiff) → `0f91de0`(co修复) → `4e270eb`(update-report perf) → `1968cfb`(CAS) → `7cbd916`(懒加载) → `3b3efb4`(日志清理) → `b32079c`(loadbulk 分目录) → `dd97592`(双后端对比文档) → `4d13a69`(PROPFIND O(n²) 修复)。
 
+### 协议层大目录 O(n²) 消除（git 4d13a69）
+- **PROPFIND**：propChildren 每 child 调 propNode(path)，内部 re-Resolve 会从根重展开父目录 → 大目录 O(n²)。ListDir 已返回每个 child 的 NodeRev 字段，改为**预解析 NodeRev 直传**跳过 Resolve → 线性。svn ls 200 文件 **2.84s → 0.668s（4.3 倍）**；1000 文件大目录 9.24s（慢在客户端解析 1000 条 XML）。
+- **PUT/REPORT 确认线性**：nodeCache 按不可变 id 缓存 NodeRev+ByName（PUT 1 秒 124 文件）；update-report 用 indexTree 预取 + child NodeID 直取（co 200 文件 12.3s）。协议层大目录无 O(n²) 遗留。
+
 ### PROPFIND 大目录 O(n²) 修复（决定性，git 4d13a69）
 - 根因：propChildren 逐 child 调 propNode(path)，propNode 内部 `repo.Resolve(rev, path)` **从根重展开整个父目录** → 大目录 N 个 child 展开 N 次 → O(n²)。
 - 修复：ListDir 已返回每个 child 的 NodeRev 字段（Kind/ID/Props），propNode 改为接受**预解析 NodeRev**，propChildren 直传跳过 Resolve → **线性 O(n)**。
 - 实测：svn ls 200 文件 **2.84s → 0.668s（4.3 倍）**；svn ls 1000 文件 9.24s（服务器线性，慢在客户端解析 1000 条 XML）。
 - 注：PUT（nodeCache 按不可变 id 缓存 NodeRev+ByName）与 REPORT update-report（indexTree 预取 + child NodeID 直取）**本身已线性**，协议层无 O(n²) 遗留。
+
+### 协议层优化（2026-10-30）
+- **PROPFIND O(n²) 修复（git 4d13a69）**：propChildren 原每 child 调 propNode→Resolve，每个子项都从根重展开父目录（大目录 O(n²)）。ListDir 已返回各子项 NodeRev 字段（Kind/ID/Props），改为直传预解析 NodeRev 跳过 Resolve → 线性。实测 svn ls 200 文件 2.84s → 0.668s（4.3 倍）。
+- **PUT/REPORT 已线性**：nodeCache 按不可变 id 缓存 NodeRev+ByName 索引（PUT 1 秒 124 文件）；update-report 用 indexTree 预取 + child NodeID 直取（co 200 文件 12.3s）。
+- **大目录端到端**：挂载 loadbulk 大库后 svn ls c00（1000 文件）9.24s 线性；根递归 30000 / co 30000 全量下载为客户端侧开销（递归 XML、1.5GB 下载），服务器无 O(n²) 遗留。
