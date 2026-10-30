@@ -38,7 +38,13 @@ func (s *Server) handleLockUnlock(w http.ResponseWriter, r *http.Request, res re
 }
 
 func (s *Server) handleLock(w http.ResponseWriter, r *http.Request, res resource) {
-	owner := parseLockOwner(r.Body)
+	// The lock owner must be the authenticated principal, never the client's
+	// <D:owner> (svn lock -m puts the comment there, and LOCK may arrive
+	// without credentials / challenge). Anonymous -> "anonymous".
+	owner := "anonymous"
+	if id := IdentityFrom(r.Context()); id.Username != "" {
+		owner = id.Username
+	}
 	path := res.path
 	if path == "" {
 		path = "/"
