@@ -174,7 +174,7 @@ func indexTree(repo *fs.Repo, rev uint64, path string, out map[string]fs.NodeID)
 		return err
 	}
 	for _, c := range children {
-		cpath := path + "/" + c.Name
+		cpath := strings.TrimSuffix(path, "/") + "/" + c.Name
 		out[cpath] = c.ID
 		if c.Kind == fs.KindDir {
 			if err := indexTree(repo, rev, cpath, out); err != nil {
@@ -219,7 +219,7 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 	// stable ordering
 	sort.Slice(children, func(i, j int) bool { return children[i].Name < children[j].Name })
 	for _, c := range children {
-		cpath := path + "/" + c.Name
+		cpath := strings.TrimSuffix(path, "/") + "/" + c.Name
 		if c.Kind == fs.KindDir {
 			bc := base + "!svn/bc/" + strconv.FormatUint(rev, 10) + "/" + strings.TrimPrefix(cpath, "/")
 			b.WriteString("    <S:add-directory name=\"" + xmlEscape(c.Name) + "\" bc-url=\"" + xmlEscape(bc) + "\">\n")
