@@ -25,14 +25,22 @@ var ErrRepoNotFound = errors.New("fs: repository not found")
 var ErrPathNotFound = errors.New("fs: path not found")
 var ErrOutOfDate = errors.New("fs: commit base revision is out of date")
 
+// OutOfDateError identifies the path whose working-copy revision predates a
+// concurrent change. It unwraps to ErrOutOfDate so callers can keep using
+// errors.Is.
+type OutOfDateError struct{ Path string }
+
+func (e *OutOfDateError) Error() string { return "fs: " + e.Path + " is out of date" }
+func (e *OutOfDateError) Unwrap() error { return ErrOutOfDate }
+
 // Repo is a versioned repository backed by an object Store.
 type Repo struct {
-	store   store.Store
-	keys    *store.Keys
-	shardSz uint64
+	store    store.Store
+	keys     *store.Keys
+	shardSz  uint64
 	maxDelta uint64
 
-	mu   sync.Mutex
+	mu    sync.Mutex
 	cache *cache.LRU
 	// nodeCache caches decoded node-revs by immutable id so repeated Resolve /
 	// ListDir on the same revision reuse the node (and its ByName index) instead
@@ -408,31 +416,45 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 	// disjoint paths merge cleanly; concurrent commits to the same path are
 	// rejected (native svn raises E160024 here) instead of silently
 	// last-write-wins over each other.
-	if baseRev > 0 {
-		for _, ch := range changes {
-			// Root / directory changes: svn clients routinely attach root and
-			// directory property changes (e.g. svn:date) to every commit.
-			// A directory's node-rev moves whenever any child changes, so a
-			// strict check here would falsely reject disjoint-path commits
-			// ("/svn/demo conflicts"). Children's add/modify/delete carry their
-			// own Change entries and are still guarded below, so skipping
-			// directories loses no lost-update protection.
-			if ch.Path == "/" || ch.Kind == KindDir {
-				continue
-			}
-			hnr, err := r.Resolve(cur.Head, ch.Path)
-			if err == nil {
-				if hnr.Node.Rev > baseRev {
-					log.Printf("fs: commit OOD file=%s headRev=%d baseRev=%d -> reject", ch.Path, hnr.Node.Rev, baseRev)
-					return 0, ErrOutOfDate
+	for _, ch := range changes {
+		// Root / directory changes: svn clients routinely attach root and
+		// directory property changes (e.g. svn:date) to every commit.
+		// A directory's node-rev moves whenever any child changes, so a
+		// strict check here would falsely reject disjoint-path commits
+		// ("/svn/demo conflicts"). Children's add/modify/delete carry their
+		// own Change entries and are still guarded below, so skipping
+		// directories loses no lost-update protection.
+		if ch.Path == "/" || ch.Kind == KindDir {
+			continue
+		}
+		// Prefer the client's own base revision for this path; fall back to
+		// the transaction base for writers that do not send one.
+		base := ch.BaseRev
+		if base == 0 {
+			base = baseRev
+		}
+		hnr, err := r.Resolve(cur.Head, ch.Path)
+		if err == nil {
+			if base == 0 {
+				if ch.Action == ActionAdd {
+					// The client adds a node that another commit created first.
+					log.Printf("fs: commit conflict (already exists) path=%s head=%d", ch.Path, cur.Head)
+					return 0, &OutOfDateError{Path: ch.Path}
 				}
 				continue
 			}
-			// Path absent at HEAD but present at baseRev: it was deleted by a
-			// concurrent commit, so a change touching it is out of date.
-			if _, e := r.Resolve(baseRev, ch.Path); e == nil {
-				log.Printf("fs: commit OOD deleted-in-window file=%s head=%d base=%d -> reject", ch.Path, cur.Head, baseRev)
-				return 0, ErrOutOfDate
+			if hnr.Node.Rev > base {
+				log.Printf("fs: commit OOD path=%s headRev=%d baseRev=%d -> reject", ch.Path, hnr.Node.Rev, base)
+				return 0, &OutOfDateError{Path: ch.Path}
+			}
+			continue
+		}
+		// Path absent at HEAD but present at the client's base revision: it was
+		// deleted by a concurrent commit, so a change touching it is out of date.
+		if base > 0 {
+			if _, e := r.Resolve(base, ch.Path); e == nil {
+				log.Printf("fs: commit OOD deleted-in-window path=%s head=%d base=%d -> reject", ch.Path, cur.Head, base)
+				return 0, &OutOfDateError{Path: ch.Path}
 			}
 		}
 	}
@@ -554,9 +576,9 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 
 // VerifyIssue describes one integrity failure found by Verify.
 type VerifyIssue struct {
-	Path       string
-	Rev        uint64
-	Err        error
+	Path        string
+	Rev         uint64
+	Err         error
 	Rebuildable bool // text delta whose base+delta are intact => can be rebuilt
 }
 
@@ -587,9 +609,9 @@ func (r *Repo) Verify(headRev uint64) ([]VerifyIssue, error) {
 		}
 		if _, err := r.GetText(nr.Node); err != nil {
 			issues = append(issues, VerifyIssue{
-				Path:       path,
-				Rev:        rev,
-				Err:        err,
+				Path:        path,
+				Rev:         rev,
+				Err:         err,
 				Rebuildable: nr.TextRep == TextRepDelta && nr.Base != nil,
 			})
 		}

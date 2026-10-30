@@ -1,12 +1,14 @@
 package server
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,6 +33,11 @@ type txnChange struct {
 	props        map[string]string
 	copyFromPath string
 	copyFromRev  uint64
+	// baseRev is the client's working-copy revision for this path
+	// (X-SVN-Version-Name), 0 when the path is new. It is the correct base
+	// for svndiff PUTs and for the out-of-date check: using the transaction's
+	// HEAD instead silently merged deltas into the wrong text.
+	baseRev uint64
 }
 
 // txn is a checked-out working resource bound to an activity.
@@ -172,6 +179,30 @@ func (s *Server) openRepoOnly(w http.ResponseWriter, name string) (*fs.Repo, boo
 	return r, true
 }
 
+// clientBaseRevision returns the working-copy revision a mutating request is
+// based on (X-SVN-Version-Name), or 0 when the node is new.
+func clientBaseRevision(r *http.Request) uint64 {
+	if v := r.Header.Get("X-SVN-Version-Name"); v != "" {
+		if n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 64); err == nil {
+			return n
+		}
+	}
+	return 0
+}
+
+// writeOutOfDate rejects a stale working copy the way mod_dav_svn does: 409
+// with a DAV error body whose errcode makes the client report E170004
+// ("File ... is out of date") instead of a generic HTTP failure.
+func writeOutOfDate(w http.ResponseWriter, path string) {
+	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+	w.WriteHeader(http.StatusConflict)
+	fmt.Fprintf(w, `<?xml version="1.0" encoding="utf-8"?>`+"\n"+
+		`<D:error xmlns:D="DAV:" xmlns:m="http://apache.org/dav/xmlns" xmlns:C="svn:">`+"\n"+
+		`<C:error/>`+"\n"+
+		`<m:human-readable errcode="170004">File '%s' is out of date</m:human-readable>`+"\n"+
+		`</D:error>`+"\n", xmlEscape(path))
+}
+
 // --- PROPPATCH ---
 
 func (s *Server) handleProppatch(w http.ResponseWriter, r *http.Request, res resource) {
@@ -262,6 +293,9 @@ func (s *Server) handleProppatch(w http.ResponseWriter, r *http.Request, res res
 		if ch.props == nil {
 			ch.props = map[string]string{}
 		}
+		if br := clientBaseRevision(r); br > 0 {
+			ch.baseRev = br
+		}
 		for _, p := range sets {
 			ch.props[svnPropertyKey(p.ns, p.local)] = p.value
 		}
@@ -313,36 +347,66 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 	}
 	ch := tx.changeFor(res.path)
 	ch.kind = fs.KindFile
-	// Existing file at the base revision => this PUT modifies it (204);
-	// otherwise it creates it (201).
+	clientRev := clientBaseRevision(r)
+	isSvndiff := strings.Contains(r.Header.Get("Content-Type"), "svndiff")
+
+	// The delta (and the out-of-date decision) must use the revision the
+	// client based its edit on, never the transaction's HEAD: another commit
+	// may have moved HEAD in between, and applying an old delta to the new
+	// text corrupts the file.
 	isNew := true
-	if tx.baseRev > 0 {
+	if clientRev > 0 {
 		if repo, rok := s.openRepoOnly(w, res.repo); rok {
-			if nr, err := repo.Resolve(tx.baseRev, res.path); err == nil && nr.Kind == fs.KindFile {
-				isNew = false
-				if strings.Contains(r.Header.Get("Content-Type"), "svndiff") {
-					if b, err := repo.GetText(nr.Node); err == nil {
-						// A modifying PUT carries an svndiff delta based on
-						// the checked-out revision of this path.
-						decoded, derr := svndiff.Apply(b, data)
-						if derr != nil {
-							s.mu.Unlock()
-							http.Error(w, "svndiff decode: "+derr.Error(), http.StatusBadRequest)
-							return
+			head, herr := repo.Head()
+			if herr == nil {
+				if hnr, err := repo.Resolve(head, res.path); err == nil {
+					if hnr.Node.Rev > clientRev {
+						s.mu.Unlock()
+						writeOutOfDate(w, res.path)
+						return
+					}
+				} else if _, err := repo.Resolve(clientRev, res.path); err == nil {
+					// Deleted since the client's base revision.
+					s.mu.Unlock()
+					writeOutOfDate(w, res.path)
+					return
+				} else {
+					clientRev = 0 // not present at the client's base either
+				}
+			}
+			if clientRev > 0 {
+				if nr, err := repo.Resolve(clientRev, res.path); err == nil && nr.Kind == fs.KindFile {
+					isNew = false
+					baseText, gerr := repo.GetText(nr.Node)
+					if gerr == nil {
+						if want := r.Header.Get("X-SVN-Base-Fulltext-MD5"); want != "" {
+							sum := md5.Sum(baseText)
+							if !strings.EqualFold(hex.EncodeToString(sum[:]), want) {
+								s.mu.Unlock()
+								writeOutOfDate(w, res.path)
+								return
+							}
 						}
-						data = decoded
+						if isSvndiff {
+							decoded, derr := svndiff.Apply(baseText, data)
+							if derr != nil {
+								s.mu.Unlock()
+								http.Error(w, "svndiff decode: "+derr.Error(), http.StatusBadRequest)
+								return
+							}
+							data = decoded
+						}
 					}
 				}
 			}
 		}
 	}
-	if isNew && strings.Contains(r.Header.Get("Content-Type"), "svndiff") {
+	if isNew && isSvndiff {
 		decoded, derr := svndiff.Apply(nil, data)
 		if derr != nil {
 			// Never persist a decode failure: a brand-new file's body is an
 			// svndiff delta against the empty base; storing the raw delta bytes
 			// would silently corrupt repository contents. Fail the commit.
-			os.WriteFile("/home/user/svngod/bad_delta_dump.bin", data, 0o644) // diagnostic
 			s.mu.Unlock()
 			http.Error(w, "svndiff decode: "+derr.Error(), http.StatusBadRequest)
 			return
@@ -350,6 +414,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 		data = decoded
 	}
 	ch.data = data
+	ch.baseRev = clientRev
 	if ch.props == nil {
 		ch.props = map[string]string{}
 	}
@@ -383,6 +448,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, res resour
 	}
 	ch := tx.changeFor(res.path)
 	ch.action = fs.ActionDelete
+	ch.baseRev = clientBaseRevision(r)
 	s.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -467,6 +533,15 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 		for _, c := range changes {
 			log.Printf("  change path=%q kind=%v action=%v textlen=%d", c.Path, c.Kind, c.Action, len(c.Data))
 		}
+		var ood *fs.OutOfDateError
+		if errors.As(err, &ood) {
+			writeOutOfDate(w, ood.Path)
+			return
+		}
+		if errors.Is(err, fs.ErrOutOfDate) {
+			writeOutOfDate(w, "/")
+			return
+		}
 		http.Error(w, "commit failed: "+err.Error(), http.StatusConflict)
 		return
 	}
@@ -513,6 +588,7 @@ func collectChanges(repo *fs.Repo, tx *txn) []fs.Change {
 			Props:        ch.props,
 			CopyFromPath: ch.copyFromPath,
 			CopyFromRev:  ch.copyFromRev,
+			BaseRev:      ch.baseRev,
 		})
 	}
 	return out

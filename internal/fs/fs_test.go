@@ -3,6 +3,7 @@ package fs
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 
 	"svngod/internal/fs/store"
@@ -10,12 +11,12 @@ import (
 
 func TestNodeRevRoundTrip(t *testing.T) {
 	nr := &NodeRev{
-		Kind:  KindFile,
-		Node:  NodeID{Rev: 3, ID: 7},
-		Pred:  NodeID{Rev: 2, ID: 4},
-		Props: map[string]string{"svn:mime-type": "text/plain", "k": "v"},
+		Kind:    KindFile,
+		Node:    NodeID{Rev: 3, ID: 7},
+		Pred:    NodeID{Rev: 2, ID: 4},
+		Props:   map[string]string{"svn:mime-type": "text/plain", "k": "v"},
 		TextRep: TextRepFull,
-		Text:   []byte("hello world"),
+		Text:    []byte("hello world"),
 	}
 	got, err := UnmarshalNodeRev(nr.Marshal())
 	if err != nil {
@@ -333,5 +334,42 @@ func TestCommitCopyFromHistory(t *testing.T) {
 		if string(txt) != tc.want {
 			t.Fatalf("%s=%q want %q", tc.p, txt, tc.want)
 		}
+	}
+}
+
+// TestCommitStaleBaseRev: a change coded against an older per-path base
+// revision is rejected and names the path, instead of merging into newer text.
+func TestCommitStaleBaseRev(t *testing.T) {
+	st := store.NewMemoryStore()
+	repo, err := CreateRepo(st, "r", 4096, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r1, err := repo.CommitTxn(0, []Change{
+		{Path: "/f.txt", Action: ActionAdd, Kind: KindFile, Data: []byte("v1")},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.CommitTxn(r1, []Change{
+		{Path: "/f.txt", Action: ActionModify, Kind: KindFile, Data: []byte("v2"), BaseRev: r1},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Client still believes it edits r1.
+	_, err = repo.CommitTxn(2, []Change{
+		{Path: "/f.txt", Action: ActionModify, Kind: KindFile, Data: []byte("stale"), BaseRev: r1},
+	}, nil)
+	var ood *OutOfDateError
+	if !errors.As(err, &ood) {
+		t.Fatalf("err = %v, want OutOfDateError", err)
+	}
+	if ood.Path != "/f.txt" {
+		t.Fatalf("path = %q", ood.Path)
+	}
+	if nr, _ := repo.Resolve(2, "/f.txt"); nr == nil {
+		t.Fatal("missing node")
+	} else if txt, _ := repo.GetText(nr.Node); string(txt) != "v2" {
+		t.Fatalf("content changed to %q, want v2", txt)
 	}
 }

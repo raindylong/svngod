@@ -23,6 +23,9 @@ type Change struct {
 	Props        map[string]string
 	CopyFromPath string // ActionCopy
 	CopyFromRev  uint64 // ActionCopy (rev of copy source)
+	// BaseRev is the client's working-copy revision for this path (0 for a
+	// new node); CommitTxn's per-path out-of-date check uses it.
+	BaseRev uint64
 }
 
 // tnode is an in-memory working-copy node during a commit.
@@ -43,8 +46,8 @@ type tnode struct {
 	base       *NodeID
 
 	// per-commit state
-	newID   uint64 // assigned node id for this commit (0 = unassigned)
-	dirty   bool
+	newID uint64 // assigned node id for this commit (0 = unassigned)
+	dirty bool
 
 	// lazy-load flags. A node loaded via lazyLoad keeps its directory children
 	// and file text unexpanded; they are fetched on demand (ensureDir /

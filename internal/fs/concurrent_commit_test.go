@@ -1,6 +1,7 @@
 package fs
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -52,7 +53,7 @@ func TestConcurrentSamePathCommit(t *testing.T) {
 		switch {
 		case e == nil:
 			succ++
-		case e == ErrOutOfDate:
+		case errors.Is(e, ErrOutOfDate):
 			ood++
 		default:
 			winnerErr = fmt.Errorf("unexpected error from goroutine %d: %v", i, e)
@@ -142,7 +143,7 @@ func TestConcurrentSamePathCommitS3(t *testing.T) {
 		switch {
 		case e == nil:
 			succ++
-		case e == ErrOutOfDate:
+		case errors.Is(e, ErrOutOfDate):
 			ood++
 		default:
 			winnerErr = fmt.Errorf("unexpected error from goroutine %d: %v", i, e)
