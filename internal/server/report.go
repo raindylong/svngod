@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -381,7 +382,7 @@ func extractReposPath(url, base string) (string, bool) {
 				if p == "" {
 					return "/", true
 				}
-				return "/" + p, true
+				return "/" + unescapePath(p), true
 			}
 		}
 	}
@@ -394,7 +395,16 @@ func extractReposPath(url, base string) (string, bool) {
 	if p == "" {
 		return "/", true
 	}
-	return "/" + p, true
+	return "/" + unescapePath(p), true
+}
+
+// unescapePath decodes URL-escaped path segments (Chinese / space file names
+// arrive in src-path percent-encoded).
+func unescapePath(p string) string {
+	if dec, err := url.PathUnescape(p); err == nil {
+		return dec
+	}
+	return p
 }
 
 // --- log-report (svn log) ---
