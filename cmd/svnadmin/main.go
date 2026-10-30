@@ -67,6 +67,14 @@ func (o *options) repoStore(localPath string) (store.Store, string, error) {
 		}
 		return st, "repos/" + name, nil
 	}
+	// --prefix is the bucket-level public prefix (default "repos"). The S3
+	// store's own key prefix becomes <public>/<name>, and CreateRepo is called
+	// with repo-root-relative keys (""), so created objects land exactly where
+	// a config entry with storage.prefix=<public> and repo name <name> expects.
+	root := o.prefix
+	if root == "" {
+		root = "repos"
+	}
 	st, err := store.NewS3Store(store.S3Config{
 		Endpoint:   o.endpoint,
 		AccessKey:  o.accessKey,
@@ -74,16 +82,13 @@ func (o *options) repoStore(localPath string) (store.Store, string, error) {
 		Bucket:     o.bucket,
 		Region:     "us-east-1",
 		UseSSL:     o.useSSL,
-		RepoPrefix: o.prefix,
+		RepoPrefix: root,
+		BaseRepo:   name,
 	})
 	if err != nil {
 		return nil, "", err
 	}
-	prefix := o.prefix
-	if prefix == "" {
-		prefix = "repos/" + name
-	}
-	return st, prefix, nil
+	return st, "", nil
 }
 
 // mirrorStore builds a MirrorStore from a --mirror-file JSON array so the repo
