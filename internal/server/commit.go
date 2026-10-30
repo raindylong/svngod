@@ -506,6 +506,26 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 	}
 	tx := a.txn
 	changes := collectChanges(repo, tx)
+	// Per-path authorization: the individual requests were authorized against
+	// their own resource, but a transaction can contain paths it never named
+	// (server-side copies, MOVE destinations). Re-check every changed path,
+	// plus read access to copy sources, exactly where mod_dav_svn does.
+	if az := s.cfg.authzFor(res.repo); az != nil {
+		user := IdentityFrom(r.Context()).Username
+		for _, ch := range changes {
+			if !az.Authorize(user, res.repo, ch.Path, true) {
+				s.mu.Unlock()
+				http.Error(w, "Access forbidden to "+ch.Path, http.StatusForbidden)
+				return
+			}
+			if ch.Action == fs.ActionCopy && ch.CopyFromPath != "" &&
+				!az.Authorize(user, res.repo, ch.CopyFromPath, false) {
+				s.mu.Unlock()
+				http.Error(w, "Access forbidden to "+ch.CopyFromPath, http.StatusForbidden)
+				return
+			}
+		}
+	}
 	revProps := a.revProps
 	if revProps == nil {
 		revProps = map[string]string{}

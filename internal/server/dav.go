@@ -267,7 +267,7 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request, res reso
 				return
 			}
 			if children {
-				if err := s.propChildren(&b, repo, base, res.repo, rev, path, props, depth, &budget); err != nil {
+				if err := s.propChildren(&b, repo, base, res.repo, rev, path, props, depth, &budget, IdentityFrom(r.Context()).Username); err != nil {
 					http.Error(w, err.Error(), http.StatusInternalServerError)
 					return
 				}
@@ -276,7 +276,7 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request, res reso
 			s.propBaselineColl(&b, repo, base, res.repo, rev, props)
 			// depth 1/infinity: list the baseline's root directory children.
 			if depth == "1" || depth == "infinity" {
-				if err := s.propChildren(&b, repo, base, res.repo, rev, "/", props, depth, &budget); err != nil {
+				if err := s.propChildren(&b, repo, base, res.repo, rev, "/", props, depth, &budget, IdentityFrom(r.Context()).Username); err != nil {
 					http.Error(w, err.Error(), http.StatusInternalServerError)
 					return
 				}
@@ -293,7 +293,7 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request, res reso
 		}
 		// depth 1/infinity: children
 		if depth == "1" || depth == "infinity" {
-			if err := s.propChildren(&b, repo, base, res.repo, rev, path, props, depth, &budget); err != nil {
+			if err := s.propChildren(&b, repo, base, res.repo, rev, path, props, depth, &budget, IdentityFrom(r.Context()).Username); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -501,7 +501,7 @@ func (s *Server) propNode(b *strings.Builder, repo *fs.Repo, base, name string, 
 }
 
 // propChildren writes immediate children (depth 1) or full subtree (infinity).
-func (s *Server) propChildren(b *strings.Builder, repo *fs.Repo, base, name string, rev uint64, path string, props []Name, depth string, budget *int) error {
+func (s *Server) propChildren(b *strings.Builder, repo *fs.Repo, base, name string, rev uint64, path string, props []Name, depth string, budget *int, user string) error {
 	nr, err := repo.Resolve(rev, path)
 	if err != nil {
 		return nil // not a dir
@@ -524,6 +524,10 @@ func (s *Server) propChildren(b *strings.Builder, repo *fs.Repo, base, name stri
 		// introducing "//" so the emitted hrefs stay canonical for the client's
 		// svn_fspath__skip_ancestor assertion.
 		cpath := strings.TrimRight(path, "/") + "/" + c.Name
+		// Never disclose inaccessible subtrees in a directory listing.
+		if az := s.cfg.authzFor(name); az != nil && !az.Authorize(user, name, cpath, false) {
+			continue
+		}
 		// ListDir already returned each child's NodeRev fields; pass the
 		// pre-parsed rev so propNode does not re-Resolve (which would expand the
 		// whole parent dir per child => O(n^2) on a big directory).
@@ -534,7 +538,7 @@ func (s *Server) propChildren(b *strings.Builder, repo *fs.Repo, base, name stri
 		if depth == "infinity" {
 			cnr, err := repo.Resolve(rev, cpath)
 			if err == nil && cnr.Kind == fs.KindDir {
-				if err := s.propChildren(b, repo, base, name, rev, cpath, props, depth, budget); err != nil {
+				if err := s.propChildren(b, repo, base, name, rev, cpath, props, depth, budget, user); err != nil {
 					return err
 				}
 			}

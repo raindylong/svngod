@@ -59,7 +59,7 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request, res resour
 	case "log-report":
 		s.reportLog(w, repo, res.path, body)
 	case "list-report":
-		s.reportList(w, repo, base, res.path, body)
+		s.reportList(w, r, repo, base, res.repo, res.path, body)
 	case "file-revs-report", "get-file-revs-report", "get-file-revs":
 		s.reportFileRevs(w, repo, base, res.path, body)
 	case "get-location-segments":
@@ -1020,7 +1020,7 @@ var _ = errors.New
 // Request body carries <S:path> and optional <S:prop> entries; response is
 // <S:list-report> with a <S:entry kind=... name=...>per child whose text is
 // the relative path.
-func (s *Server) reportList(w http.ResponseWriter, repo *fs.Repo, base, reportPath string, body []byte) {
+func (s *Server) reportList(w http.ResponseWriter, r *http.Request, repo *fs.Repo, base, repoName, reportPath string, body []byte) {
 	var root xmlEl
 	if err := xml.Unmarshal(body, &root); err != nil {
 		http.Error(w, "bad list-report", http.StatusBadRequest)
@@ -1071,8 +1071,16 @@ func (s *Server) reportList(w http.ResponseWriter, repo *fs.Repo, base, reportPa
 	// namespace and makes clients reject the report).
 	b.WriteString(`<S:list-report xmlns:S="svn:" xmlns:D="` + NS_DAV + `">` + "\n")
 
+	az := s.cfg.authzFor(repoName)
+	user := IdentityFrom(r.Context()).Username
+	allowed := func(p string) bool {
+		return az == nil || az.Authorize(user, repoName, p, false)
+	}
 	var emit func(path string, node *fs.NodeRev)
 	emit = func(path string, node *fs.NodeRev) {
+		if !allowed(path) {
+			return
+		}
 		kind := "file"
 		size := int64(-1)
 		if node.Kind == fs.KindDir {
@@ -1112,6 +1120,9 @@ func (s *Server) reportList(w http.ResponseWriter, repo *fs.Repo, base, reportPa
 		sort.Slice(children, func(i, j int) bool { return children[i].Name < children[j].Name })
 		for _, c := range children {
 			childPath := strings.TrimSuffix(path, "/") + "/" + c.Name
+			if !allowed(childPath) {
+				continue
+			}
 			cnr, err := repo.GetNodeRev(c.ID)
 			if err != nil {
 				continue

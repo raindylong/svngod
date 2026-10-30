@@ -228,6 +228,31 @@ func (s *Server) authorized(user string, res resource, method string) bool {
 	if path == "" {
 		path = "/"
 	}
+	switch method {
+	case MethodMkactivity, "CHECKOUT", "MERGE":
+		// Creating an activity / opening a working resource / finalizing a
+		// commit is not a path operation. Write access is enforced per changed
+		// path when the transaction is committed (handleMerge), so users whose
+		// write grant is on a subtree (e.g. /trunk) can commit without
+		// write on "/".
+		return user != "" || s.cfg.authFor(res.repo) == nil
+	case MethodCopy:
+		// Copying needs read access to the source; the destination is
+		// checked at commit time. Requiring write on the source made
+		// read-only sources impossible to branch from.
+		return az.Authorize(user, res.repo, path, false)
+	case MethodProppatch:
+		// PROPPATCH on the transaction root carries revision properties
+		// (svn:log etc.), not a node change; node props are still checked.
+		if res.typ == resTxn && (res.path == "" || res.path == "/") {
+			return user != "" || s.cfg.authFor(res.repo) == nil
+		}
+	case http.MethodDelete:
+		// Aborting an activity / transaction is cleanup, not a path change.
+		if res.typ == resActivity || res.typ == resTxn {
+			return user != "" || s.cfg.authFor(res.repo) == nil
+		}
+	}
 	write := writeMethods[method]
 	return az.Authorize(user, res.repo, path, write)
 }

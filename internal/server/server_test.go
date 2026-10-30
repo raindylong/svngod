@@ -1,7 +1,6 @@
 package server
 
 import (
-	"strconv"
 	"crypto/sha1"
 	"encoding/base64"
 	"fmt"
@@ -10,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -257,12 +257,12 @@ bob = r
 
 func TestUrlParsing(t *testing.T) {
 	cases := []struct {
-		in      string
-		typ     resourceType
-		repo    string
-		rev     uint64
-		path    string
-		uuid    string
+		in   string
+		typ  resourceType
+		repo string
+		rev  uint64
+		path string
+		uuid string
 	}{
 		{"/svn/demo/", resRoot, "demo", 0, "", ""},
 		{"/svn/demo", resRoot, "demo", 0, "", ""},
@@ -285,4 +285,120 @@ func TestUrlParsing(t *testing.T) {
 		}
 	}
 	_ = fmt.Sprintf
+}
+
+// TestAuthzSubtreeWrite: a user whose only write grant is on a subtree must be
+// able to run the commit protocol (MKACTIVITY/CHECKOUT/PROPPATCH/DELETE used
+// to be authorized against "/", which denied the whole commit), while node
+// writes outside the grant stay forbidden.
+func TestAuthzSubtreeWrite(t *testing.T) {
+	authz := "[/]\nalice = r\n[/trunk]\nalice = rw\n"
+	ts, _, base := testServer(t, "alice:"+shaPass("pw")+"\n", authz)
+	defer ts.Close()
+	user, pass := "alice", "pw"
+
+	resp := doRequest(t, "MKACTIVITY", base+"/svn/demo/!svn/act/u-1", "", user, pass, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("MKACTIVITY status=%d body=%s", resp.StatusCode, bodyOf(t, resp))
+	}
+	resp.Body.Close()
+
+	checkout := `<?xml version="1.0"?><D:checkout xmlns:D="DAV:"><D:activity-set><D:href>` +
+		base + `/svn/demo/!svn/act/u-1</D:href></D:activity-set></D:checkout>`
+	resp = doRequest(t, "CHECKOUT", base+"/svn/demo/!svn/vcc/default", checkout, user, pass, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("CHECKOUT status=%d body=%s", resp.StatusCode, bodyOf(t, resp))
+	}
+	loc := resp.Header.Get("Location")
+	resp.Body.Close()
+	txn := strings.TrimSuffix(loc, "/")
+	if !strings.Contains(txn, "/!svn/txn/") {
+		t.Fatalf("unexpected txn location %q", loc)
+	}
+
+	pp := `<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:" xmlns:S="http://subversion.tigris.org/xmlns/svn/">` +
+		`<D:set><D:prop><S:log>msg</S:log></D:prop></D:set></D:propertyupdate>`
+	resp = doRequest(t, "PROPPATCH", txn, pp, user, pass, nil)
+	if resp.StatusCode != http.StatusMultiStatus {
+		t.Fatalf("root PROPPATCH status=%d body=%s", resp.StatusCode, bodyOf(t, resp))
+	}
+	resp.Body.Close()
+
+	resp = doRequest(t, "PUT", txn+"/trunk/new.txt", "data", user, pass, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT trunk status=%d body=%s", resp.StatusCode, bodyOf(t, resp))
+	}
+	resp.Body.Close()
+
+	resp = doRequest(t, "PUT", txn+"/secret/x.txt", "data", user, pass, nil)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("PUT secret status=%d, want 403", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	resp = doRequest(t, "DELETE", base+"/svn/demo/!svn/act/u-1", "", user, pass, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("activity DELETE status=%d", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+// TestAuthzCommitRechecksCopyDestination: COPY is authorized against its
+// source, so a transaction could carry a change under a path the client never
+// addressed (server-side copy). MERGE must re-check every changed path.
+func TestAuthzCommitRechecksCopyDestination(t *testing.T) {
+	authz := "[/]\nalice = r\n[/trunk]\nalice = rw\n"
+	ts, _, base := testServer(t, "alice:"+shaPass("pw")+"\n", authz)
+	defer ts.Close()
+	user, pass := "alice", "pw"
+
+	startTxn := func(act string) string {
+		resp := doRequest(t, "MKACTIVITY", base+"/svn/demo/!svn/act/"+act, "", user, pass, nil)
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("MKACTIVITY status=%d", resp.StatusCode)
+		}
+		resp.Body.Close()
+		body := `<?xml version="1.0"?><D:checkout xmlns:D="DAV:"><D:activity-set><D:href>` +
+			base + `/svn/demo/!svn/act/` + act + `</D:href></D:activity-set></D:checkout>`
+		resp = doRequest(t, "CHECKOUT", base+"/svn/demo/!svn/vcc/default", body, user, pass, nil)
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("CHECKOUT status=%d", resp.StatusCode)
+		}
+		loc := strings.TrimSuffix(resp.Header.Get("Location"), "/")
+		resp.Body.Close()
+		return loc
+	}
+	merge := func(act string) *http.Response {
+		body := `<?xml version="1.0"?><D:merge xmlns:D="DAV:"><D:source><D:href>` +
+			base + `/svn/demo/!svn/act/` + act + `</D:href></D:source></D:merge>`
+		return doRequest(t, "MERGE", base+"/svn/demo/!svn/vcc/default", body, user, pass, nil)
+	}
+
+	// Denied destination: the copy request itself only checks the source.
+	txn := startTxn("u-2")
+	resp := doRequest(t, "COPY", base+"/svn/demo/!svn/bln/1/trunk/README.txt", "", user, pass,
+		map[string]string{"Destination": txn + "/secret/leak.txt"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("COPY status=%d body=%s", resp.StatusCode, bodyOf(t, resp))
+	}
+	resp.Body.Close()
+	resp = merge("u-2")
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("MERGE into /secret status=%d, want 403: %s", resp.StatusCode, bodyOf(t, resp))
+	}
+	resp.Body.Close()
+
+	// Allowed destination: same flow under /trunk commits.
+	txn = startTxn("u-3")
+	resp = doRequest(t, "COPY", base+"/svn/demo/!svn/bln/1/trunk/README.txt", "", user, pass,
+		map[string]string{"Destination": txn + "/trunk/copy.txt"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("COPY status=%d body=%s", resp.StatusCode, bodyOf(t, resp))
+	}
+	resp.Body.Close()
+	resp = merge("u-3")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("MERGE into /trunk status=%d, want 200: %s", resp.StatusCode, bodyOf(t, resp))
+	}
+	resp.Body.Close()
 }
