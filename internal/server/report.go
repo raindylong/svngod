@@ -288,6 +288,14 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 			sum := md5.Sum(text)
 			md5hex := hex.EncodeToString(sum[:])
 			if inBase {
+				// File unchanged since the client's baseline (its node-rev was
+				// created at or before baseRev) -> the client already has this
+				// version; skip open-file/fetch-file. Emitting a fetch-file here
+				// would make the client validate the base-checksum against its
+				// locally-modified pristine and fail with E155017.
+				if c.ID.Rev <= baseRev {
+					continue
+				}
 				// existing file in client's WC -> open-file (update semantics).
 				// add-file would make the client's add_file() editor skip the
 				// already-versioned file as an obstructing working copy.
