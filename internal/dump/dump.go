@@ -37,6 +37,14 @@ func Dump(repo *fs.Repo, w io.Writer) error {
 	if _, err := io.WriteString(w, "SVN-fs-dump-format-version: 2\n\n"); err != nil {
 		return err
 	}
+	// svnadmin's loader expects the repository UUID header; without it the
+	// stream is still parsed but tools such as svnrdump/svnadmin verify reject
+	// it. A missing uuid is non-fatal, so dump proceeds with an empty value.
+	if uuid, err := repo.UUID(); err == nil && uuid != "" {
+		if _, err := fmt.Fprintf(w, "UUID: %s\n\n", uuid); err != nil {
+			return err
+		}
+	}
 	for rev := uint64(1); rev <= head; rev++ {
 		if err := dumpRevision(repo, w, rev); err != nil {
 			return fmt.Errorf("dump rev %d: %w", rev, err)
@@ -55,9 +63,56 @@ func dumpRevision(repo *fs.Repo, w io.Writer, rev uint64) error {
 		return err
 	}
 	revPropsText := encodeProps(rp.Props)
-	payload := len(revPropsText)
 
-	// Build node payload in a buffer so we can compute Content-length.
+	// A copied directory is one change in svn's history model: its subtree
+	// comes with the copy. Dumping every descendant as an "add" makes
+	// svnadmin load fail with E160020 (path already exists). Drop descendants
+	// that are byte-identical (same node id) to their copy source; keep the
+	// ones that were changed relative to it.
+	type copySkip struct {
+		prefix    string
+		srcPrefix string
+		srcRev    uint64
+	}
+	var skips []copySkip
+	for p, act := range changes {
+		if act != chAdded {
+			continue
+		}
+		if nr, err := repo.Resolve(rev, p); err == nil && nr.CopyFrom != nil && nr.CopyFromPath != "" {
+			skips = append(skips, copySkip{prefix: p, srcPrefix: nr.CopyFromPath, srcRev: nr.CopyFrom.Rev})
+		}
+	}
+	for _, sk := range skips {
+		for p := range changes {
+			if !strings.HasPrefix(p, sk.prefix+"/") {
+				continue
+			}
+			suffix := p[len(sk.prefix):]
+			cur, err1 := repo.Resolve(rev, p)
+			if err1 != nil {
+				continue
+			}
+			// A WC copy may re-create every descendant as its own copy node
+			// (copyfrom == the parent's source mapped to this suffix); such a
+			// node is not a distinct change.
+			if cur.CopyFrom != nil && cur.CopyFromPath == sk.srcPrefix+suffix && cur.CopyFrom.Rev == sk.srcRev {
+				delete(changes, p)
+				continue
+			}
+			// Otherwise skip only when the node is the very same object as the
+			// copy source (shared by reference).
+			src, err2 := repo.Resolve(sk.srcRev, sk.srcPrefix+suffix)
+			if err2 == nil && cur.Node == src.Node {
+				delete(changes, p)
+			}
+		}
+	}
+
+	// Node payload is written after the revision record. In the dump format
+	// Content-length covers only the revision's own property block; node
+	// records follow outside it. Counting node bytes here (as this code used
+	// to) makes svnadmin load desynchronise and reject the stream.
 	var nodes bytes.Buffer
 	paths := make([]string, 0, len(changes))
 	for p := range changes {
@@ -65,17 +120,19 @@ func dumpRevision(repo *fs.Repo, w io.Writer, rev uint64) error {
 	}
 	sort.Strings(paths)
 	for _, p := range paths {
-		n, err := writeNode(&nodes, repo, rev, p, changes[p])
-		if err != nil {
+		if _, err := writeNode(&nodes, repo, rev, p, changes[p]); err != nil {
 			return err
 		}
-		payload += n
 	}
 
 	fmt.Fprintf(w, "Revision-number: %d\n", rev)
 	fmt.Fprintf(w, "Prop-content-length: %d\n", len(revPropsText))
-	fmt.Fprintf(w, "Content-length: %d\n\n", payload)
+	fmt.Fprintf(w, "Content-length: %d\n\n", len(revPropsText))
 	if _, err := w.Write(revPropsText); err != nil {
+		return err
+	}
+	// Blank line separates the revision record from the first node record.
+	if _, err := io.WriteString(w, "\n"); err != nil {
 		return err
 	}
 	if _, err := w.Write(nodes.Bytes()); err != nil {
@@ -85,21 +142,13 @@ func dumpRevision(repo *fs.Repo, w io.Writer, rev uint64) error {
 }
 
 func writeNode(w io.Writer, repo *fs.Repo, rev uint64, path string, action changeKind) (int, error) {
+	// Dump node paths are repository-relative and carry no leading slash.
+	dumpPath := strings.TrimPrefix(path, "/")
 	if action == chDeleted {
-		// kind comes from the previous revision
-		nr, err := repo.Resolve(rev-1, path)
-		if err != nil {
-			return 0, fmt.Errorf("delete %s: %w", path, err)
-		}
-		kind := "file"
-		if nr.Kind == fs.KindDir {
-			kind = "dir"
-		}
-		fmt.Fprintf(w, "Node-path: %s\n", path)
-		fmt.Fprintf(w, "Node-kind: %s\n", kind)
-		fmt.Fprintf(w, "Node-action: delete\n")
-		fmt.Fprintf(w, "Prop-content-length: 0\n")
-		fmt.Fprintf(w, "Content-length: 0\n\n")
+		// A delete carries no kind/props/content: svn_fs_dump writes just
+		// Node-path + Node-action: delete followed by a blank separator line.
+		fmt.Fprintf(w, "Node-path: %s\n", dumpPath)
+		fmt.Fprintf(w, "Node-action: delete\n\n")
 		return 0, nil
 	}
 
@@ -126,10 +175,14 @@ func writeNode(w io.Writer, repo *fs.Repo, rev uint64, path string, action chang
 		}
 	}
 
-	fmt.Fprintf(w, "Node-path: %s\n", path)
+	fmt.Fprintf(w, "Node-path: %s\n", dumpPath)
 	fmt.Fprintf(w, "Node-kind: %s\n", kind)
 	fmt.Fprintf(w, "Node-action: %s\n", actionStr)
-	if nr.CopyFrom != nil {
+	// copyfrom describes how the node came into existence; it is only valid
+	// on add/replace records. A "change" node that inherited an ancestor's
+	// copyfrom (the fs keeps it for lineage) must not repeat it, or loaders
+	// treat the modification as a fresh copy.
+	if nr.CopyFrom != nil && (action == chAdded || action == chReplaced) {
 		fmt.Fprintf(w, "Node-copyfrom-rev: %d\n", nr.CopyFrom.Rev)
 		fmt.Fprintf(w, "Node-copyfrom-path: %s\n", nr.CopyFromPath)
 	}

@@ -72,7 +72,6 @@ func Load(repo *fs.Repo, r io.Reader) error {
 
 	var changes []fs.Change
 	var props map[string]string
-	var remaining int
 	inRevision := false
 	var lastRev uint64
 
@@ -118,6 +117,9 @@ func Load(repo *fs.Repo, r io.Reader) error {
 			if err != nil {
 				return fmt.Errorf("dump: bad Prop-content-length")
 			}
+			if contentLen < plen {
+				return fmt.Errorf("dump: Content-length %d < Prop-content-length %d", contentLen, plen)
+			}
 			propText := make([]byte, plen)
 			if _, err := io.ReadFull(br, propText); err != nil {
 				return err
@@ -126,24 +128,36 @@ func Load(repo *fs.Repo, r io.Reader) error {
 			if err != nil {
 				return err
 			}
-			remaining = contentLen - plen
+			// Node records follow the revision's property block and are NOT
+			// counted in Content-length (standard svnadmin dumps); any extra
+			// bytes in Content-length beyond the props are padding.
+			if pad := contentLen - plen; pad > 0 {
+				if _, err := io.CopyN(io.Discard, br, int64(pad)); err != nil {
+					return err
+				}
+			}
 			inRevision = true
 			continue
 		}
 
+		// Preamble blocks such as "UUID: <uuid>" carry stream metadata, not
+		// repository content; skip them instead of failing (standard dumps
+		// always contain one).
+		if _, ok := hdrs["UUID"]; ok && !inRevision {
+			continue
+		}
 		if _, ok := hdrs["Node-path"]; !ok {
+			if !inRevision {
+				continue // unknown preamble block
+			}
 			return fmt.Errorf("dump: unexpected headers %v", hdrs)
 		}
 		if !inRevision {
 			return fmt.Errorf("dump: node before any revision")
 		}
-		cs, consumed, err := buildChange(repo, br, hdrs)
+		cs, _, err := buildChange(repo, br, hdrs)
 		if err != nil {
 			return err
-		}
-		remaining -= consumed
-		if remaining < 0 {
-			return fmt.Errorf("dump: revision Content-length overrun at %s", hdrs["Node-path"])
 		}
 		changes = append(changes, cs...)
 	}
@@ -171,7 +185,10 @@ func readHeaders(br *bufio.Reader) (map[string]string, error) {
 // A "replace" expands to delete-then-add so the commit preserves the new
 // content instead of a bare delete.
 func buildChange(repo *fs.Repo, br *bufio.Reader, hdrs map[string]string) ([]fs.Change, int, error) {
-	path := hdrs["Node-path"]
+	// Dump node paths are repository-relative ("trunk/a.txt"); fs.Change
+	// wants absolute svn paths ("/trunk/a.txt"). Older svngod dumps wrote a
+	// leading slash, so normalize instead of blindly prefixing.
+	path := "/" + strings.TrimPrefix(hdrs["Node-path"], "/")
 	action := hdrs["Node-action"]
 	kind := hdrs["Node-kind"]
 	plen, _ := strconv.Atoi(hdrs["Prop-content-length"])
@@ -213,7 +230,7 @@ func buildChange(repo *fs.Repo, br *bufio.Reader, hdrs map[string]string) ([]fs.
 			rv, _ := strconv.ParseUint(rev, 10, 64)
 			c.Action = fs.ActionCopy
 			c.CopyFromRev = rv
-			c.CopyFromPath = hdrs["Node-copyfrom-path"]
+			c.CopyFromPath = "/" + strings.TrimPrefix(hdrs["Node-copyfrom-path"], "/")
 		} else {
 			c.Action = fs.ActionAdd
 		}
@@ -231,7 +248,7 @@ func buildChange(repo *fs.Repo, br *bufio.Reader, hdrs map[string]string) ([]fs.
 			rv, _ := strconv.ParseUint(rev, 10, 64)
 			c.Action = fs.ActionCopy
 			c.CopyFromRev = rv
-			c.CopyFromPath = hdrs["Node-copyfrom-path"]
+			c.CopyFromPath = "/" + strings.TrimPrefix(hdrs["Node-copyfrom-path"], "/")
 		} else {
 			c.Action = fs.ActionAdd
 		}
