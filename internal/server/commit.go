@@ -39,6 +39,9 @@ type txnChange struct {
 	// for svndiff PUTs and for the out-of-date check: using the transaction's
 	// HEAD instead silently merged deltas into the wrong text.
 	baseRev uint64
+	// dataRef names the content-addressed body in the repo store for sessions
+	// restored after a restart (the bytes are fetched on first use).
+	dataRef string
 }
 
 // txn is a checked-out working resource bound to an activity.
@@ -69,11 +72,16 @@ func (s *Server) handleMkactivity(w http.ResponseWriter, r *http.Request, res re
 		http.Error(w, "MKACTIVITY requires an activity URI", http.StatusBadRequest)
 		return
 	}
+	repo, rok := s.repo(w, res)
+	if !rok {
+		return
+	}
 	s.mu.Lock()
 	if _, ok := s.activities[res.uuid]; !ok {
 		s.activities[res.uuid] = &activity{id: res.uuid, revProps: map[string]string{}}
 	}
 	s.mu.Unlock()
+	s.persistActivity(repo, res.uuid)
 	w.Header().Set("Location", s.absURL(r, res.repo, "/!svn/act/"+res.uuid+"/"))
 	w.WriteHeader(http.StatusCreated)
 }
@@ -103,6 +111,7 @@ func (s *Server) handleCheckout(w http.ResponseWriter, r *http.Request, res reso
 		http.Error(w, "activity does not exist", http.StatusConflict)
 		return
 	}
+	var repoHandle *fs.Repo
 	if a.txn == nil {
 		repo, rok := s.openRepoOnly(w, res.repo)
 		if !rok {
@@ -117,9 +126,17 @@ func (s *Server) handleCheckout(w http.ResponseWriter, r *http.Request, res reso
 		}
 		a.txn = &txn{id: "txn-" + actID, baseRev: head, changes: map[string]*txnChange{}}
 		s.txns[a.txn.id] = a.txn
+		repoHandle = repo
+	} else if op := s.cfg.openerFor(res.repo); op != nil {
+		if h, err := op(res.repo); err == nil {
+			repoHandle = h
+		}
 	}
 	tx := a.txn
 	s.mu.Unlock()
+	if repoHandle != nil {
+		s.persistActivity(repoHandle, actID)
+	}
 
 	// Return the working resource for this transaction: the checked-out
 	// resource path (e.g. CHECKOUT bln/1/hello.txt -> txn/<id>/hello.txt),
@@ -247,6 +264,7 @@ func (s *Server) handleProppatch(w http.ResponseWriter, r *http.Request, res res
 			a.revProps[svnPropertyKey(p.ns, p.local)] = p.value
 		}
 		s.mu.Unlock()
+		s.persistActivity(repo, res.uuid)
 		w.WriteHeader(http.StatusOK)
 	case resTxn:
 		s.mu.Lock()
@@ -273,6 +291,7 @@ func (s *Server) handleProppatch(w http.ResponseWriter, r *http.Request, res res
 				}
 			}
 			s.mu.Unlock()
+			s.persistActivity(repo, strings.TrimPrefix(tx.id, "txn-"))
 			// 207 multistatus acknowledging the revision props.
 			var b strings.Builder
 			b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
@@ -321,6 +340,7 @@ func (s *Server) handleProppatch(w http.ResponseWriter, r *http.Request, res res
 			delete(ch.props, svnPropertyKey(p.ns, p.local))
 		}
 		s.mu.Unlock()
+		s.persistActivity(repo, strings.TrimPrefix(tx.id, "txn-"))
 		// 207 multistatus acknowledging each prop
 		var b strings.Builder
 		b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
@@ -348,6 +368,10 @@ func (s *Server) handleProppatch(w http.ResponseWriter, r *http.Request, res res
 func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource) {
 	if res.typ != resTxn {
 		http.Error(w, "PUT only applies to a transaction working resource", http.StatusBadRequest)
+		return
+	}
+	repo, rok := s.repo(w, res)
+	if !rok {
 		return
 	}
 	s.mu.Lock()
@@ -440,10 +464,13 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 	}
 	ch.data = data
 	ch.baseRev = clientRev
+	ch.dataRef = ""
 	if ch.props == nil {
 		ch.props = map[string]string{}
 	}
+	actID := strings.TrimPrefix(tx.id, "txn-")
 	s.mu.Unlock()
+	s.persistActivity(repo, actID)
 	w.Header().Set("Location", s.absURL(r, res.repo, "/!svn/txn/"+tx.id+res.path))
 	if isNew {
 		w.WriteHeader(http.StatusCreated)
@@ -455,8 +482,15 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, res resource) {
 	if res.typ == resActivity {
 		s.mu.Lock()
+		a, had := s.activities[res.uuid]
 		delete(s.activities, res.uuid)
+		if had && a.txn != nil {
+			delete(s.txns, a.txn.id)
+		}
 		s.mu.Unlock()
+		if repo, ok := s.repo(w, res); ok {
+			s.dropActivityState(repo, res.uuid)
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -478,7 +512,11 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, res resour
 	ch := tx.changeFor(res.path)
 	ch.action = fs.ActionDelete
 	ch.baseRev = clientBaseRevision(r)
+	actID := strings.TrimPrefix(tx.id, "txn-")
 	s.mu.Unlock()
+	if repo, ok := s.repo(w, res); ok {
+		s.persistActivity(repo, actID)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -499,7 +537,11 @@ func (s *Server) handleMkcol(w http.ResponseWriter, r *http.Request, res resourc
 	if ch.props == nil {
 		ch.props = map[string]string{}
 	}
+	actID := strings.TrimPrefix(tx.id, "txn-")
 	s.mu.Unlock()
+	if repo, ok := s.repo(w, res); ok {
+		s.persistActivity(repo, actID)
+	}
 	w.WriteHeader(http.StatusCreated)
 }
 
@@ -597,6 +639,7 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 	}
 
 	rev, err := repo.CommitTxn(tx.baseRev, changes, revProps)
+	s.dropActivityState(repo, actID)
 	if err != nil {
 		log.Printf("CommitTxn failed: %v", err)
 		for _, c := range changes {
@@ -650,6 +693,7 @@ func collectChanges(repo *fs.Repo, tx *txn) []fs.Change {
 	out := make([]fs.Change, 0, len(paths))
 	for _, p := range paths {
 		ch := tx.changes[p]
+		loadChangeData(repo, ch)
 		action := ch.action
 		// default action from presence in base revision
 		if action == fs.ActionAdd && ch.kind == 0 {

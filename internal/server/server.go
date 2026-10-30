@@ -92,6 +92,7 @@ type Server struct {
 	txns        map[string]*txn
 	locks       map[string]*lockEntry // key: repo + "\x00" + path
 	locksLoaded map[string]bool       // repositories whose persisted locks were restored
+	stateLoaded map[string]bool       // repositories whose persisted activities were restored
 	repoCache   map[string]*fs.Repo   // per-name repo singletons (shared r.mu)
 }
 
@@ -103,6 +104,7 @@ func New(cfg Config) *Server {
 		txns:        map[string]*txn{},
 		locks:       map[string]*lockEntry{},
 		locksLoaded: map[string]bool{},
+		stateLoaded: map[string]bool{},
 		repoCache:   map[string]*fs.Repo{},
 	}
 }
@@ -317,6 +319,7 @@ func (s *Server) repo(w http.ResponseWriter, res resource) (*fs.Repo, bool) {
 	s.mu.Unlock()
 	if r != nil {
 		s.ensureLocksLoaded(res.repo, r)
+		s.ensureActivitiesLoaded(res.repo, r)
 		return r, true
 	}
 	ropen, err := opener(res.repo)
@@ -335,6 +338,7 @@ func (s *Server) repo(w http.ResponseWriter, res resource) (*fs.Repo, bool) {
 	s.repoCache[res.repo] = ropen
 	s.mu.Unlock()
 	s.ensureLocksLoaded(res.repo, ropen)
+	s.ensureActivitiesLoaded(res.repo, ropen)
 	return ropen, true
 }
 
