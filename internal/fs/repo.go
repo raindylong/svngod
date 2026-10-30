@@ -142,6 +142,15 @@ func (r *Repo) UUID() (string, error) {
 	return string(b), nil
 }
 
+// SetUUID overwrites the repository UUID. Used by dump/load migration so a
+// loaded repository keeps the identity of its source.
+func (r *Repo) SetUUID(u string) error {
+	if u == "" {
+		return errors.New("fs: empty uuid")
+	}
+	return r.store.Put(context.Background(), r.keys.UUID(), []byte(u))
+}
+
 // ShardSize returns the configured shard size.
 func (r *Repo) ShardSize() uint64 { return r.shardSz }
 

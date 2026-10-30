@@ -60,6 +60,8 @@ func decodeProps(data []byte) (map[string]string, error) {
 
 // Load reads an svn dump v2 stream and replays it into repo via CommitTxn.
 func Load(repo *fs.Repo, r io.Reader) error {
+	// (uuid handling below: adopt the dump's UUID when loading into an empty
+	// repository)
 	br := bufio.NewReader(r)
 	// header
 	head, err := br.ReadString('\n')
@@ -74,6 +76,8 @@ func Load(repo *fs.Repo, r io.Reader) error {
 	var props map[string]string
 	inRevision := false
 	var lastRev uint64
+	startHead, _ := repo.Head()
+	dumpUUID := ""
 
 	flush := func() error {
 		if !inRevision || len(changes) == 0 {
@@ -94,7 +98,13 @@ func Load(repo *fs.Repo, r io.Reader) error {
 		hdrs, err := readHeaders(br)
 		if len(hdrs) == 0 {
 			if err == io.EOF {
-				return flush()
+				if ferr := flush(); ferr != nil {
+					return ferr
+				}
+				if startHead == 0 && dumpUUID != "" {
+					return repo.SetUUID(dumpUUID)
+				}
+				return nil
 			}
 			if err != nil {
 				return err
@@ -143,7 +153,10 @@ func Load(repo *fs.Repo, r io.Reader) error {
 		// Preamble blocks such as "UUID: <uuid>" carry stream metadata, not
 		// repository content; skip them instead of failing (standard dumps
 		// always contain one).
-		if _, ok := hdrs["UUID"]; ok && !inRevision {
+		if u, ok := hdrs["UUID"]; ok && !inRevision {
+			// Keep the source repository's identity; svnadmin load does the
+			// same (a repository loaded into an empty repo adopts the UUID).
+			dumpUUID = u
 			continue
 		}
 		if _, ok := hdrs["Node-path"]; !ok {
