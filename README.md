@@ -72,7 +72,12 @@ $SVN status /tmp/w $A
 $SVN log $URL $A
 $SVN diff -r 1:2 $URL $A
 
-# 并发提交 —— 验证 S3 真 CAS 原子写（同路径并发应 1 胜 + N-1 个 E160024）
+# 并发提交 —— 路径级 CAS / 交错提交（对齐标准 SVN）
+# 不同路径（独立文件）：各 WC 并发提交全部成功，成为连续修订（交错）
+for i in 1 2 3; do
+  (cd /tmp/w$i && $SVN commit -m "indep$i" indep$i.txt $A &)
+done
+# 同路径：1 胜 + N-1 个 E160024（冲突拒绝，不静默覆盖）
 for i in 1 2 3; do
   ($SVN commit -m "c$i" /tmp/w/f.txt $A &)
 done
@@ -98,6 +103,7 @@ cmd/
 
 - 真实 svn CLI 1.14.1（ra_serf HTTPv1）端到端：co / import / commit / update / status / log / ls / info / blame / diff。
 - **P0 S3 真 CAS 原子写**：Store.CAS 按内容哈希条件写（Get→ContentETag 比对→不等 `ErrPreconditionFailed`→Put），同路径并发提交 1 胜 + N-1 失败；`TestConcurrentSamePathCommit`（FileStore + 真实 RustFS）`-count=50`、`go test -race ./...` 全绿。
+- **路径级 CAS / 交错提交**：per-repo 单例复用 + CommitTxn 路径级 out-of-date 检查，**不同路径并发提交全部成功（成为连续修订）**，同路径并发保持 1 胜 + N-1×E160024（对齐标准 SVN）。
 - **P1 update-report 读路径回归**：对 WC 已存在节点发 `open-file`+`fetch-file`（而非 `add-file`，避免客户端 `add_file()` 把已版本化文件判为 obstructing working copy），`<S:entry start-empty>` 区分 co/update，根/目录 `rev=baseRev`，`V:md5-checksum`。`svn co` / 增量 update（文件内容正确更新）/ no-op update 全部正常（E155024 根治，与 mod_dav_svn 行为一致）。
 - 真实 OpenLDAP（direct-bind + search+bind）认证 + authz 授权。
 - 多库独立 authz / 独立认证（本地表 + LDAP 混合）E2E。
