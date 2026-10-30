@@ -104,7 +104,9 @@ cmd/
 - 真实 svn CLI 1.14.1（ra_serf HTTPv1）端到端：co / import / commit / update / status / log / ls / info / blame / diff。
 - **P0 S3 真 CAS 原子写**：Store.CAS 按内容哈希条件写（Get→ContentETag 比对→不等 `ErrPreconditionFailed`→Put），同路径并发提交 1 胜 + N-1 失败；`TestConcurrentSamePathCommit`（FileStore + 真实 RustFS）`-count=50`、`go test -race ./...` 全绿。
 - **路径级 CAS / 交错提交**：per-repo 单例复用 + CommitTxn 路径级 out-of-date 检查，**不同路径并发提交全部成功（成为连续修订）**，同路径并发保持 1 胜 + N-1×E160024（对齐标准 SVN）。
+- **三后端并发复核（端到端）**：S3/RustFS 并发独立文件 5/5 成功（HEAD 65→70）+ 同路径 1 胜 2 败（→71）；**本地盘 file** 后端 5/5 成功（11→16）；**Mirror 镜像**（自建 file+file 主备）5/5 成功（0→5，主备双写同步）。同路径冲突败者 `svn update` 走**标准文本冲突 C** 语义（生成 `.mine/.r73/.r74`），`svn resolve --accept theirs-full` 后提交 no-op（HEAD 75）。
 - **P1 update-report 读路径回归**：对 WC 已存在节点发 `open-file`+`fetch-file`（而非 `add-file`，避免客户端 `add_file()` 把已版本化文件判为 obstructing working copy），`<S:entry start-empty>` 区分 co/update，根/目录 `rev=baseRev`，`V:md5-checksum`。`svn co` / 增量 update（文件内容正确更新）/ no-op update 全部正常（E155024 根治，与 mod_dav_svn 行为一致）。
+- **E155017 根治（update-report no-op）**：客户端 base 之后未变文件不再发 `fetch-file`（`c.ID.Rev <= baseRev` 跳过），败者 update 不再校验失败，正确进入标准文本冲突路径。
 - 真实 OpenLDAP（direct-bind + search+bind）认证 + authz 授权。
 - 多库独立 authz / 独立认证（本地表 + LDAP 混合）E2E。
 - 主备 S3 镜像：双写 / 读负载均衡 / 故障降级 / 恢复自动补齐 E2E。
