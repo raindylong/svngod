@@ -1,7 +1,9 @@
 package server
 
 import (
+	"crypto/md5"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/xml"
 	"strings"
 	"testing"
@@ -243,5 +245,79 @@ func TestReportGetMergeinfo(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("mergeinfo-report missing %q:\n%s", want, out)
 		}
+	}
+}
+
+// TestReportUpdateMixedRevision: the WC root entry says r1 while the server is
+// at r2. The changed file must be sent as open-file with a base-checksum of the
+// r1 text (not r2), and unchanged files must be skipped.
+func TestReportUpdateMixedRevision(t *testing.T) {
+	ts, repo, base := testServer(t, "", "")
+	defer ts.Close()
+	if _, err := repo.CommitTxn(1, []fs.Change{
+		{Path: "/trunk/README.txt", Action: fs.ActionModify, Kind: fs.KindFile, Data: []byte("v2\n")},
+	}, map[string]string{"svn:log": "r2"}); err != nil {
+		t.Fatal(err)
+	}
+	body := `<?xml version="1.0"?><S:update-report xmlns:S="svn:">` +
+		`<S:src-path>` + base + `/svn/demo/</S:src-path>` +
+		`<S:target-revision>2</S:target-revision><S:depth>unknown</S:depth>` +
+		`<S:entry rev="1" depth="infinity"></S:entry></S:update-report>`
+	out := doReport(t, base, body)
+	if strings.Contains(out, `add-file name="README.txt"`) {
+		t.Fatalf("changed file sent as add-file:\n%s", out)
+	}
+	if !strings.Contains(out, `open-file name="README.txt"`) {
+		t.Fatalf("missing open-file for README:\n%s", out)
+	}
+	sum := md5.Sum([]byte("hello svn\n"))
+	want := `base-checksum="` + hex.EncodeToString(sum[:]) + `"`
+	if !strings.Contains(out, want) {
+		t.Fatalf("base-checksum is not the r1 text (%s):\n%s", want, out)
+	}
+	if strings.Contains(out, `name="guide.txt"`) {
+		t.Fatalf("unchanged file was sent:\n%s", out)
+	}
+}
+
+// TestReportUpdateDeleteEntry: a path present at the WC baseline but gone from
+// the target must be reported as delete-entry.
+func TestReportUpdateDeleteEntry(t *testing.T) {
+	ts, repo, base := testServer(t, "", "")
+	defer ts.Close()
+	if _, err := repo.CommitTxn(1, []fs.Change{
+		{Path: "/trunk/doc/guide.txt", Action: fs.ActionDelete},
+	}, map[string]string{"svn:log": "delete guide"}); err != nil {
+		t.Fatal(err)
+	}
+	body := `<?xml version="1.0"?><S:update-report xmlns:S="svn:">` +
+		`<S:src-path>` + base + `/svn/demo/</S:src-path>` +
+		`<S:target-revision>2</S:target-revision><S:depth>unknown</S:depth>` +
+		`<S:entry rev="1" depth="infinity"></S:entry></S:update-report>`
+	out := doReport(t, base, body)
+	if !strings.Contains(out, `<S:delete-entry name="guide.txt"/>`) {
+		t.Fatalf("missing delete-entry:\n%s", out)
+	}
+}
+
+// TestReportUpdateAnchoredSwitch: for svn switch the top-level open-directory
+// is only the anchor and must not carry properties (the client asserts on it);
+// the target element carries the content.
+func TestReportUpdateAnchoredSwitch(t *testing.T) {
+	ts, _, base := testServer(t, "", "")
+	defer ts.Close()
+	body := `<?xml version="1.0"?><S:update-report xmlns:S="svn:">` +
+		`<S:src-path>` + base + `/svn/demo/</S:src-path>` +
+		`<S:target-revision>1</S:target-revision><S:depth>unknown</S:depth>` +
+		`<S:update-target>trunk</S:update-target>` +
+		`<S:entry rev="1" depth="infinity"></S:entry></S:update-report>`
+	out := doReport(t, base, body)
+	anchorIdx := strings.Index(out, `<S:open-directory rev="`)
+	targetIdx := strings.Index(out, `<S:open-directory name="trunk"`)
+	if anchorIdx < 0 || targetIdx < 0 || targetIdx < anchorIdx {
+		t.Fatalf("expected anchor then target directory:\n%s", out)
+	}
+	if between := out[anchorIdx:targetIdx]; strings.Contains(between, "set-prop") {
+		t.Fatalf("anchor open-directory carries properties:\n%s", between)
 	}
 }

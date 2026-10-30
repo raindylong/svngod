@@ -109,7 +109,6 @@ func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name s
 		http.Error(w, "bad update-report", http.StatusBadRequest)
 		return
 	}
-	// target revision (default HEAD)
 	head, err := repo.Head()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -125,44 +124,30 @@ func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name s
 		http.Error(w, "target revision does not exist", http.StatusBadRequest)
 		return
 	}
-	// Client's WC baseline revision comes from <S:entry rev="N"> (svn diff), or
-	// <S:revision>; used so the txdelta is sent as a delta from the baseline
-	// revision's text rather than an empty base.
-	var baseRev uint64
-	// start-empty="true" on <S:entry> means the client's WC has no such node
-	// (fresh checkout / sparse). In that case the server must send add-file /
-	// add-directory, never open-file, even when the baseline has the node.
-	startEmpty := false
-	if e, ok := root.child("entry"); ok {
-		if v := e.attr("start-empty"); v == "true" || v == "yes" {
-			startEmpty = true
-		}
-		if v := e.attr("rev"); v != "" {
-			if n, err := strconv.ParseUint(v, 10, 64); err == nil {
-				baseRev = n
-			}
-		}
-	}
-	if baseRev == 0 {
-		if br, ok := root.child("revision"); ok {
-			v := br.attr("rev")
-			if v == "" {
-				v = strings.TrimSpace(br.Content)
-			}
-			if n, err := strconv.ParseUint(v, 10, 64); err == nil {
-				baseRev = n
-			}
-		}
-	}
-	if baseRev > head {
-		baseRev = 0
-	}
 	// src path (the checkout root inside the repo)
 	rootPath := "/"
 	if sp, ok := root.child("src-path"); ok {
 		if p, ok := extractReposPath(sp.Content, base); ok {
 			rootPath = p
 		}
+	}
+	// The WC baseline is described by the <S:entry> tree: every entry names a
+	// path and the revision that path is at. A single revision for the whole
+	// report is wrong for mixed-revision working copies and made svn update
+	// fail with checksum mismatches or "obstructing working copy".
+	wb := newWCBaseline(repo, rootPath, &root)
+
+	// Requested depth controls how far the report descends. "unknown" means
+	// "keep the WC's current sparse shape", so each entry's own depth limits
+	// recursion; an explicit --set-depth overrides it.
+	reqDepth := ""
+	if e, ok := root.child("depth"); ok {
+		reqDepth = strings.TrimSpace(e.Content)
+	}
+	explicitDepth := reqDepth != "" && reqDepth != "unknown"
+	limit, filesOnly := -1, false
+	if explicitDepth {
+		limit, filesOnly = depthLimit(reqDepth)
 	}
 
 	var b strings.Builder
@@ -171,17 +156,26 @@ func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name s
 	b.WriteString("  <S:target-revision rev=\"" + strconv.FormatUint(rev, 10) + "\"/>\n")
 	rp, _ := repo.GetRevProps(rev)
 	uuid, _ := repo.UUID()
-	// Pre-index the baseline revision's subtree once, so updateWalkDir can
-	// resolve each file's baseline text by map lookup instead of a per-file
-	// Resolve(baseRev, path) that re-walks the tree for every node.
-	baseIdx := map[string]fs.NodeID{}
-	if baseRev > 0 {
-		if err := indexTree(repo, baseRev, rootPath, baseIdx); err != nil {
+	// svn switch reports an anchor plus a target: the WC root is only the
+	// anchor and must not carry properties (the client asserts on that), while
+	// the target element carries the new location's props and children.
+	updateTarget := ""
+	if ut, ok := root.child("update-target"); ok {
+		updateTarget = strings.Trim(strings.TrimSpace(ut.Content), "/")
+	}
+	if updateTarget != "" {
+		targetPath := joinWCPath(rootPath, updateTarget)
+		anchorRev := rev
+		if r := wb.rootRev(); r > 0 {
+			anchorRev = r
+		}
+		b.WriteString("  <S:open-directory rev=\"" + strconv.FormatUint(anchorRev, 10) + "\">\n")
+		if err := s.updateWalkDir(&b, repo, base, rev, targetPath, "open-directory", true, rp, uuid, wb, 0, limit, filesOnly, explicitDepth, 0, updateTarget); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-	}
-	if err := s.updateWalkDir(&b, repo, base, rev, baseRev, rootPath, "open-directory", true, rp, uuid, baseIdx, startEmpty); err != nil {
+		b.WriteString("  </S:open-directory>\n")
+	} else if err := s.updateWalkDir(&b, repo, base, rev, rootPath, "open-directory", true, rp, uuid, wb, 0, limit, filesOnly, explicitDepth, 0, ""); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -191,23 +185,118 @@ func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name s
 	io.WriteString(w, b.String())
 }
 
-// indexTree walks rev's subtree rooted at path and records cpath -> NodeID for
-// every descendant, enabling O(1) baseline lookups during update-report.
-func indexTree(repo *fs.Repo, rev uint64, path string, out map[string]fs.NodeID) error {
-	children, err := repo.ListDir(rev, path)
-	if err != nil {
-		return err
+// wcEntry is one <S:entry> from an update-report: a path the client has, the
+// revision it is at, and how deep it is populated.
+type wcEntry struct {
+	path  string
+	rev   uint64
+	depth string
+	empty bool // start-empty="true": the client has no such node
+}
+
+// wcBaseline answers "what revision is this path at in the client's working
+// copy?" by finding the most specific <S:entry> covering the path.
+type wcBaseline struct {
+	repo    *fs.Repo
+	entries map[string]wcEntry
+}
+
+func normalizeWCPath(p string) string {
+	if p == "" {
+		return "/"
 	}
-	for _, c := range children {
-		cpath := strings.TrimSuffix(path, "/") + "/" + c.Name
-		out[cpath] = c.ID
-		if c.Kind == fs.KindDir {
-			if err := indexTree(repo, rev, cpath, out); err != nil {
-				return err
+	return "/" + strings.Trim(p, "/")
+}
+
+func joinWCPath(parent, name string) string {
+	if parent == "/" || parent == "" {
+		return "/" + strings.Trim(name, "/")
+	}
+	return strings.TrimSuffix(parent, "/") + "/" + strings.Trim(name, "/")
+}
+
+func pathUnder(path, prefix string) bool {
+	if prefix == "/" || prefix == "" {
+		return true
+	}
+	return path == prefix || strings.HasPrefix(path, prefix+"/")
+}
+
+func newWCBaseline(repo *fs.Repo, rootPath string, root *xmlEl) *wcBaseline {
+	wb := &wcBaseline{repo: repo, entries: map[string]wcEntry{}}
+	rootPath = normalizeWCPath(rootPath)
+	var walk func(parent string, e xmlEl)
+	walk = func(parent string, e xmlEl) {
+		name := strings.TrimSpace(e.Content)
+		p := parent
+		if name != "" {
+			p = joinWCPath(parent, name)
+		}
+		ent := wcEntry{path: p, depth: e.attr("depth")}
+		v := e.attr("start-empty")
+		ent.empty = v == "true" || v == "yes"
+		if rv := e.attr("rev"); rv != "" {
+			if n, err := strconv.ParseUint(strings.TrimSpace(rv), 10, 64); err == nil {
+				ent.rev = n
+			}
+		}
+		wb.entries[p] = ent
+		for _, c := range e.Children {
+			if c.XMLName.Local == "entry" {
+				walk(p, c)
 			}
 		}
 	}
-	return nil
+	for _, c := range root.Children {
+		if c.XMLName.Local == "entry" {
+			walk(rootPath, c)
+		}
+	}
+	return wb
+}
+
+// revFor returns the revision the path sits at in the WC, and whether the
+// client actually has it (depth and start-empty considered).
+func (w *wcBaseline) revFor(path string) (uint64, bool) {
+	path = normalizeWCPath(path)
+	var best wcEntry
+	found := false
+	for p, e := range w.entries {
+		if !pathUnder(path, p) {
+			continue
+		}
+		if !found || len(p) > len(best.path) {
+			best, found = e, true
+		}
+	}
+	if !found || best.rev == 0 {
+		return 0, false
+	}
+	// An entry that names this exact path means the client has the node;
+	// start-empty only says its children are not populated (that is how a
+	// depth-immediates WC reports itself when the client deepens it). For
+	// inherited children, start-empty means "not present": that is what a
+	// fresh checkout sends for its root entry.
+	if path == best.path {
+		return best.rev, true
+	}
+	if best.empty {
+		return 0, false
+	}
+	if best.depth == "empty" {
+		return 0, false // depth-empty: only the entry itself is present
+	}
+	return best.rev, true
+}
+
+// rootRev is the WC root's revision (0 for a fresh checkout).
+func (w *wcBaseline) rootRev() uint64 {
+	for _, e := range w.entries {
+		if e.path == "/" {
+			return e.rev
+		}
+	}
+	return 0
 }
 
 // writeEntryProps emits svn:entry properties for a node. svn's update editor
@@ -228,150 +317,293 @@ func writeEntryProps(b *strings.Builder, rp *fs.RevProps, uuid string, rev uint6
 	}
 }
 
-// updateWalkDir emits a directory node and its children (add-directory /
-// add-file with fulltext txdelta), walking the whole subtree at rev. baseRev
-// is the client's WC baseline revision (from <S:revision>); when > 0 the file
-// txdelta is sent as a delta from the baseline revision's text (svn diff).
-func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, rev uint64, baseRev uint64, path, openEl string, wrap bool, rp *fs.RevProps, uuid string, baseIdx map[string]fs.NodeID, startEmpty bool) error {
-	// Element rev (open-directory / open-file) mirrors the client's WC baseline
-	// revision; on a fresh checkout (baseRev==0) we emit HEAD. The checked-in
-	// href still points at the target revision.
+// pathCreatedRev is the revision in which a node appeared at its current path:
+// the copy root's revision for copied nodes (their node-rev id points at the
+// source and would produce an rvr URL that does not contain the new path),
+// else the node revision.
+func pathCreatedRev(repo *fs.Repo, nr *fs.NodeRev) uint64 {
+	if nr == nil {
+		return 0
+	}
+	if cr, _, ok := copyOrigin(repo, nr); ok {
+		return cr
+	}
+	return nr.Node.Rev
+}
+
+// rvrHref builds a revision-resource URL for a path at its created revision.
+func rvrHref(base, path string, rev uint64) string {
+	return base + "!svn/rvr/" + strconv.FormatUint(rev, 10) + "/" + strings.TrimPrefix(escapePathSegments(path), "/")
+}
+
+// depthLimit maps an svn depth name to a recursion bound: -1 = unlimited,
+// 0 = the node itself only, 1 = one level. filesOnly reports that only file
+// children may be listed at that level (svn_depth_files).
+func depthLimit(d string) (int, bool) {
+	switch d {
+	case "empty":
+		return 0, false
+	case "files":
+		return 1, true
+	case "immediates":
+		return 1, false
+	}
+	return -1, false
+}
+
+func minLimit(a, b int) int {
+	if a < 0 {
+		return b
+	}
+	if b < 0 {
+		return a
+	}
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// entryDepthLevel returns the recursion bound implied by a WC entry's depth.
+func (w *wcBaseline) entryDepthLevel(path string) (int, bool) {
+	if e, ok := w.entries[normalizeWCPath(path)]; ok {
+		if e.depth == "" {
+			return -1, true
+		}
+		l, _ := depthLimit(e.depth)
+		return l, true
+	}
+	return 0, false
+}
+
+// updateWalkDir emits one directory node and its children. Every presence /
+// baseline decision comes from the client's per-path <S:entry> revisions
+// (wcBaseline), so mixed-revision WCs update correctly. Paths present in the
+// client's baseline but absent from the target are reported as delete-entry.
+func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, rev uint64, path, openEl string, wrap bool, rp *fs.RevProps, uuid string, wb *wcBaseline, level, limit int, filesOnly, explicitDepth bool, copyFloor uint64, wrapName string) error {
 	outRev := rev
-	if baseRev > 0 {
-		outRev = baseRev
+	if br, ok := wb.revFor(path); ok {
+		outRev = br
+	}
+	// Nodes inside a copied directory share the source's node-rev ids; their
+	// rvr URL must still name the path's location, so the copy revision acts
+	// as a floor for created revisions.
+	if dnr, derr := repo.Resolve(rev, path); derr == nil {
+		if cr, _, ok := copyOrigin(repo, dnr); ok && cr > copyFloor {
+			copyFloor = cr
+		}
 	}
 	if wrap {
-		b.WriteString("  <S:" + openEl + " rev=\"" + strconv.FormatUint(outRev, 10) + "\">\n")
+		nameAttr := ""
+		if wrapName != "" {
+			nameAttr = " name=\"" + xmlEscape(wrapName) + "\""
+		}
+		b.WriteString("  <S:" + openEl + nameAttr + " rev=\"" + strconv.FormatUint(outRev, 10) + "\">\n")
+		nodeRev := rev
+		if nr, err := repo.Resolve(rev, path); err == nil {
+			nodeRev = pathCreatedRev(repo, nr)
+			if nodeRev == 0 {
+				nodeRev = rev
+			}
+		}
+		href := rvrHref(base, path, nodeRev)
+		b.WriteString("      <D:checked-in><D:href>" + xmlEscape(href) + "</D:href></D:checked-in>\n")
 	}
 	writeEntryProps(b, rp, uuid, rev)
 	children, err := repo.ListDir(rev, path)
 	if err != nil {
 		return err
 	}
-	// stable ordering
 	sort.Slice(children, func(i, j int) bool { return children[i].Name < children[j].Name })
+	childLevel := level + 1
 	for _, c := range children {
-		cpath := strings.TrimSuffix(path, "/") + "/" + c.Name
+		// Depth bound: -1 unlimited, otherwise children exist up to `limit`.
+		if limit >= 0 && childLevel > limit {
+			continue
+		}
+		if filesOnly && limit == childLevel && c.Kind == fs.KindDir {
+			continue
+		}
+		cpath := joinWCPath(path, c.Name)
+		baseRev, inBase := wb.revFor(cpath)
 		if c.Kind == fs.KindDir {
-			if _, inBase := baseIdx[cpath]; inBase && !startEmpty {
-				// existing dir in client's WC -> open-directory (update semantics)
-				ver := base + "!svn/ver/" + strconv.FormatUint(rev, 10) + "/" + strings.TrimPrefix(escapePathSegments(cpath), "/")
+			// A revision inherited from an ancestor entry does not prove the
+			// client has this directory: it may have been added after that
+			// revision (e.g. a server-side copy). It must exist in the
+			// baseline tree as well.
+			if inBase {
+				if _, err := repo.Resolve(baseRev, cpath); err != nil {
+					inBase = false
+				}
+			}
+			if inBase {
+				// Existing dir in the client's WC -> open-directory.
+				dirRev := c.Rev
+				if dnr, derr := repo.GetNodeRev(c.ID); derr == nil {
+					if cr := pathCreatedRev(repo, dnr); cr > 0 {
+						dirRev = cr
+					}
+				}
+				if dirRev < copyFloor {
+					dirRev = copyFloor
+				}
+				ver := rvrHref(base, cpath, dirRev)
 				b.WriteString("    <S:open-directory name=\"" + xmlEscape(c.Name) + "\" rev=\"" + strconv.FormatUint(outRev, 10) + "\">\n")
 				b.WriteString("      <D:checked-in><D:href>" + xmlEscape(ver) + "</D:href></D:checked-in>\n")
 				writeEntryProps(b, rp, uuid, rev)
 				writeNodeProps(b, c.Props)
-				if err := s.updateWalkDir(b, repo, base, rev, baseRev, cpath, "open-directory", false, rp, uuid, baseIdx, startEmpty); err != nil {
+				cl := limit
+				if !explicitDepth {
+					if l, ok := wb.entryDepthLevel(cpath); ok {
+						cl = minLimit(limit, l)
+					}
+				}
+				if cl >= 0 && childLevel+1 > cl {
+					// Depth stops here: emit the directory, no children.
+					b.WriteString("    </S:open-directory>\n")
+					continue
+				}
+				if err := s.updateWalkDir(b, repo, base, rev, cpath, "open-directory", false, rp, uuid, wb, childLevel, cl, false, explicitDepth, copyFloor, ""); err != nil {
 					return err
 				}
 				b.WriteString("    </S:open-directory>\n")
 			} else {
 				bc := base + "!svn/bc/" + strconv.FormatUint(rev, 10) + "/" + strings.TrimPrefix(escapePathSegments(cpath), "/")
+				dirRev := c.Rev
+				if dnr, derr := repo.GetNodeRev(c.ID); derr == nil {
+					if cr := pathCreatedRev(repo, dnr); cr > 0 {
+						dirRev = cr
+					}
+				}
+				if dirRev < copyFloor {
+					dirRev = copyFloor
+				}
+				ver := rvrHref(base, cpath, dirRev)
 				b.WriteString("    <S:add-directory name=\"" + xmlEscape(c.Name) + "\" bc-url=\"" + xmlEscape(bc) + "\">\n")
-				b.WriteString("      <D:checked-in><D:href>" + xmlEscape(bc) + "</D:href></D:checked-in>\n")
+				b.WriteString("      <D:checked-in><D:href>" + xmlEscape(ver) + "</D:href></D:checked-in>\n")
 				writeEntryProps(b, rp, uuid, rev)
 				writeNodeProps(b, c.Props)
-				if err := s.updateWalkDir(b, repo, base, rev, baseRev, cpath, "add-directory", false, rp, uuid, baseIdx, startEmpty); err != nil {
+				cl := limit
+				if !explicitDepth {
+					if l, ok := wb.entryDepthLevel(cpath); ok {
+						cl = minLimit(limit, l)
+					}
+				}
+				if cl >= 0 && childLevel+1 > cl {
+					b.WriteString("    </S:add-directory>\n")
+					continue
+				}
+				if err := s.updateWalkDir(b, repo, base, rev, cpath, "add-directory", false, rp, uuid, wb, childLevel, cl, false, explicitDepth, copyFloor, ""); err != nil {
 					return err
 				}
 				b.WriteString("    </S:add-directory>\n")
 			}
-		} else {
-			_, inBase := baseIdx[cpath]
-			inBase = inBase && !startEmpty
-			// use the child's immutable node id from ListDir directly, avoiding a
-			// per-file Resolve (which re-walks the root->path chain and re-reads
-			// every block on the way).
-			nr, err := repo.GetNodeRev(c.ID)
-			if err != nil {
-				return err
-			}
-			text, err := repo.GetText(nr.Node)
-			if err != nil {
-				return err
-			}
-			// NOTE: node props must be emitted *inside* the add-file/open-file
-			// element below. Emitting them here (as a child of the enclosing
-			// directory) applies svn:executable / svn:mime-type / svn:special
-			// and user props to the parent directory instead of the file.
-			var baseText []byte
-			if baseRev > 0 && baseRev != rev {
-				if bid, ok := baseIdx[cpath]; ok {
-					if bt, gerr := repo.GetText(bid); gerr == nil {
-						baseText = bt
-					}
+			continue
+		}
+		nr, err := repo.GetNodeRev(c.ID)
+		if err != nil {
+			return err
+		}
+		text, err := repo.GetText(nr.Node)
+		if err != nil {
+			return err
+		}
+		var baseNode *fs.NodeRev
+		var baseText []byte
+		if inBase {
+			if bn, berr := repo.Resolve(baseRev, cpath); berr == nil && bn.Kind == fs.KindFile {
+				baseNode = bn
+				if bt, gerr := repo.GetText(bn.Node); gerr == nil {
+					baseText = bt
 				}
 			}
-			delta, err := svndiff.Encode(baseText, text)
-			if err != nil {
-				return err
+		}
+		if inBase && baseNode != nil {
+			propsChanged := !sameProps(baseNode.Props, nr.Props)
+			if c.ID.Rev <= baseRev && !propsChanged {
+				continue // unchanged since the client's baseline
 			}
-			sum := md5.Sum(text)
-			md5hex := hex.EncodeToString(sum[:])
-			if inBase {
-				// File unchanged since the client's baseline (its node-rev was
-				// created at or before baseRev) -> the client already has this
-				// version; skip open-file/fetch-file. Emitting a fetch-file here
-				// would make the client validate the base-checksum against its
-				// locally-modified pristine and fail with E155017.
-				if c.ID.Rev <= baseRev {
-					continue
+			if c.ID.Rev <= baseRev && propsChanged {
+				// Property-only change: open the file solely to set props.
+				fileRev := pathCreatedRev(repo, nr)
+				if fileRev < copyFloor {
+					fileRev = copyFloor
 				}
-				// existing file in client's WC -> open-file (update semantics).
-				// add-file would make the client's add_file() editor skip the
-				// already-versioned file as an obstructing working copy.
-				ver := base + "!svn/ver/" + strconv.FormatUint(rev, 10) + "/" + strings.TrimPrefix(escapePathSegments(cpath), "/")
-				ss := sha1.Sum(text)
-				// base-checksum validates the client's WC baseline: for an
-				// incremental update it is the baseline text's MD5; when
-				// baseRev==rev (no-op) the WC baseline equals the target text.
-				bs := md5.Sum(text)
-				if len(baseText) > 0 {
-					bs = md5.Sum(baseText)
+				if fileRev == 0 {
+					fileRev = rev
 				}
+				ver := rvrHref(base, cpath, fileRev)
 				b.WriteString("    <S:open-file name=\"" + xmlEscape(c.Name) + "\" rev=\"" + strconv.FormatUint(outRev, 10) + "\">\n")
 				b.WriteString("      <D:checked-in><D:href>" + xmlEscape(ver) + "</D:href></D:checked-in>\n")
 				writeEntryProps(b, rp, uuid, rev)
 				writeNodeProps(b, nr.Props)
-				// fetch-file: client GETs the full text at the checked-in href
-				// (like mod_dav_svn). base-checksum validates the WC baseline.
-				b.WriteString("      <S:fetch-file base-checksum=\"" + hex.EncodeToString(bs[:]) + "\" sha1-checksum=\"" + hex.EncodeToString(ss[:]) + "\"/>\n")
-				b.WriteString("      <S:prop><V:md5-checksum>" + md5hex + "</V:md5-checksum></S:prop>\n")
 				b.WriteString("    </S:open-file>\n")
-			} else {
-				bc := base + "!svn/bc/" + strconv.FormatUint(rev, 10) + "/" + strings.TrimPrefix(escapePathSegments(cpath), "/")
-				b.WriteString("    <S:add-file name=\"" + xmlEscape(c.Name) + "\" sha1-checksum=\"" + sha1Hex(text) + "\">\n")
-				b.WriteString("      <D:checked-in><D:href>" + xmlEscape(bc) + "</D:href></D:checked-in>\n")
-				writeEntryProps(b, rp, uuid, rev)
-				writeNodeProps(b, nr.Props)
-				b.WriteString("      <S:txdelta>" + base64.StdEncoding.EncodeToString(delta) + "</S:txdelta>\n")
-				b.WriteString("      <S:prop><V:md5-checksum>" + md5hex + "</V:md5-checksum></S:prop>\n")
-				b.WriteString("    </S:add-file>\n")
+				continue
 			}
+			fileRev := pathCreatedRev(repo, nr)
+			if fileRev < copyFloor {
+				fileRev = copyFloor
+			}
+			if fileRev == 0 {
+				fileRev = rev
+			}
+			ver := rvrHref(base, cpath, fileRev)
+			ss := sha1.Sum(text)
+			bs := md5.Sum(text)
+			if baseText != nil {
+				bs = md5.Sum(baseText)
+			}
+			b.WriteString("    <S:open-file name=\"" + xmlEscape(c.Name) + "\" rev=\"" + strconv.FormatUint(outRev, 10) + "\">\n")
+			b.WriteString("      <D:checked-in><D:href>" + xmlEscape(ver) + "</D:href></D:checked-in>\n")
+			writeEntryProps(b, rp, uuid, rev)
+			writeNodeProps(b, nr.Props)
+			b.WriteString("      <S:fetch-file base-checksum=\"" + hex.EncodeToString(bs[:]) + "\" sha1-checksum=\"" + hex.EncodeToString(ss[:]) + "\"/>\n")
+			b.WriteString("    </S:open-file>\n")
+			continue
 		}
+		// New file in this working copy.
+		fileRev := pathCreatedRev(repo, nr)
+		if fileRev < copyFloor {
+			fileRev = copyFloor
+		}
+		if fileRev == 0 {
+			fileRev = rev
+		}
+		ver := rvrHref(base, cpath, fileRev)
+		delta, derr := svndiff.Encode(baseText, text)
+		if derr != nil {
+			return derr
+		}
+		sum := md5.Sum(text)
+		b.WriteString("    <S:add-file name=\"" + xmlEscape(c.Name) + "\" sha1-checksum=\"" + sha1Hex(text) + "\">\n")
+		b.WriteString("      <D:checked-in><D:href>" + xmlEscape(ver) + "</D:href></D:checked-in>\n")
+		writeEntryProps(b, rp, uuid, rev)
+		writeNodeProps(b, nr.Props)
+		b.WriteString("      <S:txdelta>" + base64.StdEncoding.EncodeToString(delta) + "</S:txdelta>\n")
+		b.WriteString("      <S:prop><V:md5-checksum>" + hex.EncodeToString(sum[:]) + "</V:md5-checksum></S:prop>\n")
+		b.WriteString("    </S:add-file>\n")
 	}
-	// Paths present in the client's baseline but absent from the target must be
-	// reported, or deletions never reach the working copy (svn update would
-	// leave stale files forever and svn diff would omit deletions entirely).
-	if baseRev > 0 && !startEmpty {
-		prefix := strings.TrimSuffix(path, "/") + "/"
-		inTarget := make(map[string]bool, len(children))
-		for _, c := range children {
-			inTarget[c.Name] = true
-		}
-		var deleted []string
-		for bp := range baseIdx {
-			if !strings.HasPrefix(bp, prefix) {
-				continue
+	// Deletions: anything the client has at its baseline but the target lacks.
+	if baseRev, inBase := wb.revFor(path); inBase && baseRev > 0 {
+		if baseChildren, err := repo.ListDir(baseRev, path); err == nil {
+			inTarget := make(map[string]bool, len(children))
+			for _, c := range children {
+				inTarget[c.Name] = true
 			}
-			name := bp[len(prefix):]
-			if strings.Contains(name, "/") || inTarget[name] {
-				continue
+			var deleted []string
+			for _, bc := range baseChildren {
+				if inTarget[bc.Name] {
+					continue
+				}
+				if _, present := wb.revFor(joinWCPath(path, bc.Name)); !present {
+					continue
+				}
+				deleted = append(deleted, bc.Name)
 			}
-			deleted = append(deleted, name)
-		}
-		sort.Strings(deleted)
-		for _, name := range deleted {
-			b.WriteString("    <S:delete-entry name=\"" + xmlEscape(name) + "\"/>\n")
+			sort.Strings(deleted)
+			for _, name := range deleted {
+				b.WriteString("    <S:delete-entry name=\"" + xmlEscape(name) + "\"/>\n")
+			}
 		}
 	}
 	if wrap {
