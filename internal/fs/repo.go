@@ -405,7 +405,14 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 	// last-write-wins over each other.
 	if baseRev > 0 {
 		for _, ch := range changes {
-			if ch.Path == "/" {
+			// Root / directory changes: svn clients routinely attach root and
+			// directory property changes (e.g. svn:date) to every commit.
+			// A directory's node-rev moves whenever any child changes, so a
+			// strict check here would falsely reject disjoint-path commits
+			// ("/svn/demo conflicts"). Children's add/modify/delete carry their
+			// own Change entries and are still guarded below, so skipping
+			// directories loses no lost-update protection.
+			if ch.Path == "/" || ch.Kind == KindDir {
 				continue
 			}
 			hnr, err := r.Resolve(cur.Head, ch.Path)
