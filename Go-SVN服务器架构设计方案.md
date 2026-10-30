@@ -41,3 +41,13 @@
 - **PROPFIND O(n²) 修复（git 4d13a69）**：propChildren 原每 child 调 propNode→Resolve，每个子项都从根重展开父目录（大目录 O(n²)）。ListDir 已返回各子项 NodeRev 字段（Kind/ID/Props），改为直传预解析 NodeRev 跳过 Resolve → 线性。实测 svn ls 200 文件 2.84s → 0.668s（4.3 倍）。
 - **PUT/REPORT 已线性**：nodeCache 按不可变 id 缓存 NodeRev+ByName 索引（PUT 1 秒 124 文件）；update-report 用 indexTree 预取 + child NodeID 直取（co 200 文件 12.3s）。
 - **大目录端到端**：挂载 loadbulk 大库后 svn ls c00（1000 文件）9.24s 线性；根递归 30000 / co 30000 全量下载为客户端侧开销（递归 XML、1.5GB 下载），服务器无 O(n²) 遗留。
+
+### 主本地盘 + 备 S3 混合镜像（2026-10-30）
+- MirrorStore 已通过 `NewMirror([]Store)` 抽象支持**任意后端混合**（主=FileStore 本地盘、备=S3Store/RustFS）。写路径写主 + 备 best-effort，主故障自动选举健康镜像，后台 repairLoop 从主补齐备的缺失对象。
+- config.json 已支持 `storage.type=mirror` + `mirrors: [{type:file,root:...},{type:s3,endpoint:...}]` 混合声明（cmd/svngod/config.go makeStore 逐项建 Store）。
+- 端到端验证受 `svnadmin create` 尚不支持 mirror 后端限制（需先建混合 repo），属下一步补 svnadmin create mirror 后可完整验证。
+
+### block 级自动修复能力边界（2026-10-30）
+- 检测：`svnadmin verify` 遍历 HEAD 树，node-rev CRC + text delta 链校验，报告损坏项（git b67f7bd + c628491）。
+- 修复边界：node-rev 打包进 RevBlock（非单对象），单 node 损坏**无法对象级重建**（无独立数据源，delta 增量丢失即数据丢失）。自动修复的现实路径是 **MirrorStore 读时从健康镜像自动恢复**（主损坏、备完好时读自动从备补齐，已实现）+ verify 检测报告。
+- 深层 block 级写回（fs 内部重写 block 内单 node）需 fs 核心改动（解 block+改+重写），高风险，按需拍板。
