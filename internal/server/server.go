@@ -118,6 +118,20 @@ const (
 // identityKey carries the authenticated principal in the request context.
 type identityKey struct{}
 
+// statusWriter records the response status code for logging.
+type statusWriter struct {
+	http.ResponseWriter
+	code int
+}
+
+func (s *statusWriter) WriteHeader(code int) { s.code = code; s.ResponseWriter.WriteHeader(code) }
+func (s *statusWriter) Write(b []byte) (int, error) {
+	if s.code == 0 {
+		s.code = 200
+	}
+	return s.ResponseWriter.Write(b)
+}
+
 // IdentityFrom pulls the authenticated identity out of a request context.
 func IdentityFrom(ctx context.Context) auth.Identity {
 	if id, ok := ctx.Value(identityKey{}).(auth.Identity); ok {
@@ -133,6 +147,9 @@ func (s *Server) Handler() http.Handler {
 
 // route is the top-level dispatcher: auth, then per-method handling.
 func (s *Server) route(w http.ResponseWriter, r *http.Request) {
+	sw := &statusWriter{ResponseWriter: w}
+	w = sw
+	defer func() { log.Printf("HTTP %d %s %s", sw.code, r.Method, r.URL.Path) }()
 	ctx := r.Context()
 	res := parseResource(s.cfg.BasePath, r.URL.Path)
 

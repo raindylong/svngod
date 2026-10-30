@@ -31,11 +31,14 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request, res resour
 	if !ok {
 		return
 	}
-	// Respect (reject) the Label request header: svngod has no label/branch
-	// name space, so a Label-identified query cannot be honored.
+	// Respect the Label request header: a numeric Label is the WC baseline
+	// revision the client resolves against during a commit; non-numeric (a
+	// named version label) cannot be honored since svngod has no label space.
 	if lbl := r.Header.Get("Label"); lbl != "" {
-		http.Error(w, "Label (version label) not supported", http.StatusBadRequest)
-		return
+		if _, err := strconv.ParseUint(strings.TrimSpace(lbl), 10, 64); err != nil {
+			http.Error(w, "Label (version label) not supported", http.StatusBadRequest)
+			return
+		}
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
 	if err != nil {

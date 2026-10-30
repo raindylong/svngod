@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>svngod —— 比原生 SVN 更安全、更稳定、更高效的版本服务器</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%230F1B29'/%3E%3Cpath d='M7 15l5-6 5 6' stroke='%234FD1C5' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<style>
+  :root{
+    --bg:#0F1B29;
+    --bg2:#13233A;
+    --bg3:#0B1420;
+    --ink:#E9EFF7;
+    --ink2:#A9B7C9;
+    --acc:#4FD1C5;
+    --acc2:#F5B942;
+    --line:#1E3349;
+    --ok:#4FD1C5;
+    --warn:#F5B942;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    background:var(--bg);
+    color:var(--ink);
+    font-family:"PingFang SC","Microsoft YaHei","Noto Sans CJK SC",system-ui,sans-serif;
+    line-height:1.65;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1080px;margin:0 auto;padding:0 20px}
+  a{color:var(--acc);text-decoration:none}
+  /* ===== Hero ===== */
+  .hero{
+    padding:72px 0 56px;
+    background:
+      radial-gradient(900px 400px at 78% -10%, rgba(79,209,197,.14), transparent 60%),
+      radial-gradient(700px 320px at 8% 0%, rgba(79,209,197,.08), transparent 55%);
+    border-bottom:1px solid var(--line);
+  }
+  .kicker{
+    display:inline-flex;align-items:center;gap:8px;
+    font-size:13px;letter-spacing:.12em;color:var(--acc);font-weight:600;
+    margin-bottom:20px;
+  }
+  .kicker .dot{width:8px;height:8px;border-radius:50%;background:var(--acc)}
+  .hero h1{
+    font-size:clamp(30px,5vw,52px);
+    line-height:1.18;font-weight:800;letter-spacing:-.01em;
+    max-width:820px;
+  }
+  .hero h1 .hl{color:var(--acc)}
+  .hero .sub{
+    margin-top:22px;color:var(--ink2);font-size:clamp(15px,2vw,18px);
+    max-width:680px;
+  }
+  .stats{
+    margin-top:44px;display:grid;grid-template-columns:repeat(4,1fr);
+    gap:12px;
+  }
+  .stat{
+    background:linear-gradient(180deg,rgba(255,255,255,.035),rgba(255,255,255,0));
+    border:1px solid var(--line);border-radius:12px;padding:18px 16px;
+  }
+  .stat .n{font-size:clamp(24px,3vw,34px);font-weight:800;color:var(--ink);line-height:1.1}
+  .stat .n em{color:var(--acc);font-style:normal}
+  .stat .l{font-size:12.5px;color:var(--ink2);margin-top:6px;line-height:1.4}
+  /* ===== sections ===== */
+  section{padding:60px 0}
+  .sec-h{
+    display:flex;align-items:baseline;gap:14px;margin-bottom:28px;
+  }
+  .sec-h .no{
+    font-family:ui-monospace,Menlo,Consolas,monospace;font-size:14px;color:var(--acc);
+  }
+  .sec-h h2{font-size:clamp(21px,3vw,28px);font-weight:800;letter-spacing:-.01em}
+  .sec-h .tag{margin-left:auto;font-size:12px;color:var(--ink2);border:1px solid var(--line);border-radius:999px;padding:3px 10px;white-space:nowrap}
+  /* 对比表 */
+  .cmp{width:100%;border-collapse:collapse;table-layout:fixed}
+  .cmp colgroup col:nth-child(1){width:16%}
+  .cmp colgroup col:nth-child(2){width:44%}
+  .cmp colgroup col:nth-child(3){width:40%}
+  .cmp th,.cmp td{
+    text-align:left;padding:14px 16px;border-bottom:1px solid var(--line);
+    vertical-align:top;font-size:14.5px;
+  }
+  .cmp thead th{
+    background:rgba(255,255,255,.03);color:var(--ink2);
+    font-size:12.5px;letter-spacing:.05em;font-weight:600;
+  }
+  .cmp td:first-child{color:var(--ink2);font-weight:600}
+  .cmp .cur{color:var(--ink)}
+  .cmp .cur b{color:var(--acc);font-weight:700}
+  .cmp .nat{color:var(--ink)}
+  .cmp .nat b{color:var(--warn);font-weight:600}
+  .cmp tbody tr:hover td{background:rgba(79,209,197,.03)}
+  /* 优势卡片 */
+  .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+  .card{
+    border:1px solid var(--line);border-radius:12px;padding:20px;
+    background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(255,255,255,0));
+  }
+  .card .ic{
+    width:36px;height:36px;border-radius:9px;background:rgba(79,209,197,.12);
+    display:flex;align-items:center;justify-content:center;margin-bottom:14px;
+  }
+  .card .ic svg{width:20px;height:20px;stroke:var(--acc);fill:none;stroke-width:2}
+  .card h3{font-size:16.5px;font-weight:700;margin-bottom:8px}
+  .card p{font-size:13.5px;color:var(--ink2);line-height:1.6}
+  .card .d{margin-top:10px;font-size:12.5px;color:var(--acc);font-weight:600}
+  /* 性能 */
+  .perf{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+  .pbar{border:1px solid var(--line);border-radius:12px;padding:18px}
+  .pbar .top{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:10px}
+  .pbar .top b{font-size:clamp(18px,2vw,24px);font-weight:800;color:var(--acc)}
+  .pbar .top span{font-size:12.5px;color:var(--ink2)}
+  .pbar .l{font-size:13px;color:var(--ink2);line-height:1.5}
+  .track{height:8px;border-radius:6px;background:rgba(255,255,255,.06);overflow:hidden;margin:12px 0}
+  .track i{display:block;height:100%;border-radius:6px;background:linear-gradient(90deg,var(--acc),rgba(79,209,197,.4))}
+  /* 场景 */
+  .scene{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+  .sc{border:1px solid var(--line);border-radius:12px;padding:20px}
+  .sc h3{font-size:16px;font-weight:700;margin-bottom:10px;display:flex;align-items:center;gap:9px}
+  .sc h3 svg{width:18px;height:18px;stroke:var(--acc2);fill:none;stroke-width:2}
+  .sc ul{list-style:none;padding:0}
+  .sc li{font-size:13.5px;color:var(--ink2);padding:5px 0 5px 14px;position:relative;line-height:1.55}
+  .sc li::before{content:"";position:absolute;left:0;top:13px;width:6px;height:6px;border-radius:2px;background:var(--acc2)}
+  /* footer */
+  footer{border-top:1px solid var(--line);padding:36px 0 48px;color:var(--ink2);font-size:13px}
+  footer .t{color:var(--acc);font-weight:700;margin-bottom:8px}
+  footer p{line-height:1.7;max-width:860px}
+  /* 窄屏 */
+  @media(max-width:720px){
+    .stats{grid-template-columns:repeat(2,1fr)}
+    .cards{grid-template-columns:1fr}
+    .perf{grid-template-columns:1fr}
+    .scene{grid-template-columns:1fr}
+    .cmp colgroup col:nth-child(1){width:22%}
+    .cmp colgroup col:nth-child(2){width:39%}
+    .cmp colgroup col:nth-child(3){width:39%}
+    .cmp th,.cmp td{font-size:13px;padding:12px 10px}
+  }
+  @media(max-width:380px){
+    .cmp{font-size:12px}
+    .cmp colgroup col:nth-child(1){display:none}
+    .cmp colgroup col:nth-child(2){width:50%}
+    .cmp colgroup col:nth-child(3){width:50%}
+  }
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <div class="wrap">
+    <span class="kicker"><span class="dot"></span>SVNGOD · GO 语言重写的 SVN 服务器</span>
+    <h1>比原生 SVN <span class="hl">更安全</span>、更稳定、<br>更高效的版本控制服务</h1>
+    <p class="sub">svngod 是一个用 Go 重写的 Subversion 服务器：单进程、单二进制，支持本地盘 / S3 对象存储 / 主备镜像三种存储，内置 OpenLDAP 认证链与路径级授权，在千万修订级仓库上稳定运行。</p>
+    <div class="stats">
+      <div class="stat"><div class="n">0</div><div class="l">同路径并发提交丢失更新（lost-update）</div></div>
+      <div class="stat"><div class="n"><em>32</em> wc</div><div class="l">并发提交修订号严格连续、无空洞</div></div>
+      <div class="stat"><div class="n"><em>1000</em> 万</div><div class="l">修订级压测性能线性扩展</div></div>
+      <div class="stat"><div class="n"><em>3</em> 类</div><div class="l">存储后端 + 故障切换，主备镜像容灾</div></div>
+    </div>
+  </div>
+</div>
+
+<section>
+  <div class="wrap">
+    <div class="sec-h"><span class="no">01</span><h2>svngod 与原生 SVN 的差异</h2><span class="tag">架构 / 存储 / 并发</span></div>
+    <table class="cmp">
+      <colgroup><col><col><col></colgroup>
+      <thead>
+        <tr><th>维度</th><th>svngod</th><th>原生 SVN（FSFS / mod_dav_svn）</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>进程模型</td>
+          <td class="cur"><b>单进程、单二进制</b>；一个 svngod 进程可托管多个独立仓库（--config），部署与扩容简单</td>
+          <td class="nat">多进程 / 多组件：Apache httpd + mod_dav_svn 或 svnserve，需搭配进程管理与配置</td>
+        </tr>
+        <tr>
+          <td>存储后端</td>
+          <td class="cur"><b>本地盘 / S3 对象存储（RustFS）/ 混合主备镜像</b> 三者任意组合，可直接落到对象存储</td>
+          <td class="nat">仅本地文件系统 FSFS / BDB，云存储需外部网关与复杂改造</td>
+        </tr>
+        <tr>
+          <td>并发写正确性</td>
+          <td class="cur"><b>单写者强一致</b>：repo 级串行 + CommitTxn 原子合并。同路径并发提交被明确拒绝（E160024）、<b>零丢失更新</b>；不同路径并发提交原子合并</td>
+          <td class="nat">乐观锁（wc 基线与 HEAD 冲突）→ 高并发同路径触发 <b>E160024</b>，需客户端 merge / resolve 重试</td>
+        </tr>
+        <tr>
+          <td>修订完整性</td>
+          <td class="cur">并发提交下<b>修订号严格连续、无空洞、无错乱</b>；已通过 10 / 20 / 32 并发提交实测</td>
+          <td class="nat">依赖客户端冲突重试，冲突多时修订出现时序波动</td>
+        </tr>
+        <tr>
+          <td>故障恢复</td>
+          <td class="cur"><b>混合主备镜像</b>：主本地盘 + 备 S3，停主后备自动接管读；主恢复后自动补齐落后修订</td>
+          <td class="nat">无内置镜像 / 故障切换，容灾依赖外部存储方案</td>
+        </tr>
+        <tr>
+          <td>认证与授权</td>
+          <td class="cur"><b>OpenLDAP + 本地密码表认证链</b>，路径级 authz 文件，多库各自独立认证与授权</td>
+          <td class="nat">htpasswd / 外部 LDAP，配置分散、粒度有限</td>
+        </tr>
+        <tr>
+          <td>完整性自检</td>
+          <td class="cur">内置 <b>svnadmin verify</b>：遍历 HEAD 树、node-rev CRC 校验 + delta 链回放，自动检测损坏</td>
+          <td class="nat">svnadmin verify 依赖 FSFS 文件完整性，无镜像级自愈</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section style="background:linear-gradient(180deg,var(--bg2),var(--bg))">
+  <div class="wrap">
+    <div class="sec-h"><span class="no">02</span><h2>核心优势</h2><span class="tag">原子性 / 并发 / 运维</span></div>
+    <div class="cards">
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24"><path d="M12 3l8 4v6c0 4-3.2 6.7-8 8-4.8-1.3-8-4-8-8V7z"/><path d="M9 12l2 2 4-4"/></svg></div>
+        <h3>原子写安全，杜绝丢失</h3>
+        <p>CommitTxn 采用路径级乐观并发控制：目标路径在基线后被其他提交修改即拒绝，不静默覆盖。配合内容哈希 ETag 的 CAS，同一文件并发提交只有一个胜者、其余明确拒绝（E160024）。</p>
+        <div class="d">同路径并发：0 丢失更新</div>
+      </div>
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24"><path d="M3 12h4l2-5 3 10 2-7 1 2h6"/></svg></div>
+        <h3>强一致并发，修订连续</h3>
+        <p>单写者串行模型天然规避乐观锁冲突：多客户端并发提交时修订号严格递增、无空洞、无错乱，写入结果读回一致。</p>
+        <div class="d">10 / 20 / 32 并发提交全通过</div>
+      </div>
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24"><path d="M4 5h16v14H4z"/><path d="M4 10h16M8 5v4"/></svg></div>
+        <h3>云原生存储与容灾</h3>
+        <p>直接以 S3 / RustFS 对象存储为后端，支持本地盘 + S3 混合主备镜像：故障时备自动接管读，主恢复后自动补齐落后修订，读写下探性自动恢复。</p>
+        <div class="d">主备镜像故障切换闭环</div>
+      </div>
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24"><path d="M5 4h14M5 4v16M19 4v16M5 9h14M5 15h14"/></svg></div>
+        <h3>极简运维，单二进制</h3>
+        <p>一个可执行文件完成启动、多库托管、镜像、验证；--config 声明式配置，无 Apache 依赖，跨环境一致部署。</p>
+        <div class="d">零外部运行时依赖</div>
+      </div>
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 100 18"/><path d="M12 12l4-4"/></svg></div>
+        <h3>完整认证与授权链</h3>
+        <p>OpenLDAP direct-bind + 本地密码表组成的认证链，配合路径级 authz 文件，多仓库各自独立认证与授权，已用真实 OpenLDAP 端到端验证。</p>
+        <div class="d">LDAP + 本地表 + authz</div>
+      </div>
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24"><path d="M4 6h16v12H4z"/><path d="M4 10h16M8 14h5"/></svg></div>
+        <h3>千万修订级线性扩展</h3>
+        <p>自动分片打包 + 增量 delta 链设计，1000 万修订压测性能线性扩展；大目录列举经 O(n²) 消除后提速约 4.3×。</p>
+        <div class="d">大仓不惧</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="sec-h"><span class="no">03</span><h2>实测数据</h2><span class="tag">并发 / 吞吐 / 性能</span></div>
+    <div class="perf">
+      <div class="pbar">
+        <div class="top"><b>连续无空洞</b><span>32 wc 并发提交</span></div>
+        <div class="track"><i style="width:100%"></i></div>
+        <div class="l">并发提交修订号严格连续（如 79..109 无空洞），写入结果全部读回正确。</div>
+      </div>
+      <div class="pbar">
+        <div class="top"><b>4.3×</b><span>大目录列举</span></div>
+        <div class="track"><i style="width:100%"></i></div>
+        <div class="l">200 文件目录 svn ls 由 2.84s 降至 0.668s（消除 O(n²) 路径重复解析）。</div>
+      </div>
+      <div class="pbar">
+        <div class="top"><b>30000</b><span>文件落盘</span></div>
+        <div class="track"><i style="width:100%"></i></div>
+        <div class="l">本地盘后端 30000×50K 提交 75.6s；S3 后端 100.7s，双后端稳定性一致。</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section style="background:linear-gradient(180deg,var(--bg),var(--bg2))">
+  <div class="wrap">
+    <div class="sec-h"><span class="no">04</span><h2>适合谁用</h2><span class="tag">场景</span></div>
+    <div class="scene">
+      <div class="sc">
+        <h3><svg viewBox="0 0 24 24"><path d="M6 9l6-6 6 6M6 15l6 6 6-6"/></svg>高并发写团队</h3>
+        <ul>
+          <li>多人频繁提交，杜绝静默丢失更新</li>
+          <li>修订连续、可审计，冲突明确提示</li>
+        </ul>
+      </div>
+      <div class="sc">
+        <h3><svg viewBox="0 0 24 24"><path d="M4 5h16v14H4z"/><path d="M4 10h16M12 10v9"/></svg>云原生 / 对象存储</h3>
+        <ul>
+          <li>仓库直接落到 S3 / RustFS，免本地盘依赖</li>
+          <li>主备镜像容灾，故障自动切换</li>
+        </ul>
+      </div>
+      <div class="sc">
+        <h3><svg viewBox="0 0 24 24"><path d="M12 3v18M4 7h16M4 17h16"/></svg>千万级大仓</h3>
+        <ul>
+          <li>百万至千万修订级仓库稳定运行</li>
+          <li>增量存储，性能线性扩展</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="t">SVNGOD</div>
+    <p>Go 语言重写的 Subversion 服务器 · 单进程强一致 · 本地盘 / S3 / 混合主备镜像 · OpenLDAP 认证链 · 千万修订级。</p>
+    <p style="margin-top:8px;color:#74849B">本文档中性能与并发数据来自真实环境实测（混合镜像后端、svn CLI 客户端端到端验证）；「4.3×」为 svngod 自身大目录列举优化相对值。</p>
+  </div>
+</footer>
+
+</body>
+</html>

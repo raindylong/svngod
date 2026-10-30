@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -181,10 +182,12 @@ func (s *Server) resolveNode(w http.ResponseWriter, repo *fs.Repo, res resource)
 	case resBaselineColl, resBaseline, resRev, resVersion:
 		rev = res.rev
 	default:
+		log.Printf("resolveNode %s typ=%v -> unsupported", res.path, res.typ)
 		http.Error(w, "unsupported resource", http.StatusBadRequest)
 		return 0, "", false
 	}
 	if res.rev > head {
+		log.Printf("resolveNode %s res.rev=%d head=%d -> not exist", res.path, res.rev, head)
 		http.Error(w, "revision does not exist", http.StatusBadRequest)
 		return 0, "", false
 	}
@@ -202,21 +205,33 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request, res reso
 	if !ok {
 		return
 	}
-	if lbl := r.Header.Get("Label"); lbl != "" {
-		http.Error(w, "Label (version label) not supported", http.StatusBadRequest)
-		return
-	}
 	// parse requested props (allprop if empty body / no propfind element)
-	props, propnames, err := parsePropfind(r.Body)
+	pbody, _ := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	props, propnames, err := parsePropfind(bytes.NewReader(pbody))
 	if err != nil {
+		plog := string(pbody)
+		if len(plog) > 400 {
+			plog = plog[:400]
+		}
+		log.Printf("PROPFIND %s bad body=%q err=%v", r.URL.Path, plog, err)
 		http.Error(w, "bad propfind: "+err.Error(), http.StatusBadRequest)
 		return
+	}
+	// The svn client sets a Label header to the WC baseline revision on the
+	// PROPFINDs it issues during a commit (e.g. Label: 89). Treat a numeric
+	// Label as the revision to resolve, exactly like a baseline URL.
+	labelRev := uint64(0)
+	if lbl := r.Header.Get("Label"); lbl != "" {
+		if n, err := strconv.ParseUint(strings.TrimSpace(lbl), 10, 64); err == nil && n > 0 {
+			labelRev = n
+		}
 	}
 	depth := r.Header.Get("Depth")
 	if depth == "" {
 		depth = "0"
 	}
 	if depth != "0" && depth != "1" && depth != "infinity" {
+		log.Printf("PROPFIND %s invalid Depth=%q -> 400", r.URL.Path, depth)
 		http.Error(w, "invalid Depth", http.StatusBadRequest)
 		return
 	}
@@ -224,6 +239,9 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request, res reso
 	rev, path, ok := s.resolveNode(w, repo, res)
 	if !ok {
 		return
+	}
+	if labelRev > 0 && labelRev <= rev {
+		rev = labelRev
 	}
 	base := s.absURL(r, res.repo, "/")
 
