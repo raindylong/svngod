@@ -128,6 +128,23 @@ func (s *S3Store) Get(ctx context.Context, key string, rng *Range) ([]byte, erro
 	return buf, nil
 }
 
+func (s *S3Store) GetTo(ctx context.Context, key string, w io.Writer) (int64, error) {
+	obj, err := s.client.GetObject(ctx, s.bucket, s.key(key), minio.GetObjectOptions{})
+	if err != nil {
+		return 0, err
+	}
+	defer obj.Close()
+	n, err := io.Copy(w, obj)
+	if err != nil {
+		resp := minio.ToErrorResponse(err)
+		if resp.StatusCode == http.StatusNotFound || resp.Code == "NoSuchKey" {
+			return n, ErrNotFound
+		}
+		return n, err
+	}
+	return n, nil
+}
+
 func (s *S3Store) Head(ctx context.Context, key string) (string, bool, error) {
 	info, err := s.client.StatObject(ctx, s.bucket, s.key(key), minio.StatObjectOptions{})
 	if err != nil {

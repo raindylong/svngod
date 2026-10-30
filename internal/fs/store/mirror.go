@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"time"
@@ -37,8 +38,8 @@ type MirrorStore struct {
 	mu   sync.Mutex
 	prim int // index of the elected primary
 
-	stop  chan struct{}
-	done  chan struct{}
+	stop       chan struct{}
+	done       chan struct{}
 	repairable bool // set true when a mirror is marked down; repair reacts to it
 
 	// repairOnce dedupes concurrent repair runs.
@@ -201,6 +202,46 @@ func (m *MirrorStore) Get(ctx context.Context, key string, rng *Range) ([]byte, 
 	}
 	m.markDown(pi)
 	return nil, err
+}
+
+// GetTo streams an object, preferring the same mirror Get would read from.
+func (m *MirrorStore) GetTo(ctx context.Context, key string, w io.Writer) (int64, error) {
+	if isControlKey(key) {
+		p, pi := m.primary()
+		n, err := p.GetTo(ctx, key, w)
+		if err == nil {
+			return n, nil
+		}
+		m.markDown(pi)
+		for step := 1; step < len(m.mirrors); step++ {
+			idx := (pi + step) % len(m.mirrors)
+			if !m.isHealthy(idx) {
+				continue
+			}
+			if n, e := m.mirrors[idx].GetTo(ctx, key, w); e == nil {
+				return n, nil
+			}
+		}
+		return n, err
+	}
+	_, pi := m.primary()
+	n := len(m.mirrors)
+	for step := 0; step < n; step++ {
+		idx := (pi + 1 + step) % n
+		if !m.isHealthy(idx) {
+			continue
+		}
+		if got, err := m.mirrors[idx].GetTo(ctx, key, w); err == nil {
+			return got, nil
+		}
+		m.markDown(idx)
+	}
+	p, pi := m.primary()
+	got, err := p.GetTo(ctx, key, w)
+	if err != nil {
+		m.markDown(pi)
+	}
+	return got, err
 }
 
 func (m *MirrorStore) Head(ctx context.Context, key string) (string, bool, error) {

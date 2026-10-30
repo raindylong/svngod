@@ -480,3 +480,82 @@ func TestLargeTextReadableWithoutCache(t *testing.T) {
 		}
 	}
 }
+
+// TestExternalTextObjects: full texts above the threshold live in a separate
+// content-addressed object, so rev blocks stay small and reads can stream.
+func TestExternalTextObjects(t *testing.T) {
+	st := store.NewMemoryStore()
+	repo, err := CreateRepo(st, "r", 4096, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := bytes.Repeat([]byte("0123456789abcdef"), (2<<20)/16) // 2 MiB
+	if _, err := repo.CommitTxn(0, []Change{
+		{Path: "/big.bin", Action: ActionAdd, Kind: KindFile, Data: data},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	nr, err := repo.Resolve(1, "/big.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nr.TextRep != TextRepExternal {
+		t.Fatalf("TextRep = %d, want external", nr.TextRep)
+	}
+	if len(nr.Text) != 0 {
+		t.Fatalf("external node still carries %d inline bytes", len(nr.Text))
+	}
+	if nr.TextSize != uint64(len(data)) || nr.TextRef == "" {
+		t.Fatalf("text metadata = %q/%d", nr.TextRef, nr.TextSize)
+	}
+	// The rev block itself must not contain the payload.
+	rb, err := repo.readBlock(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rb.Marshal()) > 1<<20 {
+		t.Fatalf("rev block is %d bytes, payload should be external", len(rb.Marshal()))
+	}
+	if got, err := repo.GetText(nr.Node); err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("GetText: len=%d err=%v", len(got), err)
+	}
+	var buf bytes.Buffer
+	if n, err := repo.StreamText(nr.Node, &buf); err != nil || n != uint64(len(data)) || !bytes.Equal(buf.Bytes(), data) {
+		t.Fatalf("StreamText: n=%d err=%v", n, err)
+	}
+	part, err := repo.ReadTextRange(nr, 1000, 64)
+	if err != nil || !bytes.Equal(part, data[1000:1064]) {
+		t.Fatalf("ReadTextRange: %q err=%v", part, err)
+	}
+	// Reopening must resolve the external object too.
+	repo2, err := OpenRepo(st, "r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nr2, err := repo2.Resolve(1, "/big.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := repo2.GetText(nr2.Node); err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("reopened GetText: len=%d err=%v", len(got), err)
+	}
+}
+
+// TestSmallTextStaysInline keeps the common case (and delta chains) unchanged.
+func TestSmallTextStaysInline(t *testing.T) {
+	st := store.NewMemoryStore()
+	repo, _ := CreateRepo(st, "r", 4096, 64)
+	data := bytes.Repeat([]byte("x"), 1024)
+	if _, err := repo.CommitTxn(0, []Change{
+		{Path: "/small.txt", Action: ActionAdd, Kind: KindFile, Data: data},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	nr, err := repo.Resolve(1, "/small.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nr.TextRep != TextRepFull || len(nr.Text) != len(data) {
+		t.Fatalf("small text: rep=%d len=%d", nr.TextRep, len(nr.Text))
+	}
+}

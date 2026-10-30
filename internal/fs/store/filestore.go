@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -78,6 +79,22 @@ func (s *FileStore) Get(_ context.Context, key string, rng *Range) ([]byte, erro
 		end = off + rng.Length
 	}
 	return data[off:end], nil
+}
+
+func (s *FileStore) GetTo(_ context.Context, key string, w io.Writer) (int64, error) {
+	p, err := s.objPath(key)
+	if err != nil {
+		return 0, err
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, ErrNotFound
+		}
+		return 0, err
+	}
+	defer f.Close()
+	return io.Copy(w, f)
 }
 
 func (s *FileStore) Head(_ context.Context, key string) (string, bool, error) {

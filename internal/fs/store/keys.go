@@ -44,7 +44,9 @@ func (k *Keys) PackedDone(shard uint64) string { return k.p("revs", padShard(sha
 func (k *Keys) PackedRevProps(shard uint64) string { return k.p("revprops", padShard(shard)+".pack") }
 
 // LooseRev returns the loose (active-shard) revision-block key.
-func (k *Keys) LooseRev(shard, rev uint64) string { return k.p("revs-loose", padShard(shard), padRev(rev)) }
+func (k *Keys) LooseRev(shard, rev uint64) string {
+	return k.p("revs-loose", padShard(shard), padRev(rev))
+}
 
 // LooseRevProps returns the loose revision-properties key.
 func (k *Keys) LooseRevProps(shard, rev uint64) string {
@@ -53,6 +55,9 @@ func (k *Keys) LooseRevProps(shard, rev uint64) string {
 
 // Txn returns the transaction staging prefix.
 func (k *Keys) TxnPrefix(txid string) string { return k.p("txn", txid) + "/" }
+
+// Text returns the external file-text object key for a content reference.
+func (k *Keys) Text(ref string) string { return k.p("texts", ref) }
 
 // CommitLock returns the commit-lock object key.
 func (k *Keys) CommitLock() string { return k.p("locks", "commit") }

@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"regexp"
 	"strconv"
@@ -295,6 +297,61 @@ func (r *Repo) GetNodeRev(id NodeID) (*NodeRev, error) {
 	return nr, nil
 }
 
+// StreamText writes a node's full text to w. External texts are streamed from
+// their object; inline full/delta texts are materialized first (delta decoding
+// needs random access to the base).
+func (r *Repo) StreamText(id NodeID, w io.Writer) (uint64, error) {
+	nr, err := r.GetNodeRev(id)
+	if err != nil {
+		return 0, err
+	}
+	if nr.TextRep == TextRepExternal {
+		n, serr := r.store.GetTo(context.Background(), r.keys.Text(nr.TextRef), w)
+		return uint64(n), serr
+	}
+	text, err := r.GetText(id)
+	if err != nil {
+		return 0, err
+	}
+	n, err := w.Write(text)
+	return uint64(n), err
+}
+
+// TextSizeOf returns a file node's text length without loading external texts.
+func (r *Repo) TextSizeOf(nr *NodeRev) (int64, error) {
+	if nr.TextRep == TextRepExternal {
+		return int64(nr.TextSize), nil
+	}
+	text, err := r.GetText(nr.Node)
+	if err != nil {
+		return 0, err
+	}
+	return int64(len(text)), nil
+}
+
+// ReadTextRange returns up to length bytes at off. External texts are read
+// with a ranged object request, so a Range GET does not materialize the file.
+func (r *Repo) ReadTextRange(nr *NodeRev, off, length int64) ([]byte, error) {
+	if nr.TextRep == TextRepExternal {
+		if off < 0 || length <= 0 || uint64(off+length) > nr.TextSize {
+			return nil, errors.New("fs: range out of bounds")
+		}
+		return r.store.Get(context.Background(), r.keys.Text(nr.TextRef), &store.Range{Offset: off, Length: length})
+	}
+	text, err := r.GetText(nr.Node)
+	if err != nil {
+		return nil, err
+	}
+	if off < 0 || off > int64(len(text)) {
+		return nil, errors.New("fs: range out of bounds")
+	}
+	end := off + length
+	if length <= 0 || end > int64(len(text)) {
+		end = int64(len(text))
+	}
+	return text[off:end], nil
+}
+
 // GetText reconstructs a file node-rev's full text (following delta chains).
 func (r *Repo) GetText(id NodeID) ([]byte, error) {
 	if id.IsZero() {
@@ -315,6 +372,15 @@ func (r *Repo) GetText(id NodeID) ([]byte, error) {
 	switch nr.TextRep {
 	case TextRepFull:
 		text = nr.Text
+	case TextRepExternal:
+		b, gerr := r.store.Get(context.Background(), r.keys.Text(nr.TextRef), nil)
+		if gerr != nil {
+			return nil, gerr
+		}
+		if uint64(len(b)) != nr.TextSize {
+			return nil, errors.New("fs: external text size mismatch")
+		}
+		text = b
 	case TextRepDelta:
 		if nr.Base == nil {
 			return nil, errors.New("fs: delta node-rev missing base")
@@ -526,9 +592,22 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 			sum := md5.Sum(t.data)
 			copy(nr.TextMD5[:], sum[:])
 			if t.id.IsZero() || t.deltaDepth+1 >= r.maxDelta {
-				nr.TextRep = TextRepFull
-				nr.Text = append([]byte(nil), t.data...)
 				nr.DeltaDepth = 0
+				if len(t.data) > externalTextThreshold {
+					ref := hex.EncodeToString(nr.TextMD5[:])
+					key := r.keys.Text(ref)
+					if _, ok, herr := r.store.Head(ctx, key); herr != nil || !ok {
+						if perr := r.store.Put(ctx, key, t.data); perr != nil {
+							return 0, perr
+						}
+					}
+					nr.TextRep = TextRepExternal
+					nr.TextRef = ref
+					nr.TextSize = uint64(len(t.data))
+				} else {
+					nr.TextRep = TextRepFull
+					nr.Text = append([]byte(nil), t.data...)
+				}
 			} else {
 				delta, derr := svndiff.Encode(t.baseText, t.data)
 				if derr != nil {
@@ -893,6 +972,12 @@ func (r *Repo) PackShard(shard uint64) error {
 	r.cache.Clear()
 	return nil
 }
+
+// externalTextThreshold: full file texts larger than this are stored as
+// separate content-addressed objects (texts/<md5>). Rev blocks then stay small,
+// object stores serve the data directly, and GET can stream it. Deltas stay
+// inline (they are small after the encoder work).
+const externalTextThreshold = 1 << 20
 
 // maxCachedObject bounds what the LRU keeps. Full texts of large files are
 // built in memory for delta application anyway, but caching them would keep

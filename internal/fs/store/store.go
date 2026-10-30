@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"sync"
@@ -38,6 +39,10 @@ type Store interface {
 
 	// Get reads an object, or a byte range of it.
 	Get(ctx context.Context, key string, rng *Range) ([]byte, error)
+
+	// GetTo streams an object to w without materializing it. Used for file
+	// texts stored as separate objects (large files).
+	GetTo(ctx context.Context, key string, w io.Writer) (int64, error)
 
 	// Head returns the object's ETag and existence.
 	Head(ctx context.Context, key string) (etag string, exists bool, err error)
@@ -109,6 +114,17 @@ func (m *MemoryStore) Get(_ context.Context, key string, rng *Range) ([]byte, er
 	cp := make([]byte, end-off)
 	copy(cp, data[off:end])
 	return cp, nil
+}
+
+func (m *MemoryStore) GetTo(_ context.Context, key string, w io.Writer) (int64, error) {
+	m.mu.RLock()
+	data, ok := m.data[key]
+	m.mu.RUnlock()
+	if !ok {
+		return 0, ErrNotFound
+	}
+	n, err := w.Write(data)
+	return int64(n), err
 }
 
 func (m *MemoryStore) Head(_ context.Context, key string) (string, bool, error) {

@@ -90,7 +90,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, res resource)
 		http.Error(w, "GET only applies to files", http.StatusMethodNotAllowed)
 		return
 	}
-	text, err := repo.GetText(nr.Node)
+	size, err := repo.TextSizeOf(nr)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -101,26 +101,32 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, res resource)
 		w.Header().Set("Content-Type", "text/plain")
 	}
 	w.Header().Set("ETag", fmt.Sprintf(`"%d/%s"`, nr.Node.Rev, nr.Node.IDKey()))
-	w.Header().Set("Content-Length", strconv.Itoa(len(text)))
+	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 	w.Header().Set("SVN-Repository-UUID", repoUUID(repo))
 	if r.Method == http.MethodHead {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	// Range support: serve a partial payload with 206 (used for resumable /
-	// chunked downloads of large files). We still reconstruct the full text in
-	// memory (fs.GetText), but avoid transmitting the whole body.
+	// Range support: large external texts are read with a ranged object
+	// request; inline texts are sliced from the reconstructed bytes.
 	if rng := r.Header.Get("Range"); rng != "" {
-		if start, end, ok := parseRange(rng, len(text)); ok {
-			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(text)))
+		if start, end, ok := parseRange(rng, int(size)); ok {
+			part, rerr := repo.ReadTextRange(nr, int64(start), int64(end-start+1))
+			if rerr != nil {
+				http.Error(w, rerr.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
 			w.Header().Set("Content-Length", strconv.Itoa(end-start+1))
 			w.WriteHeader(http.StatusPartialContent)
-			w.Write(text[start : end+1])
+			w.Write(part)
 			return
 		}
 	}
 	w.WriteHeader(http.StatusOK)
-	w.Write(text)
+	if _, serr := repo.StreamText(nr.Node, w); serr != nil {
+		log.Printf("GET %s: stream: %v", path, serr)
+	}
 }
 
 // parseRange parses a single "bytes=start-end" range (suffix ranges bytes=-N

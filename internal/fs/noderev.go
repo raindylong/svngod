@@ -24,6 +24,9 @@ const (
 const (
 	TextRepFull  byte = 0
 	TextRepDelta byte = 1
+	// TextRepExternal stores the full text (and its md5) in a separate object,
+	// keeping rev blocks small and letting GET stream without materializing it.
+	TextRepExternal byte = 2
 )
 
 // PropRep.
@@ -62,8 +65,12 @@ type NodeRev struct {
 	TextRep      byte
 	TextMD5      [16]byte
 	Text         []byte
-	Base         *NodeID // delta base, when TextRep==TextRepDelta
-	Children     []Child // dir only
+	// TextRef/TextSize describe an external text object (TextRepExternal):
+	// the object key suffix and its length.
+	TextRef  string
+	TextSize uint64
+	Base     *NodeID // delta base, when TextRep==TextRepDelta
+	Children []Child // dir only
 	// ByName is a runtime-only name->Child index for directories, built on
 	// decode/cache; it is NOT persisted (Marshal ignores it) and lets Resolve
 	// find a child in O(1) instead of scanning Children (O(n) on a big dir).
@@ -101,8 +108,13 @@ func (nr *NodeRev) Marshal() []byte {
 	// text
 	b.WriteByte(nr.TextRep)
 	b.Write(nr.TextMD5[:])
-	wire.WriteUvarint(&b, uint64(len(nr.Text)))
-	b.Write(nr.Text)
+	if nr.TextRep == TextRepExternal {
+		wire.WriteString(&b, nr.TextRef)
+		wire.WriteUvarint(&b, nr.TextSize)
+	} else {
+		wire.WriteUvarint(&b, uint64(len(nr.Text)))
+		b.Write(nr.Text)
+	}
 	if nr.TextRep == TextRepDelta && nr.Base != nil {
 		wire.WriteUvarint(&b, nr.Base.Rev)
 		wire.WriteUvarint(&b, nr.Base.ID)
@@ -216,16 +228,27 @@ func UnmarshalNodeRev(b []byte) (*NodeRev, error) {
 	}
 	copy(nr.TextMD5[:], body[p:p+16])
 	p += 16
-	tlen, n, err := wire.ReadUvarint(body[p:])
-	if err != nil {
-		return nil, err
+	if nr.TextRep == TextRepExternal {
+		if nr.TextRef, n, err = wire.ReadString(body[p:]); err != nil {
+			return nil, err
+		}
+		p += n
+		if nr.TextSize, n, err = wire.ReadUvarint(body[p:]); err != nil {
+			return nil, err
+		}
+		p += n
+	} else {
+		tlen, n, err := wire.ReadUvarint(body[p:])
+		if err != nil {
+			return nil, err
+		}
+		p += n
+		if uint64(len(body)-p) < tlen {
+			return nil, errors.New("fs: node-rev text truncated")
+		}
+		nr.Text = append([]byte(nil), body[p:p+int(tlen)]...)
+		p += int(tlen)
 	}
-	p += n
-	if uint64(len(body)-p) < tlen {
-		return nil, errors.New("fs: node-rev text truncated")
-	}
-	nr.Text = append([]byte(nil), body[p:p+int(tlen)]...)
-	p += int(tlen)
 	if nr.TextRep == TextRepDelta {
 		base := &NodeID{}
 		if base.Rev, n, err = wire.ReadUvarint(body[p:]); err != nil {
