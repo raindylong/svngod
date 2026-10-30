@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/xml"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -42,6 +44,12 @@ type txnChange struct {
 	// dataRef names the content-addressed body in the repo store for sessions
 	// restored after a restart (the bytes are fetched on first use).
 	dataRef string
+	// dataFile is a local temp file holding the body (streamed large PUT);
+	// streamed marks bodies that must not be loaded into memory on restore.
+	dataFile string
+	streamed bool
+	// dataSize is the streamed body's length.
+	dataSize int64
 }
 
 // txn is a checked-out working resource bound to an activity.
@@ -381,104 +389,133 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 		http.Error(w, "transaction does not exist", http.StatusConflict)
 		return
 	}
-	const maxPutBody = 512 << 20
-	// Read one byte past the cap so an oversized body is rejected instead of
-	// being silently truncated and stored as a shorter file.
-	data, err := io.ReadAll(io.LimitReader(r.Body, maxPutBody+1))
-	if err != nil {
-		s.mu.Unlock()
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if len(data) > maxPutBody {
-		s.mu.Unlock()
-		http.Error(w, "file too large", http.StatusRequestEntityTooLarge)
-		return
-	}
-	if e := s.getLockLocked(res.repo, res.path); e != nil && !lockTokenMatches(r.Header.Get("If"), e.token) {
+	actID := strings.TrimPrefix(tx.id, "txn-")
+	txnBase := tx.baseRev
+	s.mu.Unlock()
+
+	if e := s.getLock(res.repo, res.path); e != nil && !lockTokenMatches(r.Header.Get("If"), e.token) {
 		// mod_dav_svn answers 423 here; the client reports "no lock token
 		// available" instead of silently overwriting a locked file.
-		s.mu.Unlock()
 		http.Error(w, "Locked", http.StatusLocked)
 		return
 	}
-	ch := tx.changeFor(res.path)
-	ch.kind = fs.KindFile
-	clientRev := clientBaseRevision(r)
-	isSvndiff := strings.Contains(r.Header.Get("Content-Type"), "svndiff")
 
 	// The delta (and the out-of-date decision) must use the revision the
 	// client based its edit on, never the transaction's HEAD: another commit
 	// may have moved HEAD in between, and applying an old delta to the new
 	// text corrupts the file.
+	clientRev := clientBaseRevision(r)
 	isNew := true
+	var baseText []byte
 	if clientRev > 0 {
-		if repo, rok := s.openRepoOnly(w, res.repo); rok {
-			head, herr := repo.Head()
-			if herr == nil {
-				if hnr, err := repo.Resolve(head, res.path); err == nil {
-					if hnr.Node.Rev > clientRev {
-						s.mu.Unlock()
-						writeOutOfDate(w, res.path)
-						return
-					}
-				} else if _, err := repo.Resolve(clientRev, res.path); err == nil {
-					// Deleted since the client's base revision.
-					s.mu.Unlock()
+		head, herr := repo.Head()
+		if herr == nil {
+			if hnr, err := repo.Resolve(head, res.path); err == nil {
+				if hnr.Node.Rev > clientRev {
 					writeOutOfDate(w, res.path)
 					return
-				} else {
-					clientRev = 0 // not present at the client's base either
 				}
+			} else if _, err := repo.Resolve(clientRev, res.path); err == nil {
+				writeOutOfDate(w, res.path) // deleted since the client's base
+				return
+			} else {
+				clientRev = 0 // not present at the client's base either
 			}
-			if clientRev > 0 {
-				if nr, err := repo.Resolve(clientRev, res.path); err == nil && nr.Kind == fs.KindFile {
-					isNew = false
-					baseText, gerr := repo.GetText(nr.Node)
-					if gerr == nil {
-						if want := r.Header.Get("X-SVN-Base-Fulltext-MD5"); want != "" {
-							sum := md5.Sum(baseText)
-							if !strings.EqualFold(hex.EncodeToString(sum[:]), want) {
-								s.mu.Unlock()
-								writeOutOfDate(w, res.path)
-								return
-							}
-						}
-						if isSvndiff {
-							decoded, derr := svndiff.Apply(baseText, data)
-							if derr != nil {
-								s.mu.Unlock()
-								http.Error(w, "svndiff decode: "+derr.Error(), http.StatusBadRequest)
-								return
-							}
-							data = decoded
+		}
+		if clientRev > 0 {
+			if nr, err := repo.Resolve(clientRev, res.path); err == nil && nr.Kind == fs.KindFile {
+				isNew = false
+				bt, gerr := repo.GetText(nr.Node)
+				if gerr == nil {
+					baseText = bt
+					if want := r.Header.Get("X-SVN-Base-Fulltext-MD5"); want != "" {
+						sum := md5.Sum(bt)
+						if !strings.EqualFold(hex.EncodeToString(sum[:]), want) {
+							writeOutOfDate(w, res.path)
+							return
 						}
 					}
 				}
 			}
 		}
 	}
-	if isNew && isSvndiff {
-		decoded, derr := svndiff.Apply(nil, data)
-		if derr != nil {
-			// Never persist a decode failure: a brand-new file's body is an
-			// svndiff delta against the empty base; storing the raw delta bytes
-			// would silently corrupt repository contents. Fail the commit.
-			s.mu.Unlock()
-			http.Error(w, "svndiff decode: "+derr.Error(), http.StatusBadRequest)
-			return
-		}
-		data = decoded
+	_ = txnBase
+
+	isSvndiff := strings.Contains(r.Header.Get("Content-Type"), "svndiff")
+	var data []byte
+	var dataFile string
+	var dataSize int64
+
+	const maxPutBody = 512 << 20
+	// Bodies are buffered in memory when small (typical svndiff deltas are a
+	// few KB) and spilled to disk above the threshold, whether or not the
+	// client sent a Content-Length (serf streams PUTs chunked).
+	body, bodyFile, berr := readBody(r.Body, putStreamThreshold, maxPutBody)
+	if berr != nil {
+		http.Error(w, berr.Error(), statusForSpool(berr))
+		return
 	}
+	if bodyFile != "" {
+		if isSvndiff {
+			outPath, derr := decodeDeltaToFile(baseText, bodyFile)
+			os.Remove(bodyFile)
+			if derr != nil {
+				http.Error(w, "svndiff decode: "+derr.Error(), http.StatusBadRequest)
+				return
+			}
+			dataFile = outPath
+		} else {
+			dataFile = bodyFile
+		}
+		if st, serr := os.Stat(dataFile); serr == nil {
+			dataSize = st.Size()
+		}
+	} else {
+		if isSvndiff {
+			var derr error
+			if isNew {
+				body, derr = svndiff.Apply(nil, body)
+			} else {
+				body, derr = svndiff.Apply(baseText, body)
+			}
+			if derr != nil {
+				// Never persist a decode failure: storing raw delta bytes would
+				// silently corrupt repository contents.
+				http.Error(w, "svndiff decode: "+derr.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+		data = body
+		dataSize = int64(len(body))
+	}
+
+	s.mu.Lock()
+	tx, ok = s.txns[res.uuid]
+	if !ok {
+		s.mu.Unlock()
+		if dataFile != "" {
+			os.Remove(dataFile)
+		}
+		http.Error(w, "transaction does not exist", http.StatusConflict)
+		return
+	}
+	ch := tx.changeFor(res.path)
+	if old := ch.dataFile; old != "" && old != dataFile {
+		os.Remove(old)
+	}
+	ch.kind = fs.KindFile
 	ch.data = data
+	ch.dataFile = dataFile
+	ch.dataSize = dataSize
+	ch.streamed = dataFile != ""
 	ch.baseRev = clientRev
 	ch.dataRef = ""
 	if ch.props == nil {
 		ch.props = map[string]string{}
 	}
-	actID := strings.TrimPrefix(tx.id, "txn-")
 	s.mu.Unlock()
 	s.persistActivity(repo, actID)
+
 	w.Header().Set("Location", s.absURL(r, res.repo, "/!svn/txn/"+tx.id+res.path))
 	if isNew {
 		w.WriteHeader(http.StatusCreated)
@@ -487,15 +524,99 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 	}
 }
 
+// putStreamThreshold: bodies above this are streamed to disk instead of being
+// buffered. It matches the external-text threshold so large files go straight
+// from the socket to their content-addressed object.
+const putStreamThreshold = 1 << 20
+
+var errBodyTooLarge = errors.New("file too large")
+
+// readBody reads a PUT body, keeping at most threshold bytes in memory. Larger
+// bodies are spilled to a temp file and returned by path.
+func readBody(r io.Reader, threshold, limit int64) ([]byte, string, error) {
+	head := make([]byte, threshold+1)
+	n, err := io.ReadFull(r, head)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return nil, "", err
+	}
+	if int64(n) <= threshold {
+		return head[:n], "", nil
+	}
+	f, cerr := os.CreateTemp("", "svngod-body-*")
+	if cerr != nil {
+		return nil, "", cerr
+	}
+	path := f.Name()
+	if _, werr := f.Write(head[:n]); werr != nil {
+		f.Close()
+		os.Remove(path)
+		return nil, "", werr
+	}
+	rest, cerr2 := io.Copy(f, io.LimitReader(r, limit-int64(n)+1))
+	cerr3 := f.Close()
+	if cerr2 == nil {
+		cerr2 = cerr3
+	}
+	if cerr2 != nil {
+		os.Remove(path)
+		return nil, "", cerr2
+	}
+	if int64(n)+rest > limit {
+		os.Remove(path)
+		return nil, "", errBodyTooLarge
+	}
+	return nil, path, nil
+}
+
+func statusForSpool(err error) int {
+	if errors.Is(err, errBodyTooLarge) {
+		return http.StatusRequestEntityTooLarge
+	}
+	return http.StatusBadRequest
+}
+
+// decodeDeltaToFile streams a spooled svndiff delta into a text temp file.
+func decodeDeltaToFile(base []byte, deltaPath string) (string, error) {
+	in, err := os.Open(deltaPath)
+	if err != nil {
+		return "", err
+	}
+	defer in.Close()
+	out, err := os.CreateTemp("", "svngod-text-*")
+	if err != nil {
+		return "", err
+	}
+	outPath := out.Name()
+	if err := svndiff.ApplyTo(base, in, out); err != nil {
+		out.Close()
+		os.Remove(outPath)
+		return "", err
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(outPath)
+		return "", err
+	}
+	return outPath, nil
+}
+
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, res resource) {
 	if res.typ == resActivity {
+		var files []string
 		s.mu.Lock()
 		a, had := s.activities[res.uuid]
 		delete(s.activities, res.uuid)
 		if had && a.txn != nil {
 			delete(s.txns, a.txn.id)
+			for _, ch := range a.txn.changes {
+				if ch.dataFile != "" {
+					files = append(files, ch.dataFile)
+				}
+			}
 		}
 		s.mu.Unlock()
+		for _, f := range files {
+			os.Remove(f)
+		}
 		if repo, ok := s.repo(w, res); ok {
 			s.dropActivityState(repo, res.uuid)
 		}
@@ -585,6 +706,15 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 	}
 	tx := a.txn
 	changes := collectChanges(repo, tx)
+	// Streamed bodies live in temp files; they are consumed by the commit (or
+	// dropped on any early exit), so clean them up when the request ends.
+	defer func() {
+		for _, c := range changes {
+			if c.DataFile != "" {
+				os.Remove(c.DataFile)
+			}
+		}
+	}()
 	// Per-path authorization: the individual requests were authorized against
 	// their own resource, but a transaction can contain paths it never named
 	// (server-side copies, MOVE destinations). Re-check every changed path,
@@ -701,7 +831,20 @@ func collectChanges(repo *fs.Repo, tx *txn) []fs.Change {
 	out := make([]fs.Change, 0, len(paths))
 	for _, p := range paths {
 		ch := tx.changes[p]
-		loadChangeData(repo, ch)
+		if ch.dataRef != "" && len(ch.data) == 0 && ch.dataFile == "" {
+			if ch.streamed {
+				if tmp, terr := os.CreateTemp("", "svngod-txn-*"); terr == nil {
+					if _, gerr := repo.Store().GetTo(context.Background(), activityDataKey(repo, ch.dataRef), tmp); gerr == nil {
+						ch.dataFile = tmp.Name()
+					} else {
+						os.Remove(tmp.Name())
+					}
+					tmp.Close()
+				}
+			} else {
+				loadChangeData(repo, ch)
+			}
+		}
 		action := ch.action
 		// default action from presence in base revision
 		if action == fs.ActionAdd && ch.kind == 0 {
@@ -721,6 +864,7 @@ func collectChanges(repo *fs.Repo, tx *txn) []fs.Change {
 			CopyFromPath: ch.copyFromPath,
 			CopyFromRev:  ch.copyFromRev,
 			BaseRev:      ch.baseRev,
+			DataFile:     ch.dataFile,
 		})
 	}
 	return out

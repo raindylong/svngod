@@ -16,6 +16,7 @@
 package svndiff
 
 import (
+	"bufio"
 	"bytes"
 	"compress/zlib"
 	"errors"
@@ -482,4 +483,142 @@ func Apply(src, delta []byte) ([]byte, error) {
 		out = append(out, tview...)
 	}
 	return out, nil
+}
+
+// --- streaming decoder (used for large PUT bodies) ---
+
+// errShortSection guards against a malformed length claiming a huge section.
+const maxSectionLen = 128 << 20
+
+// ApplyTo decodes a delta stream from r and writes the target to w without
+// materializing it. src may be nil for a delta against the empty stream (new
+// files). Memory use is bounded by the window size (the ins/data sections).
+func ApplyTo(src []byte, r io.Reader, w io.Writer) error {
+	br := bufio.NewReaderSize(r, 1<<16)
+	hdr := make([]byte, 4)
+	if _, err := io.ReadFull(br, hdr); err != nil {
+		return err
+	}
+	if string(hdr[:3]) != "SVN" {
+		return errors.New("svndiff: bad header")
+	}
+	version := hdr[3]
+	if version > 2 {
+		return fmt.Errorf("svndiff: unsupported version %d", version)
+	}
+	readSection := func(n uint64) ([]byte, error) {
+		if n > maxSectionLen {
+			return nil, errors.New("svndiff: section too large")
+		}
+		b := make([]byte, n)
+		if _, err := io.ReadFull(br, b); err != nil {
+			return nil, err
+		}
+		return decompressSeg(version, b)
+	}
+	for {
+		sviewOffset, err := readUintReader(br)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		sviewLen, err := readUintReader(br)
+		if err != nil {
+			return err
+		}
+		tviewLen, err := readUintReader(br)
+		if err != nil {
+			return err
+		}
+		insLen, err := readUintReader(br)
+		if err != nil {
+			return err
+		}
+		dataLen, err := readUintReader(br)
+		if err != nil {
+			return err
+		}
+		if sviewOffset > uint64(len(src)) || sviewLen > uint64(len(src))-sviewOffset {
+			return errors.New("svndiff: source window out of bounds")
+		}
+		sview := src[sviewOffset : sviewOffset+sviewLen]
+		ins, err := readSection(insLen)
+		if err != nil {
+			return fmt.Errorf("svndiff: bad instruction section: %w", err)
+		}
+		data, err := readSection(dataLen)
+		if err != nil {
+			return fmt.Errorf("svndiff: bad data section: %w", err)
+		}
+		var written uint64
+		ip, dp := 0, 0
+		for ip < len(ins) {
+			c := ins[ip]
+			ip++
+			action := (c >> 6) & 0x3
+			if action == 3 {
+				return errors.New("svndiff: invalid action code")
+			}
+			length := uint64(c & 0x3f)
+			if length == 0 {
+				v, n, uerr := readUint(ins[ip:])
+				if uerr != nil {
+					return uerr
+				}
+				length, ip = v, ip+n
+			}
+			if length == 0 {
+				return errors.New("svndiff: instruction length zero")
+			}
+			switch action {
+			case actionSource:
+				v, n, uerr := readUint(ins[ip:])
+				if uerr != nil {
+					return uerr
+				}
+				ip += n
+				if v > uint64(len(sview)) || length > uint64(len(sview))-v {
+					return errors.New("svndiff: source copy out of bounds")
+				}
+				if _, werr := w.Write(sview[v : v+length]); werr != nil {
+					return werr
+				}
+				written += length
+			case actionNew:
+				if dp+int(length) > len(data) {
+					return errors.New("svndiff: new data out of bounds")
+				}
+				if _, werr := w.Write(data[dp : dp+int(length)]); werr != nil {
+					return werr
+				}
+				dp += int(length)
+				written += length
+			}
+		}
+		if written != tviewLen {
+			return errors.New("svndiff: window length mismatch")
+		}
+	}
+}
+
+// readUintReader decodes svn's varint (big-endian base-128, continuation on
+// the high bit) from a stream, mirroring readUint.
+func readUintReader(r *bufio.Reader) (uint64, error) {
+	var v uint64
+	for i := 0; i < 10; i++ {
+		b, err := r.ReadByte()
+		if err != nil {
+			if i == 0 && err == io.EOF {
+				return 0, io.EOF
+			}
+			return 0, err
+		}
+		if b < 0x80 {
+			return (v << 7) | uint64(b), nil
+		}
+		v = (v << 7) | uint64(b&0x7f)
+	}
+	return 0, errors.New("svndiff: varint too long")
 }

@@ -37,6 +37,10 @@ type Store interface {
 	// Put creates a new immutable object. Callers guarantee the key is unique.
 	Put(ctx context.Context, key string, data []byte) error
 
+	// PutFrom stores exactly size bytes read from r. Used to stream large
+	// uploads without buffering them.
+	PutFrom(ctx context.Context, key string, r io.Reader, size int64) error
+
 	// Get reads an object, or a byte range of it.
 	Get(ctx context.Context, key string, rng *Range) ([]byte, error)
 
@@ -114,6 +118,17 @@ func (m *MemoryStore) Get(_ context.Context, key string, rng *Range) ([]byte, er
 	cp := make([]byte, end-off)
 	copy(cp, data[off:end])
 	return cp, nil
+}
+
+func (m *MemoryStore) PutFrom(_ context.Context, key string, r io.Reader, size int64) error {
+	data, err := io.ReadAll(io.LimitReader(r, size))
+	if err != nil {
+		return err
+	}
+	if int64(len(data)) != size {
+		return fmt.Errorf("store: short body (%d/%d)", len(data), size)
+	}
+	return m.Put(context.Background(), key, data)
 }
 
 func (m *MemoryStore) GetTo(_ context.Context, key string, w io.Writer) (int64, error) {

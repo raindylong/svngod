@@ -159,3 +159,29 @@ func TestEncodeLargeLocalEditIsSmall(t *testing.T) {
 		t.Fatal("round-trip mismatch")
 	}
 }
+
+// TestApplyToStreaming decodes deltas from a reader into a writer, including a
+// multi-window target and the empty-source (new file) case.
+func TestApplyToStreaming(t *testing.T) {
+	r := rand.New(rand.NewSource(11))
+	big := make([]byte, 300_000)
+	r.Read(big)
+	cases := []struct{ src, tgt []byte }{
+		{nil, big},
+		{big, append(append([]byte(nil), big[:150_000]...), append([]byte("middle"), big[150_000:]...)...)},
+		{[]byte("small base"), []byte("small base with an edit")},
+	}
+	for i, c := range cases {
+		delta, err := Encode(c.src, c.tgt)
+		if err != nil {
+			t.Fatalf("case %d encode: %v", i, err)
+		}
+		var out bytes.Buffer
+		if err := ApplyTo(c.src, bytes.NewReader(delta), &out); err != nil {
+			t.Fatalf("case %d ApplyTo: %v", i, err)
+		}
+		if !bytes.Equal(out.Bytes(), c.tgt) {
+			t.Fatalf("case %d: got %d bytes, want %d", i, out.Len(), len(c.tgt))
+		}
+	}
+}

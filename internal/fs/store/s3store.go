@@ -128,6 +128,12 @@ func (s *S3Store) Get(ctx context.Context, key string, rng *Range) ([]byte, erro
 	return buf, nil
 }
 
+func (s *S3Store) PutFrom(ctx context.Context, key string, r io.Reader, size int64) error {
+	_, err := s.client.PutObject(ctx, s.bucket, s.key(key), io.LimitReader(r, size), size,
+		minio.PutObjectOptions{ContentType: "application/octet-stream"})
+	return err
+}
+
 func (s *S3Store) GetTo(ctx context.Context, key string, w io.Writer) (int64, error) {
 	obj, err := s.client.GetObject(ctx, s.bucket, s.key(key), minio.GetObjectOptions{})
 	if err != nil {

@@ -5,7 +5,9 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"log"
+	"os"
 	"time"
 
 	"svngod/internal/fs"
@@ -26,6 +28,7 @@ import (
 
 type persistedChange struct {
 	Path         string            `json:"path"`
+	Streamed     bool              `json:"streamed,omitempty"`
 	Action       string            `json:"action"`
 	Kind         string            `json:"kind,omitempty"`
 	DataRef      string            `json:"dataRef,omitempty"`
@@ -117,6 +120,11 @@ func (s *Server) persistActivity(repo *fs.Repo, actID string) {
 			pa.RevProps[k] = v
 		}
 	}
+	type fileBody struct {
+		index int
+		path  string
+	}
+	var files []fileBody
 	if a.txn != nil {
 		pt := &persistedTxn{ID: a.txn.id, BaseRev: a.txn.baseRev}
 		for p, ch := range a.txn.changes {
@@ -125,7 +133,11 @@ func (s *Server) persistActivity(repo *fs.Repo, actID string) {
 				Props: copyMap(ch.props), CopyFromPath: ch.copyFromPath,
 				CopyFromRev: ch.copyFromRev, BaseRev: ch.baseRev,
 			}
-			if len(ch.data) > 0 {
+			switch {
+			case ch.dataFile != "":
+				pc.Streamed = true
+				files = append(files, fileBody{index: len(pt.Changes), path: ch.dataFile})
+			case len(ch.data) > 0:
 				sum := sha1.Sum(ch.data)
 				pc.DataRef = hex.EncodeToString(sum[:])
 			}
@@ -147,6 +159,16 @@ func (s *Server) persistActivity(repo *fs.Repo, actID string) {
 	s.mu.Unlock()
 
 	ctx := context.Background()
+	// Bodies on disk are hashed and uploaded (streaming) so a restart can
+	// resume the commit without the temp file.
+	for _, fb := range files {
+		ref, err := putTxnFile(ctx, repo, fb.path)
+		if err != nil {
+			log.Printf("txn: persist body %s: %v", fb.path, err)
+			continue
+		}
+		pa.Txn.Changes[fb.index].DataRef = ref
+	}
 	for ref, data := range payloads {
 		if _, exists, err := repo.Store().Head(ctx, activityDataKey(repo, ref)); err == nil && exists {
 			continue
@@ -160,6 +182,33 @@ func (s *Server) persistActivity(repo *fs.Repo, actID string) {
 			log.Printf("txn: persist %s: %v", actID, err)
 		}
 	}
+}
+
+// putTxnFile streams a local body into the transaction store and returns its
+// content reference.
+func putTxnFile(ctx context.Context, repo *fs.Repo, path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha1.New()
+	n, err := io.Copy(h, f)
+	if err != nil {
+		return "", err
+	}
+	ref := hex.EncodeToString(h.Sum(nil))
+	key := activityDataKey(repo, ref)
+	if _, ok, herr := repo.Store().Head(ctx, key); herr == nil && ok {
+		return ref, nil
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+	if err := repo.Store().PutFrom(ctx, key, f, n); err != nil {
+		return "", err
+	}
+	return ref, nil
 }
 
 // dropActivityState removes a persisted session (commit finished or aborted).
@@ -234,6 +283,7 @@ func (s *Server) ensureActivitiesLoaded(repoName string, repo *fs.Repo) {
 					action: actionByName(pc.Action), kind: kindByName(pc.Kind),
 					props: copyMap(pc.Props), copyFromPath: pc.CopyFromPath,
 					copyFromRev: pc.CopyFromRev, baseRev: pc.BaseRev, dataRef: pc.DataRef,
+					streamed: pc.Streamed,
 				}
 			}
 			a.txn = tx

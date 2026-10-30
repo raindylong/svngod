@@ -81,6 +81,37 @@ func (s *FileStore) Get(_ context.Context, key string, rng *Range) ([]byte, erro
 	return data[off:end], nil
 }
 
+// PutFrom streams into a temp file and renames it into place, so readers never
+// observe a partially written object.
+func (s *FileStore) PutFrom(_ context.Context, key string, r io.Reader, size int64) error {
+	p, err := s.objPath(key)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(p), ".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	n, err := io.Copy(tmp, io.LimitReader(r, size+1))
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	if n != size {
+		return fmt.Errorf("store: short body (%d/%d)", n, size)
+	}
+	return os.Rename(tmpName, p)
+}
+
 func (s *FileStore) GetTo(_ context.Context, key string, w io.Writer) (int64, error) {
 	p, err := s.objPath(key)
 	if err != nil {

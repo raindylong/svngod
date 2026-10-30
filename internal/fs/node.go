@@ -26,6 +26,9 @@ type Change struct {
 	// BaseRev is the client's working-copy revision for this path (0 for a
 	// new node); CommitTxn's per-path out-of-date check uses it.
 	BaseRev uint64
+	// DataFile, when set, holds the file body on disk (a streamed PUT). The
+	// commit stores it as an external text without loading it into memory.
+	DataFile string
 }
 
 // tnode is an in-memory working-copy node during a commit.
@@ -33,6 +36,7 @@ type tnode struct {
 	kind         byte
 	props        map[string]string
 	data         []byte // file full text (as of HEAD when loaded)
+	dataFile     string // streamed body on disk (large PUT)
 	baseText     []byte // previous file text captured during this commit (delta base)
 	children     map[string]*tnode
 	copyFrom     *NodeID

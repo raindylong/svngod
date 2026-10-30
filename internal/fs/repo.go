@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -295,6 +296,38 @@ func (r *Repo) GetNodeRev(id NodeID) (*NodeRev, error) {
 	r.nodeCache[k] = nr
 	r.nodeCacheMu.Unlock()
 	return nr, nil
+}
+
+// externalizeFile streams a file body into a content-addressed text object and
+// returns its md5, size and reference. The body is hashed and uploaded in two
+// passes, so memory use stays constant for arbitrarily large uploads.
+func (r *Repo) externalizeFile(ctx context.Context, path string) ([16]byte, uint64, string, error) {
+	var sum [16]byte
+	f, err := os.Open(path)
+	if err != nil {
+		return sum, 0, "", err
+	}
+	h := md5.New()
+	n, err := io.Copy(h, f)
+	f.Close()
+	if err != nil {
+		return sum, 0, "", err
+	}
+	copy(sum[:], h.Sum(nil))
+	ref := hex.EncodeToString(sum[:])
+	key := r.keys.Text(ref)
+	if _, ok, herr := r.store.Head(ctx, key); herr == nil && ok {
+		return sum, uint64(n), ref, nil
+	}
+	f, err = os.Open(path)
+	if err != nil {
+		return sum, 0, "", err
+	}
+	defer f.Close()
+	if err := r.store.PutFrom(ctx, key, f, n); err != nil {
+		return sum, 0, "", err
+	}
+	return sum, uint64(n), ref, nil
 }
 
 // StreamText writes a node's full text to w. External texts are streamed from
@@ -586,6 +619,19 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 			nr.CopyFromPath = t.copyFromPath
 		}
 		if t.kind == KindFile {
+			if t.dataFile != "" {
+				sum, size, ref, xerr := r.externalizeFile(ctx, t.dataFile)
+				if xerr != nil {
+					return 0, xerr
+				}
+				copy(nr.TextMD5[:], sum[:])
+				nr.TextRep = TextRepExternal
+				nr.TextRef = ref
+				nr.TextSize = size
+				nr.DeltaDepth = 0
+				nodes = append(nodes, nr)
+				continue
+			}
 			if err := r.ensureData(t); err != nil {
 				return 0, err
 			}
@@ -752,10 +798,14 @@ func (r *Repo) applyChange(root *tnode, ch *Change) error {
 			return err
 		}
 		if ch.Kind == KindFile {
-			t := &tnode{kind: KindFile, props: copyProps(ch.Props), data: append([]byte(nil), ch.Data...), dirty: true}
+			t := &tnode{kind: KindFile, props: copyProps(ch.Props), data: append([]byte(nil), ch.Data...), dataFile: ch.DataFile, dirty: true}
 			if old, ok := parent.children[name]; ok && old.kind == KindFile {
-				if err := r.ensureData(old); err != nil {
-					return err
+				// A streamed body becomes an external full text; no base text
+				// is needed, so do not load the old file into memory.
+				if ch.DataFile == "" {
+					if err := r.ensureData(old); err != nil {
+						return err
+					}
 				}
 				t.id = old.id
 				t.pred = old.pred
@@ -767,7 +817,7 @@ func (r *Repo) applyChange(root *tnode, ch *Change) error {
 				t.copyFromPath = old.copyFromPath
 				// A props-only change (PROPPATCH) carries no new text; keep the
 				// base revision's content so the commit does not empty the file.
-				if len(t.data) == 0 {
+				if len(t.data) == 0 && t.dataFile == "" {
 					t.data = append([]byte(nil), old.data...)
 				}
 				// A content-only change (PUT with no PROPPATCH) carries no

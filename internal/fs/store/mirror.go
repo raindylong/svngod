@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -204,6 +205,50 @@ func (m *MirrorStore) Get(ctx context.Context, key string, rng *Range) ([]byte, 
 	return nil, err
 }
 
+// PutFrom writes the stream to the primary and best-effort to standbys. The
+// reader is buffered through a temp file because a standby needs the bytes a
+// second time.
+func (m *MirrorStore) PutFrom(ctx context.Context, key string, r io.Reader, size int64) error {
+	tmp, err := os.CreateTemp("", "svngod-mirror-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := io.Copy(tmp, io.LimitReader(r, size)); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	p, pi := m.primary()
+	f, err := os.Open(tmpName)
+	if err != nil {
+		return err
+	}
+	err = p.PutFrom(ctx, key, f, size)
+	f.Close()
+	if err != nil {
+		m.markDown(pi)
+		return err
+	}
+	for i, s := range m.mirrors {
+		if i == pi || !m.isHealthy(i) {
+			continue
+		}
+		f, oerr := os.Open(tmpName)
+		if oerr != nil {
+			continue
+		}
+		if perr := s.PutFrom(ctx, key, f, size); perr != nil {
+			m.markDown(i)
+		}
+		f.Close()
+	}
+	return nil
+}
+
 // GetTo streams an object, preferring the same mirror Get would read from.
 func (m *MirrorStore) GetTo(ctx context.Context, key string, w io.Writer) (int64, error) {
 	if isControlKey(key) {
@@ -352,16 +397,21 @@ func (m *MirrorStore) repairLoop() {
 	}
 }
 
-// RepairNow runs one repair pass immediately (used on startup / when a mirror
-// is marked down).
-func (m *MirrorStore) RepairNow() { m.repair() }
+// RepairNow runs one repair pass immediately and synchronously (used on
+// startup / when a mirror is marked down). It must not silently skip because a
+// background repair holds the lock: callers expect the pass to have finished.
+func (m *MirrorStore) RepairNow() { m.repairInternal() }
 
 func (m *MirrorStore) repair() {
 	if !m.repairOnce.TryLock() {
 		return
 	}
 	defer m.repairOnce.Unlock()
+	m.repairInternal()
+}
 
+// repairInternal is one repair pass; callers coordinate with repairOnce.
+func (m *MirrorStore) repairInternal() {
 	p, pi := m.primary()
 	keys, err := listAll(context.Background(), p)
 	if err != nil {
