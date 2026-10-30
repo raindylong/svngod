@@ -28,6 +28,57 @@ svngod --config svngod.json
 
 配置示例见 `docs/Go-SVN服务器架构设计方案.md` §9.4（多库）、§9.5（主备 S3 镜像）。
 
+### 启动（S3 后端，当前环境示例）
+
+需要先有一个 S3 兼容对象存储。工程内置的本地 RustFS 用法如下：
+
+```bash
+# 1. 启动本地 RustFS（S3 兼容，端口 9000；凭证必须经 env 传入）
+RUSTFS_ACCESS_KEY=k RUSTFS_SECRET_KEY=s \
+  nohup /home/user/svngod/rustfs-bin server /home/user/svngod/rustfs-data \
+  > /tmp/rustfs.log 2>&1 &
+
+# 2. 启动 svngod（多库 JSON 配置，端口 19998）
+/home/user/svngod/bin/svngod --config /home/user/svngod/stab/s3-cas.json
+```
+
+`s3-cas.json` 要点：`endpoint=127.0.0.1:9000`、`ak=k`、`sk=s`、`bucket=svn`、`prefix=repos`，认证用本地密码表 `stab/s3/passwd`（账号 `alice:secret`）。
+
+svn 客户端固定使用自备份二进制（1.14.1），并依赖系统 libsvn：
+
+```bash
+SVN=/home/user/svngod/tools/svn
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu
+```
+
+## 用 svn CLI 简单测试
+
+```bash
+SVN=/home/user/svngod/tools/svn
+URL=http://127.0.0.1:19998/svn/demo-cas
+A="--username alice --password secret --non-interactive --no-auth-cache"
+
+# checkout / add / commit
+$SVN co $URL /tmp/w $A
+echo hello > /tmp/w/f.txt
+$SVN add /tmp/w/f.txt
+$SVN commit -m "init" /tmp/w/f.txt $A
+
+# update（增量与 no-op 均验证 update-report 读路径）
+$SVN update /tmp/w $A
+
+# 读路径
+$SVN status /tmp/w $A
+$SVN log $URL $A
+$SVN diff -r 1:2 $URL $A
+
+# 并发提交 —— 验证 S3 真 CAS 原子写（同路径并发应 1 胜 + N-1 个 E160024）
+for i in 1 2 3; do
+  ($SVN commit -m "c$i" /tmp/w/f.txt $A &)
+done
+wait
+```
+
 ## 工程结构
 
 ```
@@ -46,6 +97,8 @@ cmd/
 ## 验收状态
 
 - 真实 svn CLI 1.14.1（ra_serf HTTPv1）端到端：co / import / commit / update / status / log / ls / info / blame / diff。
+- **P0 S3 真 CAS 原子写**：Store.CAS 按内容哈希条件写（Get→ContentETag 比对→不等 `ErrPreconditionFailed`→Put），同路径并发提交 1 胜 + N-1 失败；`TestConcurrentSamePathCommit`（FileStore + 真实 RustFS）`-count=50`、`go test -race ./...` 全绿。
+- **P1 update-report 读路径回归**：对 WC 已存在节点发 `open-file`+`fetch-file`（而非 `add-file`，避免客户端 `add_file()` 把已版本化文件判为 obstructing working copy），`<S:entry start-empty>` 区分 co/update，根/目录 `rev=baseRev`，`V:md5-checksum`。`svn co` / 增量 update（文件内容正确更新）/ no-op update 全部正常（E155024 根治，与 mod_dav_svn 行为一致）。
 - 真实 OpenLDAP（direct-bind + search+bind）认证 + authz 授权。
 - 多库独立 authz / 独立认证（本地表 + LDAP 混合）E2E。
 - 主备 S3 镜像：双写 / 读负载均衡 / 故障降级 / 恢复自动补齐 E2E。
