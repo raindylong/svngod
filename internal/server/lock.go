@@ -14,7 +14,8 @@ import (
 // lockEntry is one exclusive write lock on a repository path.
 type lockEntry struct {
 	token   string // urn:uuid:<hex>
-	owner   string
+	owner   string // authenticated principal
+	comment string // free-form text from the LOCK request's <D:owner>
 	depth   string
 	created time.Time
 	timeout int // seconds
@@ -57,6 +58,11 @@ func (s *Server) handleLock(w http.ResponseWriter, r *http.Request, res resource
 	if path == "" {
 		path = "/"
 	}
+	// svn puts the user's "-m" lock comment in <D:owner>; the authenticated
+	// principal is the lock owner. Keep them separate: folding the username
+	// into the comment field (and dropping the comment) makes clients show
+	// "(null)" as the owner and the username as the comment.
+	comment := parseLockOwner(r.Body)
 	key := lockKey(res.repo, path)
 
 	s.mu.Lock()
@@ -77,7 +83,7 @@ func (s *Server) handleLock(w http.ResponseWriter, r *http.Request, res resource
 		return
 	}
 	tok = newLockToken()
-	entry := &lockEntry{token: tok, owner: owner, depth: "infinity", created: time.Now(), timeout: 3600}
+	entry := &lockEntry{token: tok, owner: owner, comment: comment, depth: "infinity", created: time.Now(), timeout: 3600}
 	s.locks[key] = entry
 	s.mu.Unlock()
 
@@ -151,8 +157,12 @@ func (s *Server) writeLockDiscovery(w http.ResponseWriter, res resource, e *lock
 	b.WriteString(`      <D:locktype><D:write/></D:locktype>` + "\n")
 	b.WriteString(`      <D:lockscope><D:exclusive/></D:lockscope>` + "\n")
 	b.WriteString(`      <D:depth>` + e.depth + `</D:depth>` + "\n")
+	if e.comment != "" {
+		b.WriteString(`      <D:owner>` + xmlEscape(e.comment) + `</D:owner>` + "\n")
+	}
 	if e.owner != "" {
-		b.WriteString(`      <D:owner>` + xmlEscape(e.owner) + `</D:owner>` + "\n")
+		b.WriteString(`      <S:owner>` + xmlEscape(e.owner) + `</S:owner>` + "\n")
+		b.WriteString(`      <S:lockowner>` + xmlEscape(e.owner) + `</S:lockowner>` + "\n")
 	}
 	b.WriteString(fmt.Sprintf(`      <D:timeout>Second-%d</D:timeout>`+"\n", e.timeout))
 	b.WriteString(`      <D:locktoken><D:href>` + e.token + `</D:href></D:locktoken>` + "\n")
@@ -178,8 +188,14 @@ func writeActivelock(b *strings.Builder, e *lockEntry) {
 	b.WriteString("          <D:locktype><D:write/></D:locktype>\n")
 	b.WriteString("          <D:lockscope><D:exclusive/></D:lockscope>\n")
 	b.WriteString("          <D:depth>" + e.depth + "</D:depth>\n")
+	if e.comment != "" {
+		// DAV:owner carries the client-supplied lock comment: svn puts the
+		// "-m" text there and reads it back as "Lock Comment".
+		b.WriteString("          <D:owner>" + xmlEscape(e.comment) + "</D:owner>\n")
+	}
 	if e.owner != "" {
-		b.WriteString("          <D:owner>" + xmlEscape(e.owner) + "</D:owner>\n")
+		b.WriteString("          <S:owner>" + xmlEscape(e.owner) + "</S:owner>\n")
+		b.WriteString("          <S:lockowner>" + xmlEscape(e.owner) + "</S:lockowner>\n")
 	}
 	b.WriteString(fmt.Sprintf("          <D:timeout>Second-%d</D:timeout>\n", e.timeout))
 	b.WriteString("          <D:locktoken><D:href>" + e.token + "</D:href></D:locktoken>\n")
