@@ -321,3 +321,32 @@ func TestReportUpdateAnchoredSwitch(t *testing.T) {
 		t.Fatalf("anchor open-directory carries properties:\n%s", between)
 	}
 }
+
+// TestReportTwoTreeDiff: svn merge/diff between two URLs sends src-path and
+// dst-path. The report must diff those trees (branch@2 vs trunk@1), not the
+// target path against itself; a branch-only file has to arrive as add-file.
+func TestReportTwoTreeDiff(t *testing.T) {
+	ts, repo, base := testServer(t, "", "")
+	defer ts.Close()
+	if _, err := repo.CommitTxn(1, []fs.Change{
+		{Path: "/branch", Action: fs.ActionCopy, Kind: fs.KindDir, CopyFromPath: "/trunk", CopyFromRev: 1},
+		{Path: "/branch/f.txt", Action: fs.ActionAdd, Kind: fs.KindFile, Data: []byte("f\n")},
+	}, map[string]string{"svn:log": "r2"}); err != nil {
+		t.Fatal(err)
+	}
+	body := `<?xml version="1.0"?><S:update-report xmlns:S="svn:">` +
+		`<S:src-path>` + base + `/svn/demo/trunk</S:src-path>` +
+		`<S:target-revision>2</S:target-revision>` +
+		`<S:dst-path>` + base + `/svn/demo/branch</S:dst-path>` +
+		`<S:depth>infinity</S:depth><S:entry depth="infinity" rev="1"></S:entry></S:update-report>`
+	out := doReport(t, base, body)
+	if !strings.Contains(out, `<S:add-file name="f.txt"`) {
+		t.Fatalf("branch-only file not added:\n%s", out)
+	}
+	if strings.Contains(out, `name="README.txt"`) {
+		t.Fatalf("unchanged file emitted:\n%s", out)
+	}
+	if strings.Contains(out, `<S:add-file name="guide.txt"`) {
+		t.Fatalf("unchanged subtree emitted:\n%s", out)
+	}
+}

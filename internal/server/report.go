@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"crypto/md5"
 	"crypto/sha1"
 	"encoding/base64"
@@ -150,32 +151,63 @@ func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name s
 		limit, filesOnly = depthLimit(reqDepth)
 	}
 
+	// Two-tree form: svn merge / svn diff between different URLs names a
+	// dst-path that differs from src-path. The response must diff those two
+	// trees, not the target path against the working copy.
+	dstPath := ""
+	if dp, ok := root.child("dst-path"); ok {
+		if p, ok := extractReposPath(strings.TrimSpace(dp.Content), base); ok {
+			dstPath = p
+		}
+	}
+	// svn switch reports an anchor plus a target: the WC root is only the
+	// anchor and must not carry properties (the client asserts on that). The
+	// content comes from dst-path (the new URL), while the baseline is the
+	// entry for the old path (rootPath + update-target).
+	updateTarget := ""
+	if ut, ok := root.child("update-target"); ok {
+		updateTarget = strings.Trim(strings.TrimSpace(ut.Content), "/")
+	}
+	if updateTarget != "" {
+		newPath := dstPath
+		if newPath == "" {
+			newPath = joinWCPath(rootPath, updateTarget)
+		}
+		oldPath := joinWCPath(rootPath, updateTarget)
+		anchorRev := rev
+		if r := wb.rootRev(); r > 0 {
+			anchorRev = r
+		}
+		var b strings.Builder
+		b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
+		b.WriteString(`<S:update-report xmlns:S="svn:" xmlns:D="` + NS_DAV + `" xmlns:V="http://subversion.tigris.org/xmlns/dav/" inline-props="true">` + "\n")
+		b.WriteString("  <S:target-revision rev=\"" + strconv.FormatUint(rev, 10) + "\"/>\n")
+		rp, _ := repo.GetRevProps(rev)
+		uuid, _ := repo.UUID()
+		b.WriteString("  <S:open-directory rev=\"" + strconv.FormatUint(anchorRev, 10) + "\">\n")
+		if err := s.updateWalkDir(&b, repo, base, rev, newPath, "open-directory", true, rp, uuid, wb, 0, limit, filesOnly, explicitDepth, 0, updateTarget, oldPath); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		b.WriteString("  </S:open-directory>\n")
+		b.WriteString("</S:update-report>\n")
+		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, b.String())
+		return
+	}
+	if dstPath != "" && normalizeWCPath(dstPath) != normalizeWCPath(rootPath) {
+		s.reportDiff(w, repo, base, rev, rootPath, dstPath, wb.rootRev(), limit, filesOnly)
+		return
+	}
+
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
 	b.WriteString(`<S:update-report xmlns:S="svn:" xmlns:D="` + NS_DAV + `" xmlns:V="http://subversion.tigris.org/xmlns/dav/" inline-props="true">` + "\n")
 	b.WriteString("  <S:target-revision rev=\"" + strconv.FormatUint(rev, 10) + "\"/>\n")
 	rp, _ := repo.GetRevProps(rev)
 	uuid, _ := repo.UUID()
-	// svn switch reports an anchor plus a target: the WC root is only the
-	// anchor and must not carry properties (the client asserts on that), while
-	// the target element carries the new location's props and children.
-	updateTarget := ""
-	if ut, ok := root.child("update-target"); ok {
-		updateTarget = strings.Trim(strings.TrimSpace(ut.Content), "/")
-	}
-	if updateTarget != "" {
-		targetPath := joinWCPath(rootPath, updateTarget)
-		anchorRev := rev
-		if r := wb.rootRev(); r > 0 {
-			anchorRev = r
-		}
-		b.WriteString("  <S:open-directory rev=\"" + strconv.FormatUint(anchorRev, 10) + "\">\n")
-		if err := s.updateWalkDir(&b, repo, base, rev, targetPath, "open-directory", true, rp, uuid, wb, 0, limit, filesOnly, explicitDepth, 0, updateTarget); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		b.WriteString("  </S:open-directory>\n")
-	} else if err := s.updateWalkDir(&b, repo, base, rev, rootPath, "open-directory", true, rp, uuid, wb, 0, limit, filesOnly, explicitDepth, 0, ""); err != nil {
+	if err := s.updateWalkDir(&b, repo, base, rev, rootPath, "open-directory", true, rp, uuid, wb, 0, limit, filesOnly, explicitDepth, 0, "", rootPath); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -198,6 +230,7 @@ type wcEntry struct {
 // copy?" by finding the most specific <S:entry> covering the path.
 type wcBaseline struct {
 	repo    *fs.Repo
+	root    string
 	entries map[string]wcEntry
 }
 
@@ -223,8 +256,8 @@ func pathUnder(path, prefix string) bool {
 }
 
 func newWCBaseline(repo *fs.Repo, rootPath string, root *xmlEl) *wcBaseline {
-	wb := &wcBaseline{repo: repo, entries: map[string]wcEntry{}}
-	rootPath = normalizeWCPath(rootPath)
+	wb := &wcBaseline{repo: repo, root: normalizeWCPath(rootPath), entries: map[string]wcEntry{}}
+	rootPath = wb.root
 	var walk func(parent string, e xmlEl)
 	walk = func(parent string, e xmlEl) {
 		name := strings.TrimSpace(e.Content)
@@ -289,12 +322,12 @@ func (w *wcBaseline) revFor(path string) (uint64, bool) {
 	return best.rev, true
 }
 
-// rootRev is the WC root's revision (0 for a fresh checkout).
+// rootRev is the revision the report's target path sits at in the WC (0 for a
+// fresh checkout). The root entry is keyed by the report's src-path, which is
+// not necessarily the repository root (e.g. a WC checked out at /trunk).
 func (w *wcBaseline) rootRev() uint64 {
-	for _, e := range w.entries {
-		if e.path == "/" {
-			return e.rev
-		}
+	if e, ok := w.entries[w.root]; ok {
+		return e.rev
 	}
 	return 0
 }
@@ -380,9 +413,9 @@ func (w *wcBaseline) entryDepthLevel(path string) (int, bool) {
 // baseline decision comes from the client's per-path <S:entry> revisions
 // (wcBaseline), so mixed-revision WCs update correctly. Paths present in the
 // client's baseline but absent from the target are reported as delete-entry.
-func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, rev uint64, path, openEl string, wrap bool, rp *fs.RevProps, uuid string, wb *wcBaseline, level, limit int, filesOnly, explicitDepth bool, copyFloor uint64, wrapName string) error {
+func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, rev uint64, path, openEl string, wrap bool, rp *fs.RevProps, uuid string, wb *wcBaseline, level, limit int, filesOnly, explicitDepth bool, copyFloor uint64, wrapName, wcPath string) error {
 	outRev := rev
-	if br, ok := wb.revFor(path); ok {
+	if br, ok := wb.revFor(wcPath); ok {
 		outRev = br
 	}
 	// Nodes inside a copied directory share the source's node-rev ids; their
@@ -425,14 +458,15 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 			continue
 		}
 		cpath := joinWCPath(path, c.Name)
-		baseRev, inBase := wb.revFor(cpath)
+		cwcPath := joinWCPath(wcPath, c.Name)
+		baseRev, inBase := wb.revFor(cwcPath)
 		if c.Kind == fs.KindDir {
 			// A revision inherited from an ancestor entry does not prove the
 			// client has this directory: it may have been added after that
 			// revision (e.g. a server-side copy). It must exist in the
 			// baseline tree as well.
 			if inBase {
-				if _, err := repo.Resolve(baseRev, cpath); err != nil {
+				if _, err := repo.Resolve(baseRev, cwcPath); err != nil {
 					inBase = false
 				}
 			}
@@ -463,7 +497,7 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 					b.WriteString("    </S:open-directory>\n")
 					continue
 				}
-				if err := s.updateWalkDir(b, repo, base, rev, cpath, "open-directory", false, rp, uuid, wb, childLevel, cl, false, explicitDepth, copyFloor, ""); err != nil {
+				if err := s.updateWalkDir(b, repo, base, rev, cpath, "open-directory", false, rp, uuid, wb, childLevel, cl, false, explicitDepth, copyFloor, "", cwcPath); err != nil {
 					return err
 				}
 				b.WriteString("    </S:open-directory>\n")
@@ -493,7 +527,7 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 					b.WriteString("    </S:add-directory>\n")
 					continue
 				}
-				if err := s.updateWalkDir(b, repo, base, rev, cpath, "add-directory", false, rp, uuid, wb, childLevel, cl, false, explicitDepth, copyFloor, ""); err != nil {
+				if err := s.updateWalkDir(b, repo, base, rev, cpath, "add-directory", false, rp, uuid, wb, childLevel, cl, false, explicitDepth, copyFloor, "", cwcPath); err != nil {
 					return err
 				}
 				b.WriteString("    </S:add-directory>\n")
@@ -511,7 +545,7 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 		var baseNode *fs.NodeRev
 		var baseText []byte
 		if inBase {
-			if bn, berr := repo.Resolve(baseRev, cpath); berr == nil && bn.Kind == fs.KindFile {
+			if bn, berr := repo.Resolve(baseRev, cwcPath); berr == nil && bn.Kind == fs.KindFile {
 				baseNode = bn
 				if bt, gerr := repo.GetText(bn.Node); gerr == nil {
 					baseText = bt
@@ -520,10 +554,19 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 		}
 		if inBase && baseNode != nil {
 			propsChanged := !sameProps(baseNode.Props, nr.Props)
-			if c.ID.Rev <= baseRev && !propsChanged {
+			// A switch compares different paths: node revisions do not tell us
+			// whether the content changed (the target node can share a
+			// revision with the baseline while the text differs), so compare
+			// the text itself.
+			samePath := normalizeWCPath(path) == normalizeWCPath(wcPath)
+			textChanged := !bytes.Equal(baseText, text)
+			if samePath && c.ID.Rev <= baseRev && !propsChanged {
 				continue // unchanged since the client's baseline
 			}
-			if c.ID.Rev <= baseRev && propsChanged {
+			if !samePath && !textChanged && !propsChanged {
+				continue
+			}
+			if samePath && c.ID.Rev <= baseRev && propsChanged {
 				// Property-only change: open the file solely to set props.
 				fileRev := pathCreatedRev(repo, nr)
 				if fileRev < copyFloor {
@@ -584,8 +627,8 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 		b.WriteString("    </S:add-file>\n")
 	}
 	// Deletions: anything the client has at its baseline but the target lacks.
-	if baseRev, inBase := wb.revFor(path); inBase && baseRev > 0 {
-		if baseChildren, err := repo.ListDir(baseRev, path); err == nil {
+	if baseRev, inBase := wb.revFor(wcPath); inBase && baseRev > 0 {
+		if baseChildren, err := repo.ListDir(baseRev, wcPath); err == nil {
 			inTarget := make(map[string]bool, len(children))
 			for _, c := range children {
 				inTarget[c.Name] = true
@@ -595,7 +638,7 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 				if inTarget[bc.Name] {
 					continue
 				}
-				if _, present := wb.revFor(joinWCPath(path, bc.Name)); !present {
+				if _, present := wb.revFor(joinWCPath(wcPath, bc.Name)); !present {
 					continue
 				}
 				deleted = append(deleted, bc.Name)
