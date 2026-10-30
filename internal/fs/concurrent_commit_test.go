@@ -2,8 +2,11 @@ package fs
 
 import (
 	"fmt"
+	"os"
+	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"svngod/internal/fs/store"
 )
@@ -86,5 +89,89 @@ func TestConcurrentSamePathCommit(t *testing.T) {
 	}
 	if string(got) != "v0" && string(got) != "v1" && string(got) != "v2" {
 		t.Fatalf("committed f.txt content is polluted/foreign: %q", got)
+	}
+}
+
+// TestConcurrentSamePathCommitS3 runs the identical same-path atomicity contract
+// against a real S3 backend (local RustFS at 127.0.0.1:9000, AK/SK k/s). The
+// store's real content-hash CAS must yield exactly one winner and ErrOutOfDate
+// for the rest. Skipped when the local RustFS instance is not reachable, so the
+// suite stays green in environments without it.
+func TestConcurrentSamePathCommitS3(t *testing.T) {
+	st, err := store.NewS3Store(store.S3Config{
+		Endpoint:   "127.0.0.1:9000",
+		AccessKey:  "k",
+		SecretKey:  "s",
+		Bucket:     "svn",
+		Region:     "us-east-1",
+		RepoPrefix: "it/" + strconv.FormatInt(time.Now().UnixNano(), 36),
+		BaseRepo:   "r",
+	})
+	if err != nil {
+		t.Skipf("local RustFS not reachable, skipping S3 CAS concurrency test: %v", err)
+	}
+	r, err := CreateRepo(st, "", 4096, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := r.CommitTxn(0, []Change{
+		{Path: "/f.txt", Action: ActionAdd, Kind: KindFile, Data: []byte("s3 cas base content seed")},
+	}, nil)
+	if err != nil || base != 1 {
+		t.Fatalf("seed commit: rev=%d err=%v", base, err)
+	}
+
+	const n = 3
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = r.CommitTxn(base, []Change{
+				{Path: "/f.txt", Action: ActionModify, Kind: KindFile, Data: []byte(fmt.Sprintf("s3v%d", i))},
+			}, nil)
+		}(i)
+	}
+	wg.Wait()
+
+	succ, ood := 0, 0
+	var winnerErr error
+	for i, e := range errs {
+		switch {
+		case e == nil:
+			succ++
+		case e == ErrOutOfDate:
+			ood++
+		default:
+			winnerErr = fmt.Errorf("unexpected error from goroutine %d: %v", i, e)
+		}
+	}
+	if winnerErr != nil {
+		t.Fatal(winnerErr)
+	}
+	if succ != 1 || ood != n-1 {
+		t.Fatalf("expected 1 winner + %d out-of-date on S3, got succ=%d ood=%d", n-1, succ, ood)
+	}
+	head, err := r.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head != base+1 {
+		t.Fatalf("head=%d, want %d (no block pollution)", head, base+1)
+	}
+	nr, err := r.Resolve(head, "/f.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.GetText(nr.Node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := string(got); s != "s3v0" && s != "s3v1" && s != "s3v2" {
+		t.Fatalf("S3 committed f.txt polluted/foreign: %q", s)
+	}
+	if os.Getenv("RUSTFS_TEST") == "" {
+		t.Log("passed against local RustFS at 127.0.0.1:9000")
 	}
 }
