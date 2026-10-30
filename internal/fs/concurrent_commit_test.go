@@ -13,7 +13,10 @@ import (
 // path yield exactly one winner, the losers get ErrOutOfDate (not a silent
 // lost update), and the committed content is the winner's — no block pollution.
 func TestConcurrentSamePathCommit(t *testing.T) {
-	st := store.NewMemoryStore()
+	st, err := store.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	r, err := CreateRepo(st, "repos/test", 4096, 64)
 	if err != nil {
 		t.Fatal(err)

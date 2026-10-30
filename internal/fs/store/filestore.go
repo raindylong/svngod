@@ -92,8 +92,16 @@ func (s *FileStore) Head(_ context.Context, key string) (string, bool, error) {
 		}
 		return "", false, err
 	}
-	// file size doubles as a cheap, stable ETag
-	return fmt.Sprintf("%d", fi.Size()), true, nil
+	if fi.IsDir() {
+		return "", false, os.ErrNotExist
+	}
+	// Content-hash ETag, matching headLocked/CAS below. Returning file size
+	// here while CAS compares MD5 would make every commit's precondition fail.
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return "", false, err
+	}
+	return contentETag(data), true, nil
 }
 
 func (s *FileStore) CreateIfAbsent(_ context.Context, key string, data []byte) error {
