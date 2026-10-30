@@ -293,11 +293,19 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 				// already-versioned file as an obstructing working copy.
 				ver := base + "!svn/ver/" + strconv.FormatUint(rev, 10) + "/" + strings.TrimPrefix(cpath, "/")
 				ss := sha1.Sum(text)
-				bs := md5.Sum(baseText)
-				b.WriteString("    <S:open-file name=\"" + xmlEscape(c.Name) + "\" rev=\"" + strconv.FormatUint(outRev, 10) + "\" sha1-checksum=\"" + hex.EncodeToString(ss[:]) + "\" base-checksum=\"" + hex.EncodeToString(bs[:]) + "\">\n")
+				// base-checksum validates the client's WC baseline: for an
+				// incremental update it is the baseline text's MD5; when
+				// baseRev==rev (no-op) the WC baseline equals the target text.
+				bs := md5.Sum(text)
+				if len(baseText) > 0 {
+					bs = md5.Sum(baseText)
+				}
+				b.WriteString("    <S:open-file name=\"" + xmlEscape(c.Name) + "\" rev=\"" + strconv.FormatUint(outRev, 10) + "\">\n")
 				b.WriteString("      <D:checked-in><D:href>" + xmlEscape(ver) + "</D:href></D:checked-in>\n")
 				writeEntryProps(b, rp, uuid, rev)
-				b.WriteString("      <S:txdelta>" + base64.StdEncoding.EncodeToString(delta) + "</S:txdelta>\n")
+				// fetch-file: client GETs the full text at the checked-in href
+				// (like mod_dav_svn). base-checksum validates the WC baseline.
+				b.WriteString("      <S:fetch-file base-checksum=\"" + hex.EncodeToString(bs[:]) + "\" sha1-checksum=\"" + hex.EncodeToString(ss[:]) + "\"/>\n")
 				b.WriteString("      <S:prop><V:md5-checksum>" + md5hex + "</V:md5-checksum></S:prop>\n")
 				b.WriteString("    </S:open-file>\n")
 			} else {
