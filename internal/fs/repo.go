@@ -735,10 +735,20 @@ func (r *Repo) applyChange(root *tnode, ch *Change) error {
 		}
 		cp := deepCopy(src)
 		cp.dirty = true
-		// copyfrom is the source node's own revision, exactly as svn records
-		// it; children that were updated after the parent's source revision
-		// then show up as "replaced" with their own copy source.
-		cp.copyFrom = &src.id
+		// copyfrom is the source as of the revision the client asked for
+		// (the COPY URL's peg). Resolving that revision gives the node svn
+		// would have recorded; children updated after it then differ from the
+		// parent's copy source and show up as replaced, exactly as svn
+		// reports a working-copy copy with mixed base revisions.
+		if ch.CopyFromRev > 0 {
+			if snr, serr := r.Resolve(ch.CopyFromRev, ch.CopyFromPath); serr == nil {
+				cp.copyFrom = &snr.Node
+			} else {
+				cp.copyFrom = &src.id
+			}
+		} else {
+			cp.copyFrom = &src.id
+		}
 		cp.copyFromPath = ch.CopyFromPath
 		if err := r.ensureDir(parent); err != nil {
 			return err

@@ -949,9 +949,16 @@ func (s *Server) logChangedPaths(b *strings.Builder, repo *fs.Repo, rev uint64, 
 				// addition, not a replacement.
 				continue
 			}
-			// Present in the source but different here: svn reports replaced.
+			// Present in the source but different here: svn reports replaced
+			// with the child's own copy source (the source path with this
+			// suffix, as of the revision the child came from).
+			cfRev := nr.Node.Rev
+			if nr.CopyFrom != nil && nr.CopyFrom.Rev > 0 {
+				cfRev = nr.CopyFrom.Rev
+			}
 			changes[p] = change{action: chReplaced, kind: nr.Kind,
-				textMods: nr.Kind == fs.KindFile, propMods: false}
+				textMods: nr.Kind == fs.KindFile, propMods: false,
+				copyFromPath: cr.src + suffix, copyFromRev: cfRev}
 		}
 	}
 	paths := make([]string, 0, len(changes))
@@ -984,7 +991,12 @@ func (s *Server) logChangedPaths(b *strings.Builder, repo *fs.Repo, rev uint64, 
 		case chDeleted:
 			b.WriteString("    <S:deleted-path" + attrs + ">" + xmlEscape(p) + "</S:deleted-path>\n")
 		case chReplaced:
-			b.WriteString("    <S:replaced-path" + attrs + ">" + xmlEscape(p) + "</S:replaced-path>\n")
+			cf := ""
+			if ch.copyFromPath != "" {
+				cf = " copyfrom-path=\"" + xmlEscape(ch.copyFromPath) + "\" copyfrom-rev=\"" +
+					strconv.FormatUint(ch.copyFromRev, 10) + "\""
+			}
+			b.WriteString("    <S:replaced-path" + cf + attrs + ">" + xmlEscape(p) + "</S:replaced-path>\n")
 		}
 	}
 }
@@ -1003,6 +1015,10 @@ type change struct {
 	kind     byte
 	textMods bool
 	propMods bool
+	// copyfrom for replaced entries inside a copied directory (svn records
+	// the child's own copy source there, which merge tracking uses).
+	copyFromPath string
+	copyFromRev  uint64
 }
 
 // treeDiff returns the set of paths changed between rev-1 and rev.
