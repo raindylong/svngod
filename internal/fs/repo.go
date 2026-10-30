@@ -140,7 +140,7 @@ func (r *Repo) Head() (uint64, error) {
 
 func (r *Repo) readCurrent() (*Current, string, error) {
 	ctx := context.Background()
-	etag, ok, err := r.store.Head(ctx, r.keys.Current())
+	_, ok, err := r.store.Head(ctx, r.keys.Current())
 	if err != nil {
 		return nil, "", err
 	}
@@ -152,7 +152,11 @@ func (r *Repo) readCurrent() (*Current, string, error) {
 		return nil, "", err
 	}
 	cur, err := UnmarshalCurrent(b)
-	return cur, etag, err
+	// The ETag is the content hash of the current pointer itself, not the
+	// store's HEAD metadata: on object stores (RustFS) HEAD/GET header ETags
+	// are unstable, while the GET body is byte-exact. All store CAS
+	// implementations compare against this same content-hash ETag.
+	return cur, store.ContentETag(b), err
 }
 
 func (r *Repo) shard(rev uint64) uint64 { return rev / r.shardSz }

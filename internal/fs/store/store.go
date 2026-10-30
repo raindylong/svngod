@@ -114,8 +114,11 @@ func (m *MemoryStore) Get(_ context.Context, key string, rng *Range) ([]byte, er
 func (m *MemoryStore) Head(_ context.Context, key string) (string, bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	e, ok := m.etag[key]
-	return e, ok, nil
+	data, ok := m.data[key]
+	if !ok {
+		return "", false, nil
+	}
+	return ContentETag(data), true, nil
 }
 
 func (m *MemoryStore) CreateIfAbsent(_ context.Context, key string, data []byte) error {
@@ -127,20 +130,21 @@ func (m *MemoryStore) CreateIfAbsent(_ context.Context, key string, data []byte)
 	cp := make([]byte, len(data))
 	copy(cp, data)
 	m.data[key] = cp
-	m.etag[key] = m.nextETag(key)
+	m.etag[key] = ContentETag(data)
 	return nil
 }
 
 func (m *MemoryStore) CAS(_ context.Context, key string, expectETag string, data []byte) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.etag[key] != expectETag {
+	cur, ok := m.data[key]
+	if !ok || ContentETag(cur) != expectETag {
 		return "", ErrPreconditionFailed
 	}
 	cp := make([]byte, len(data))
 	copy(cp, data)
 	m.data[key] = cp
-	m.etag[key] = m.nextETag(key)
+	m.etag[key] = ContentETag(data)
 	return m.etag[key], nil
 }
 

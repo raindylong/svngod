@@ -101,7 +101,7 @@ func (s *FileStore) Head(_ context.Context, key string) (string, bool, error) {
 	if err != nil {
 		return "", false, err
 	}
-	return contentETag(data), true, nil
+	return ContentETag(data), true, nil
 }
 
 func (s *FileStore) CreateIfAbsent(_ context.Context, key string, data []byte) error {
@@ -149,7 +149,7 @@ func (s *FileStore) CAS(_ context.Context, key string, expectETag string, data [
 	if err := os.WriteFile(p, data, 0o644); err != nil {
 		return "", err
 	}
-	return contentETag(data), nil
+	return ContentETag(data), nil
 }
 
 func (s *FileStore) headLocked(p string) (string, bool, error) {
@@ -167,14 +167,14 @@ func (s *FileStore) headLocked(p string) (string, bool, error) {
 	if err != nil {
 		return "", false, err
 	}
-	return contentETag(data), true, nil
+	return ContentETag(data), true, nil
 }
 
 // contentETag returns a content hash of data so that CAS on mutable objects
 // (the current HEAD pointer) never collides across revisions that happen to
 // have the same byte length. File size is a poor ETag: two revisions of
 // "current" can have equal size and CAS would wrongly accept a stale writer.
-func contentETag(data []byte) string {
+func ContentETag(data []byte) string {
 	h := md5.Sum(data)
 	return hex.EncodeToString(h[:])
 }

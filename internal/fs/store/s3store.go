@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -34,14 +35,12 @@ type S3Store struct {
 
 // NewS3Store builds an S3Store.
 //
-// CAS / CreateIfAbsent note: minio-go (v7) does not expose S3 conditional
-// PutObject (If-Match / If-None-Match), and CopyObject self-copy cannot
-// change an object's body. Therefore these two methods here are single-writer
-// best-effort: a Head pre-check followed by an atomic PutObject. This is
-// correct for the single-process design, where the process mutex plus S3's
-// object-level PutObject atomicity (read-after-write, never a torn object)
-// provide the real guarantee. Truly atomic multi-writer CAS requires
-// conditional writes (AWS SDK v2, 2024+); that is the documented upgrade path.
+// CAS is a real content-hash compare-and-swap (see CAS below): the current
+// object is read, its MD5 content ETag is compared against the expected ETag,
+// and only then is the object overwritten. This gives genuine single-writer
+// atomicity even across processes on an S3 gateway, independent of whether the
+// gateway returns stable HEAD ETags. The bucket is created idempotently on
+// first use.
 func NewS3Store(cfg S3Config) (*S3Store, error) {
 	opt := &minio.Options{BucketLookup: minio.BucketLookupAuto, Secure: cfg.UseSSL}
 	if cfg.Region != "" {
@@ -55,6 +54,24 @@ func NewS3Store(cfg S3Config) (*S3Store, error) {
 	cl, err := minio.New(cfg.Endpoint, opt)
 	if err != nil {
 		return nil, fmt.Errorf("store: init s3 client: %w", err)
+	}
+	ctx := context.Background()
+	exists, err := cl.BucketExists(ctx, cfg.Bucket)
+	if err != nil {
+		// Reverse proxies (nginx in front of RustFS) commonly answer the
+		// bucket-root HEAD probe with a 301 redirect even though object-path
+		// requests work fine. Treat such gateway-level redirects as "bucket
+		// exists" and let the first object write surface a real problem.
+		if merr := minio.ToErrorResponse(err); merr.StatusCode == 301 || merr.StatusCode == 307 || merr.StatusCode == 405 {
+			exists = true
+		} else {
+			return nil, fmt.Errorf("store: check bucket %s: %w", cfg.Bucket, err)
+		}
+	}
+	if !exists {
+		if err := cl.MakeBucket(ctx, cfg.Bucket, minio.MakeBucketOptions{Region: cfg.Region}); err != nil {
+			return nil, fmt.Errorf("store: create bucket %s: %w", cfg.Bucket, err)
+		}
 	}
 	return &S3Store{client: cl, bucket: cfg.Bucket, prefix: joinKey(cfg.RepoPrefix, cfg.BaseRepo)}, nil
 }
@@ -129,27 +146,27 @@ func (s *S3Store) CreateIfAbsent(ctx context.Context, key string, data []byte) e
 	return s.Put(ctx, key, data)
 }
 
-// CAS is single-writer: Head + atomic PutObject (see NewS3Store note).
-// svngod is a single process and every commit is serialised under repo.mu, so
-// the ETag comparison is only a best-effort guard. Some S3 gateways (e.g.
-// RustFS) return unstable ETags across HEAD requests, which made the strict
-// `cur != expect` comparison spuriously fail with ErrPreconditionFailed and
-// abort commits. We keep the existence check but proceed with the overwrite
-// regardless of ETag mismatch.
+// CAS is a real content-hash compare-and-swap: read the current object, compare
+// its content ETag (MD5 of bytes) against expectETag, and only then overwrite.
+// The HEAD existence check is deliberately avoided here — a HEAD read is not
+// needed because the GET body already proves existence, and on some S3 gateways
+// (e.g. RustFS) HEAD/GET ETag headers are unstable while the body is always
+// byte-exact. Return value is the new content ETag of the written object.
 func (s *S3Store) CAS(ctx context.Context, key string, expectETag string, data []byte) (string, error) {
-	if _, ok, err := s.Head(ctx, key); err != nil {
+	cur, err := s.Get(ctx, key, nil)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return "", ErrNotFound
+		}
 		return "", err
-	} else if !ok {
-		return "", ErrNotFound
+	}
+	if ContentETag(cur) != expectETag {
+		return "", ErrPreconditionFailed
 	}
 	if err := s.Put(ctx, key, data); err != nil {
 		return "", err
 	}
-	info, err := s.client.StatObject(ctx, s.bucket, s.key(key), minio.StatObjectOptions{})
-	if err != nil {
-		return "", err
-	}
-	return info.ETag, nil
+	return ContentETag(data), nil
 }
 
 func (s *S3Store) ListPrefix(ctx context.Context, prefix, continuation string, max int) ([]ListedObj, string, error) {
