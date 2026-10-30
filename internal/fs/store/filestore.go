@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"fmt"
 	"io/fs"
 	"os"
@@ -139,7 +141,7 @@ func (s *FileStore) CAS(_ context.Context, key string, expectETag string, data [
 	if err := os.WriteFile(p, data, 0o644); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%d", int64(len(data))), nil
+	return contentETag(data), nil
 }
 
 func (s *FileStore) headLocked(p string) (string, bool, error) {
@@ -150,7 +152,23 @@ func (s *FileStore) headLocked(p string) (string, bool, error) {
 		}
 		return "", false, err
 	}
-	return fmt.Sprintf("%d", fi.Size()), true, nil
+	if fi.IsDir() {
+		return "", false, os.ErrNotExist
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return "", false, err
+	}
+	return contentETag(data), true, nil
+}
+
+// contentETag returns a content hash of data so that CAS on mutable objects
+// (the current HEAD pointer) never collides across revisions that happen to
+// have the same byte length. File size is a poor ETag: two revisions of
+// "current" can have equal size and CAS would wrongly accept a stale writer.
+func contentETag(data []byte) string {
+	h := md5.Sum(data)
+	return hex.EncodeToString(h[:])
 }
 
 func (s *FileStore) ListPrefix(_ context.Context, prefix, _ string, max int) ([]ListedObj, string, error) {
