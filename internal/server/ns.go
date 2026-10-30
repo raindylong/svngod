@@ -5,28 +5,47 @@ package server
 import (
 	"encoding/xml"
 	"fmt"
+	"net/http"
 	"strings"
 )
 
 // XML namespaces used by the Subversion DAV protocol (mirrors mod_dav_svn).
 const (
 	NS_DAV    = "DAV:"
-	NS_SVN    = "http://subversion.tigris.org/xmlns/svn/"  // svn:* properties
+	NS_SVN    = "http://subversion.tigris.org/xmlns/svn/" // svn:* properties
 	NS_DAVSVN = "http://subversion.tigris.org/xmlns/dav/" // protocol elements (update-report, checkout, ...)
 	NS_CSVN   = "http://subversion.tigris.org/xmlns/custom/"
 )
 
-// The DAV capabilities advertised in OPTIONS (RFC 3253 DeltaV + SVN extras).
-// svndiff1/svndiff2 advertise that we accept compressed (zlib/lz4) svndiff
-// windows on PUT; the svn client then picks v1/v2 instead of plain v0.
-const davCapabilities = "1, 2, 3, version-control, checkout, working-resource, merge, baseline, activity, version-controlled-collection, labeled-version, update, http://subversion.tigris.org/xmlns/dav/svn/svndiff1"
+// DAV capabilities advertised in OPTIONS. mod_dav_svn sends them as several
+// DAV: header lines and clients gate features on them (mergeinfo, for one,
+// is refused client-side with E200007 when the capability is absent). Only
+// capabilities this server actually implements are listed; svdfiff1 tells the
+// client it may send compressed svndiff windows on PUT.
+var davCapabilityHeaders = []string{
+	"1,2",
+	"version-control,checkout,working-resource",
+	"merge,baseline,activity,version-controlled-collection",
+	"http://subversion.tigris.org/xmlns/dav/svn/log-revprops",
+	"http://subversion.tigris.org/xmlns/dav/svn/inline-props",
+	"http://subversion.tigris.org/xmlns/dav/svn/list",
+	"http://subversion.tigris.org/xmlns/dav/svn/mergeinfo",
+	"http://subversion.tigris.org/xmlns/dav/svn/svndiff1",
+}
+
+// writeDAVCapabilities emits one DAV header per capability group.
+func writeDAVCapabilities(h http.Header) {
+	for _, c := range davCapabilityHeaders {
+		h.Add("DAV", c)
+	}
+}
 
 // allowedMethods advertised in OPTIONS Allow.
 const allowedMethods = "OPTIONS, PROPFIND, GET, REPORT, MKACTIVITY, PROPPATCH, PUT, CHECKOUT, MERGE, DELETE, COPY, MOVE, LOCK, UNLOCK"
 
 // Name is a qualified XML element/property name.
 type Name struct {
-	NS   string
+	NS    string
 	Local string
 }
 
@@ -38,40 +57,40 @@ func davsn() string { return NS_DAVSVN }
 // Names we recognise when parsing client requests.
 var (
 	// DAV delta-v elements (RFC 3253)
-	enVcc          = Name{NS_DAV, "version-controlled-configuration"}
-	enBaseline     = Name{NS_DAV, "baseline"}
-	enBaselineColl = Name{NS_DAV, "baseline-collection"}
-	enActivity     = Name{NS_DAV, "activity"}
-	enCheckout     = Name{NS_DAV, "checkout"}
-	enMerge        = Name{NS_DAV, "merge"}
-	enMkactivity   = Name{NS_DAV, "mkactivity"}
-	enResourcetype = Name{NS_DAV, "resourcetype"}
-	enCollection   = Name{NS_DAV, "collection"}
-	enProp         = Name{NS_DAV, "prop"}
-	enPropstat     = Name{NS_DAV, "propstat"}
-	enStatus       = Name{NS_DAV, "status"}
-	enResponse     = Name{NS_DAV, "response"}
-	enMultistatus  = Name{NS_DAV, "multistatus"}
-	enHref         = Name{NS_DAV, "href"}
-	enPropfind     = Name{NS_DAV, "propfind"}
-	enAllprop      = Name{NS_DAV, "allprop"}
-	enPropname     = Name{NS_DAV, "propname"}
-	enGetetag      = Name{NS_DAV, "getetag"}
-	enGetcontentlength = Name{NS_DAV, "getcontentlength"}
-	enGetcontenttype   = Name{NS_DAV, "getcontenttype"}
-	enDisplayname      = Name{NS_DAV, "displayname"}
-	enVersionname      = Name{NS_DAV, "version-name"}
-	enBaselineRelative = Name{NS_DAV, "baseline-relative-path"}
-	enRepositoryUUID   = Name{NS_DAV, "repository-uuid"}
-	enRoot             = Name{NS_DAV, "root"}
+	enVcc                = Name{NS_DAV, "version-controlled-configuration"}
+	enBaseline           = Name{NS_DAV, "baseline"}
+	enBaselineColl       = Name{NS_DAV, "baseline-collection"}
+	enActivity           = Name{NS_DAV, "activity"}
+	enCheckout           = Name{NS_DAV, "checkout"}
+	enMerge              = Name{NS_DAV, "merge"}
+	enMkactivity         = Name{NS_DAV, "mkactivity"}
+	enResourcetype       = Name{NS_DAV, "resourcetype"}
+	enCollection         = Name{NS_DAV, "collection"}
+	enProp               = Name{NS_DAV, "prop"}
+	enPropstat           = Name{NS_DAV, "propstat"}
+	enStatus             = Name{NS_DAV, "status"}
+	enResponse           = Name{NS_DAV, "response"}
+	enMultistatus        = Name{NS_DAV, "multistatus"}
+	enHref               = Name{NS_DAV, "href"}
+	enPropfind           = Name{NS_DAV, "propfind"}
+	enAllprop            = Name{NS_DAV, "allprop"}
+	enPropname           = Name{NS_DAV, "propname"}
+	enGetetag            = Name{NS_DAV, "getetag"}
+	enGetcontentlength   = Name{NS_DAV, "getcontentlength"}
+	enGetcontenttype     = Name{NS_DAV, "getcontenttype"}
+	enDisplayname        = Name{NS_DAV, "displayname"}
+	enVersionname        = Name{NS_DAV, "version-name"}
+	enBaselineRelative   = Name{NS_DAV, "baseline-relative-path"}
+	enRepositoryUUID     = Name{NS_DAV, "repository-uuid"}
+	enRoot               = Name{NS_DAV, "root"}
 	enCreatorDisplayname = Name{NS_DAV, "creator-displayname"}
-	enSupportedLock = Name{NS_DAV, "supportedlock"}
-	enLockentry     = Name{NS_DAV, "lockentry"}
-	enLockscope     = Name{NS_DAV, "lockscope"}
-	enExclusive     = Name{NS_DAV, "exclusive"}
-	enShared        = Name{NS_DAV, "shared"}
-	enLocktype      = Name{NS_DAV, "locktype"}
-	enWrite         = Name{NS_DAV, "write"}
+	enSupportedLock      = Name{NS_DAV, "supportedlock"}
+	enLockentry          = Name{NS_DAV, "lockentry"}
+	enLockscope          = Name{NS_DAV, "lockscope"}
+	enExclusive          = Name{NS_DAV, "exclusive"}
+	enShared             = Name{NS_DAV, "shared"}
+	enLocktype           = Name{NS_DAV, "locktype"}
+	enWrite              = Name{NS_DAV, "write"}
 
 	// svn protocol elements (namespace http://subversion.tigris.org/xmlns/dav/)
 	enUpdateReport = Name{NS_DAVSVN, "update-report"}

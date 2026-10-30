@@ -93,7 +93,9 @@ func parseResource(basePath, reqPath string) resource {
 				return resource{typ: resBaseline, repo: repo, rev: rev}
 			}
 		}
-	case "rev":
+	case "rev", "rvr":
+		// !svn/rev and !svn/rvr both address a node at a fixed revision;
+		// rvr is the peg-revision form mod_dav_svn exposes to clients.
 		if len(priv) >= 2 {
 			rev, err := strconv.ParseUint(priv[1], 10, 64)
 			if err == nil {

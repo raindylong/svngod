@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -35,7 +36,7 @@ func (s *Server) handleOptions(w http.ResponseWriter, r *http.Request, res resou
 		return
 	}
 	h := w.Header()
-	h.Set("DAV", davCapabilities)
+	writeDAVCapabilities(h)
 	h.Set("MS-Author-Via", "DAV")
 	h.Set("SVN-Repository-UUID", uuid)
 	// SVN-Repository-Root is HTTPv2-only; advertising it on a v1 server makes
@@ -207,15 +208,10 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request, res reso
 	}
 	// parse requested props (allprop if empty body / no propfind element)
 	pbody, _ := io.ReadAll(io.LimitReader(r.Body, 8<<20))
-	props, propnames, err := parsePropfind(bytes.NewReader(pbody))
-	if err != nil {
-		plog := string(pbody)
-		if len(plog) > 400 {
-			plog = plog[:400]
-		}
-		log.Printf("PROPFIND %s bad body=%q err=%v", r.URL.Path, plog, err)
-		http.Error(w, "bad propfind: "+err.Error(), http.StatusBadRequest)
-		return
+	dprops, propnames := parsePropfindRequest(pbody)
+	props := make([]Name, len(dprops))
+	for i := range dprops {
+		props[i] = Name{NS: dprops[i].ns, Local: dprops[i].local}
 	}
 	// The svn client sets a Label header to the WC baseline revision on the
 	// PROPFINDs it issues during a commit (e.g. Label: 89). Treat a numeric
@@ -306,7 +302,7 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request, res reso
 
 	b.WriteString("</D:multistatus>\n")
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
-	w.Header().Set("DAV", davCapabilities)
+	writeDAVCapabilities(w.Header())
 	w.WriteHeader(http.StatusMultiStatus)
 	io.WriteString(w, b.String())
 }
@@ -416,10 +412,14 @@ func (s *Server) propNode(b *strings.Builder, repo *fs.Repo, base, name string, 
 		b.WriteString("      <D:getetag/>\n")
 		b.WriteString("      <D:version-name/>\n")
 		b.WriteString("      <D:creator-displayname/>\n")
+		keys := make([]string, 0, len(nr.Props))
 		for k := range nr.Props {
-			if strings.HasPrefix(k, "svn:") && k != "svn:date" && k != "svn:author" {
-				local := strings.TrimPrefix(k, "svn:")
-				b.WriteString("      <" + local + ` xmlns="svn:"/>` + "\n")
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if (strings.HasPrefix(k, "svn:") && k != "svn:date" && k != "svn:author") || !strings.HasPrefix(k, "svn:") {
+				b.WriteString("      " + davPropNameTag(k) + "\n")
 			}
 		}
 		b.WriteString("      </D:prop>\n      <D:status>HTTP/1.1 200 OK</D:status>\n    </D:propstat>\n")
@@ -465,11 +465,16 @@ func (s *Server) propNode(b *strings.Builder, repo *fs.Repo, base, name string, 
 	// `svn proplist` list it as a user property. update-report already delivers
 	// committed-rev/date/author via S:set-prop, so it is not needed here.
 	// writeSvnEntryProps(b, nr, rev, path)
-	for k, v := range nr.Props {
-		if strings.HasPrefix(k, "svn:") && k != "svn:date" && k != "svn:author" {
-			local := strings.TrimPrefix(k, "svn:")
-			b.WriteString("      <" + local + ` xmlns="svn:">` + xmlEscape(v) + "</" + local + ">\n")
+	keys := make([]string, 0, len(nr.Props))
+	for k := range nr.Props {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if k == "svn:date" || k == "svn:author" {
+			continue
 		}
+		b.WriteString("      " + davPropElement(k, nr.Props[k]) + "\n")
 	}
 	if nr.Kind == fs.KindFile {
 		text, err := repo.GetText(nr.Node)
@@ -540,40 +545,6 @@ func (s *Server) propChildren(b *strings.Builder, repo *fs.Repo, base, name stri
 
 // --- propfind request parsing ---
 
-func parsePropfind(body io.Reader) ([]Name, bool, error) {
-	data, err := io.ReadAll(io.LimitReader(body, 1<<20))
-	if err != nil {
-		return nil, false, err
-	}
-	if len(strings.TrimSpace(string(data))) == 0 {
-		return nil, false, nil // allprop default
-	}
-	// propnames: list property names only (svn proplist).
-	if strings.Contains(string(data), "<propnames") || strings.Contains(string(data), "<D:propnames") {
-		return nil, true, nil
-	}
-	var top struct {
-		XMLName xml.Name
-		Inner   string `xml:",innerxml"`
-	}
-	if err := xml.Unmarshal(data, &top); err != nil {
-		return nil, false, err
-	}
-	// Look for <D:prop> children; if none, it's allprop.
-	var props []Name
-	dec := xml.NewDecoder(strings.NewReader(top.Inner))
-	for {
-		tok, err := dec.Token()
-		if err != nil {
-			break
-		}
-		if se, ok := tok.(xml.StartElement); ok {
-			props = append(props, Name{NS: se.Name.Space, Local: se.Name.Local})
-		}
-	}
-	return props, false, nil
-}
-
 // --- misc helpers ---
 
 func repoUUID(repo *fs.Repo) string {
@@ -638,7 +609,6 @@ func writeSvnEntryProps(b *strings.Builder, nr *fs.NodeRev, rev uint64, path str
 
 // The remaining methods (REPORT, MKACTIVITY, commit flow, lock) are built in
 // later increments; these stubs keep the router complete.
-
 
 // handleCopyMove implements COPY/MOVE into a transaction working resource.
 // Source is either a version baseline (!svn/bc/<rev>/<path>) or an already
@@ -746,7 +716,6 @@ type srcPlan struct {
 	cfPath string
 	cfRev  uint64
 }
-
 
 func copyMap(m map[string]string) map[string]string {
 	if m == nil {

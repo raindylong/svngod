@@ -129,8 +129,10 @@ func TestOptionsCapabilities(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatalf("status=%d", resp.StatusCode)
 	}
-	dav := resp.Header.Get("DAV")
-	if !strings.Contains(dav, "version-control") || !strings.Contains(dav, "merge") {
+	// Capabilities are advertised as several DAV: header lines (as mod_dav_svn
+	// does), so join them before checking.
+	dav := strings.Join(resp.Header.Values("DAV"), ",")
+	if !strings.Contains(dav, "version-control") || !strings.Contains(dav, "merge") || !strings.Contains(dav, "svn/mergeinfo") {
 		t.Fatalf("DAV header wrong: %q", dav)
 	}
 	uuid, _ := repo.UUID()

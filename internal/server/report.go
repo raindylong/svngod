@@ -57,9 +57,9 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request, res resour
 	case "update-report":
 		s.reportUpdate(w, repo, base, res.repo, body)
 	case "log-report":
-		s.reportLog(w, repo, base, body)
+		s.reportLog(w, repo, res.path, body)
 	case "list-report":
-		s.reportList(w, repo, base, res.repo, body)
+		s.reportList(w, repo, base, res.path, body)
 	case "file-revs-report", "get-file-revs-report", "get-file-revs":
 		s.reportFileRevs(w, repo, base, res.path, body)
 	case "get-location-segments":
@@ -68,7 +68,7 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request, res resour
 		s.reportGetLocations(w, repo, base, res.path, body)
 	case "get-locks-report", "get-locks":
 		s.reportGetLocks(w, repo, res.repo, res.path, body)
-	case "get-mergeinfo-report", "get-mergeinfo":
+	case "mergeinfo-report", "get-mergeinfo-report", "get-mergeinfo":
 		s.reportGetMergeinfo(w, repo, res.path, body)
 	default:
 		http.Error(w, "unsupported REPORT: "+root.XMLName.Local, http.StatusBadRequest)
@@ -401,7 +401,14 @@ func writeNodeProps(b *strings.Builder, props map[string]string) {
 		if k == "svn:date" {
 			continue
 		}
-		b.WriteString("      <S:set-prop name=\"" + xmlEscape(k) + "\">" + xmlEscape(props[k]) + "</S:set-prop>\n")
+		// mod_dav_svn reports user properties under their DAV name
+		// ("custom:NAME"), and the client stores that name in the WC; sending
+		// the bare name would leave WC props inconsistent with the server.
+		name := k
+		if !strings.HasPrefix(k, "svn:") {
+			name = "custom:" + k
+		}
+		b.WriteString("      <S:set-prop name=\"" + xmlEscape(name) + "\">" + xmlEscape(props[k]) + "</S:set-prop>\n")
 	}
 }
 
@@ -447,7 +454,7 @@ func unescapePath(p string) string {
 
 // --- log-report (svn log) ---
 
-func (s *Server) reportLog(w http.ResponseWriter, repo *fs.Repo, base string, body []byte) {
+func (s *Server) reportLog(w http.ResponseWriter, repo *fs.Repo, reportPath string, body []byte) {
 	var root xmlEl
 	if err := xml.Unmarshal(body, &root); err != nil {
 		http.Error(w, "bad log-report", http.StatusBadRequest)
@@ -458,7 +465,9 @@ func (s *Server) reportLog(w http.ResponseWriter, repo *fs.Repo, base string, bo
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	// start/end revisions (descending from start to end)
+	// start/end revisions. Clients send them in the requested direction
+	// (svn log -r 1:5 sends start=1,end=5); honour that order instead of
+	// assuming a descending range, which made ascending requests empty.
 	start, end := head, uint64(1)
 	if v, ok := root.child("start-revision"); ok {
 		if n, err := strconv.ParseUint(strings.TrimSpace(v.Content), 10, 64); err == nil && n <= head {
@@ -466,7 +475,7 @@ func (s *Server) reportLog(w http.ResponseWriter, repo *fs.Repo, base string, bo
 		}
 	}
 	if v, ok := root.child("end-revision"); ok {
-		if n, err := strconv.ParseUint(strings.TrimSpace(v.Content), 10, 64); err == nil && n >= 1 {
+		if n, err := strconv.ParseUint(strings.TrimSpace(v.Content), 10, 64); err == nil && n <= head {
 			end = n
 		}
 	}
@@ -477,15 +486,36 @@ func (s *Server) reportLog(w http.ResponseWriter, repo *fs.Repo, base string, bo
 		}
 	}
 	_, discoverChanged := root.child("discover-changed-paths")
+
+	// <S:path> entries are relative to the report URL; a revision is only
+	// interesting when one of the requested paths changed in it. Ignoring the
+	// filter made `svn log URL/subdir` (and mergeinfo) return every revision.
+	basePath := strings.TrimSuffix(reportPath, "/")
+	if basePath == "/" {
+		basePath = ""
+	}
+	var filters []string
+	for _, c := range root.Children {
+		if c.XMLName.Local != "path" {
+			continue
+		}
+		rel := strings.Trim(strings.TrimSpace(c.Content), "/")
+		p := basePath
+		if rel != "" {
+			p = strings.TrimSuffix(basePath, "/") + "/" + rel
+		}
+		filters = append(filters, p)
+	}
+	if len(filters) == 0 {
+		filters = []string{basePath}
+	}
+
 	// requested revprops: which svn:* props the client wants
 	requested := map[string]bool{}
 	anyRevprop := false
 	for _, c := range root.Children {
 		if c.XMLName.Local == "revprop" {
 			anyRevprop = true
-			// The client names the requested revision property in the element
-			// content (e.g. <S:revprop>svn:author</S:revprop>); tolerate an
-			// attribute form as well.
 			n := c.attr("name")
 			if n == "" {
 				n = strings.TrimSpace(c.Content)
@@ -495,7 +525,6 @@ func (s *Server) reportLog(w http.ResponseWriter, repo *fs.Repo, base string, bo
 			}
 		}
 	}
-	// If the client asked for no revprops explicitly, skip them.
 	noRevProps := false
 	if _, ok := root.child("no-revprops"); ok {
 		noRevProps = true
@@ -504,22 +533,33 @@ func (s *Server) reportLog(w http.ResponseWriter, repo *fs.Repo, base string, bo
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
 	b.WriteString(`<S:log-report xmlns:S="svn:" xmlns:D="` + NS_DAV + `">` + "\n")
+	ascending := start < end
 	count := uint64(0)
-	for rv := start; rv >= end; rv-- {
+	emit := func(rv uint64) bool {
 		if limit > 0 && count >= limit {
-			break
+			return false
+		}
+		var changes map[string]change
+		if rv > 0 {
+			changes, _ = treeDiff(repo, rv)
+		}
+		// A path filter applies to every log request, whether or not the
+		// client asked for changed paths: svn log URL/trunk must not return
+		// revisions that only touched /branch.
+		if rv > 0 && !anyPathTouched(changes, filters) {
+			return true
 		}
 		count++
 		rp, err := repo.GetRevProps(rv)
 		if err != nil {
-			continue
+			return true
 		}
 		b.WriteString("  <S:log-item>\n")
 		if discoverChanged {
-			s.logChangedPaths(&b, repo, rv)
+			s.logChangedPaths(&b, repo, rv, changes)
 		}
 		b.WriteString("    <D:version-name>" + strconv.FormatUint(rv, 10) + "</D:version-name>\n")
-		if !noRevProps && len(rp.Props) > 0 {
+		if !noRevProps && rp != nil && len(rp.Props) > 0 {
 			keys := make([]string, 0, len(rp.Props))
 			for k := range rp.Props {
 				keys = append(keys, k)
@@ -527,7 +567,6 @@ func (s *Server) reportLog(w http.ResponseWriter, repo *fs.Repo, base string, bo
 			sort.Strings(keys)
 			for _, k := range keys {
 				v := rp.Props[k]
-				// if the client named specific revprops, honour that set
 				if anyRevprop && !requested[k] {
 					continue
 				}
@@ -544,8 +583,25 @@ func (s *Server) reportLog(w http.ResponseWriter, repo *fs.Repo, base string, bo
 			}
 		}
 		b.WriteString("  </S:log-item>\n")
-		if rv == 0 || rv == 1 {
-			break
+		return true
+	}
+	if ascending {
+		for rv := start; rv <= end; rv++ {
+			if !emit(rv) {
+				break
+			}
+			if rv == end {
+				break
+			}
+		}
+	} else {
+		for rv := start; ; rv-- {
+			if !emit(rv) {
+				break
+			}
+			if rv == end || rv == 0 {
+				break
+			}
 		}
 	}
 	b.WriteString("</S:log-report>\n")
@@ -554,10 +610,25 @@ func (s *Server) reportLog(w http.ResponseWriter, repo *fs.Repo, base string, bo
 	io.WriteString(w, b.String())
 }
 
+// anyPathTouched reports whether any changed path is the filter path, lies
+// beneath it, or is one of its ancestors (a deleted parent removes the child).
+func anyPathTouched(changes map[string]change, filters []string) bool {
+	for _, f := range filters {
+		if f == "" {
+			return true // repository root
+		}
+		for p := range changes {
+			if p == f || strings.HasPrefix(p, f+"/") || strings.HasPrefix(f, p+"/") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // logChangedPaths diffs rev vs rev-1 and emits added/modified/deleted paths.
-func (s *Server) logChangedPaths(b *strings.Builder, repo *fs.Repo, rev uint64) {
-	changes, err := treeDiff(repo, rev)
-	if err != nil {
+func (s *Server) logChangedPaths(b *strings.Builder, repo *fs.Repo, rev uint64, changes map[string]change) {
+	if changes == nil {
 		return
 	}
 	paths := make([]string, 0, len(changes))
@@ -565,22 +636,32 @@ func (s *Server) logChangedPaths(b *strings.Builder, repo *fs.Repo, rev uint64) 
 		paths = append(paths, p)
 	}
 	sort.Strings(paths)
+	kindName := func(k byte) string {
+		if k == fs.KindDir {
+			return "dir"
+		}
+		return "file"
+	}
 	for _, p := range paths {
 		ch := changes[p]
+		// svn exposes node-kind/text-mods/prop-mods on changed paths; clients
+		// use them (mergeinfo, svn log -v) to tell content from property edits.
+		attrs := " node-kind=\"" + kindName(ch.kind) + "\" text-mods=\"" +
+			strconv.FormatBool(ch.textMods) + "\" prop-mods=\"" + strconv.FormatBool(ch.propMods) + "\""
 		switch ch.action {
 		case chAdded:
 			if nr, err := repo.Resolve(rev, p); err == nil && nr.CopyFrom != nil {
 				b.WriteString("    <S:added-path copyfrom-path=\"" + xmlEscape(nr.CopyFromPath) + "\" copyfrom-rev=\"" +
-					strconv.FormatUint(nr.CopyFrom.Rev, 10) + "\">" + xmlEscape(p) + "</S:added-path>\n")
+					strconv.FormatUint(nr.CopyFrom.Rev, 10) + "\"" + attrs + ">" + xmlEscape(p) + "</S:added-path>\n")
 				continue
 			}
-			b.WriteString("    <S:added-path>" + xmlEscape(p) + "</S:added-path>\n")
+			b.WriteString("    <S:added-path" + attrs + ">" + xmlEscape(p) + "</S:added-path>\n")
 		case chModified:
-			b.WriteString("    <S:modified-path>" + xmlEscape(p) + "</S:modified-path>\n")
+			b.WriteString("    <S:modified-path" + attrs + ">" + xmlEscape(p) + "</S:modified-path>\n")
 		case chDeleted:
-			b.WriteString("    <S:deleted-path>" + xmlEscape(p) + "</S:deleted-path>\n")
+			b.WriteString("    <S:deleted-path" + attrs + ">" + xmlEscape(p) + "</S:deleted-path>\n")
 		case chReplaced:
-			b.WriteString("    <S:replaced-path>" + xmlEscape(p) + "</S:replaced-path>\n")
+			b.WriteString("    <S:replaced-path" + attrs + ">" + xmlEscape(p) + "</S:replaced-path>\n")
 		}
 	}
 }
@@ -594,7 +675,12 @@ const (
 	chReplaced
 )
 
-type change struct{ action changeKind }
+type change struct {
+	action   changeKind
+	kind     byte
+	textMods bool
+	propMods bool
+}
 
 // treeDiff returns the set of paths changed between rev-1 and rev.
 func treeDiff(repo *fs.Repo, rev uint64) (map[string]change, error) {
@@ -609,25 +695,25 @@ func treeDiff(repo *fs.Repo, rev uint64) (map[string]change, error) {
 		prev, prevErr2 := repo.Resolve(prevRev, path)
 		switch {
 		case err == nil && prevErr2 != nil:
-			out[path] = change{chAdded}
+			out[path] = change{action: chAdded, kind: cur.Kind, textMods: cur.Kind == fs.KindFile, propMods: len(cur.Props) > 0}
 			if cur.Kind == fs.KindDir {
 				children, _ := repo.ListDir(rev, path)
 				for _, c := range children {
-					if err := walk(prevRev, rev, path+"/"+c.Name); err != nil {
+					if err := walk(prevRev, rev, strings.TrimSuffix(path, "/")+"/"+c.Name); err != nil {
 						return err
 					}
 				}
 			}
 			return nil
 		case err != nil && prevErr2 == nil:
-			out[path] = change{chDeleted}
+			out[path] = change{action: chDeleted, kind: prev.Kind}
 			return nil
 		case err != nil && prevErr2 != nil:
 			return nil
 		}
 		// both exist: compare kind + (for files) text + props
 		if cur.Kind != prev.Kind {
-			out[path] = change{chReplaced}
+			out[path] = change{action: chReplaced, kind: cur.Kind, textMods: cur.Kind == fs.KindFile, propMods: true}
 		} else if cur.Kind == fs.KindDir {
 			curCh, _ := repo.ListDir(rev, path)
 			prevCh, _ := repo.ListDir(prevRev, path)
@@ -637,17 +723,17 @@ func treeDiff(repo *fs.Repo, rev uint64) (map[string]change, error) {
 			}
 			for _, c := range prevCh {
 				if !names[c.Name] {
-					if err := walk(prevRev, rev, path+"/"+c.Name); err != nil {
+					if err := walk(prevRev, rev, strings.TrimSuffix(path, "/")+"/"+c.Name); err != nil {
 						return err
 					}
 				}
 			}
 			// record directory modification if its own props changed
 			if !sameProps(cur.Props, prev.Props) {
-				out[path] = change{chModified}
+				out[path] = change{action: chModified, kind: cur.Kind, propMods: true}
 			}
 			for _, c := range curCh {
-				if err := walk(prevRev, rev, path+"/"+c.Name); err != nil {
+				if err := walk(prevRev, rev, strings.TrimSuffix(path, "/")+"/"+c.Name); err != nil {
 					return err
 				}
 			}
@@ -658,7 +744,8 @@ func treeDiff(repo *fs.Repo, rev uint64) (map[string]change, error) {
 				return fmt.Errorf("treeDiff text: %v %v", err1, err2)
 			}
 			if !bytesEqual(ct, pt) || !sameProps(cur.Props, prev.Props) {
-				out[path] = change{chModified}
+				out[path] = change{action: chModified, kind: cur.Kind,
+					textMods: !bytesEqual(ct, pt), propMods: !sameProps(cur.Props, prev.Props)}
 			}
 		}
 		_ = prevErr
@@ -697,43 +784,137 @@ func sameProps(a, b map[string]string) bool {
 
 var _ = errors.New
 
-
 // reportList writes a <S:list-report> response (svn ls / svn list).
 // Request body carries <S:path> and optional <S:prop> entries; response is
 // <S:list-report> with a <S:entry kind=... name=...>per child whose text is
 // the relative path.
-func (s *Server) reportList(w http.ResponseWriter, repo *fs.Repo, base, name string, body []byte) {
-	var req struct {
-		XMLName xml.Name
-		Path    string `xml:"path"`
+func (s *Server) reportList(w http.ResponseWriter, repo *fs.Repo, base, reportPath string, body []byte) {
+	var root xmlEl
+	if err := xml.Unmarshal(body, &root); err != nil {
+		http.Error(w, "bad list-report", http.StatusBadRequest)
+		return
 	}
-	xml.Unmarshal(body, &req)
-	path := req.Path
-	if path == "" {
-		path = "/"
+	head, err := repo.Head()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
-	rev, _ := repo.Head()
-	var b strings.Builder
-	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
-	b.WriteString(`<S:list-report xmlns:S="` + NS_SVN + `" xmlns:D="` + NS_DAV + `">` + "\n")
-	b.WriteString(`  <S:path>` + xmlEscape(path) + `</S:path>` + "\n")
-	children, err := repo.ListDir(rev, path)
-	if err == nil {
-		for _, c := range children {
-			kind := "file"
-			if c.Kind == fs.KindDir {
-				kind = "dir"
-			}
-			b.WriteString(`  <S:entry kind="` + kind + `" name="` + xmlEscape(c.Name) + `">` + xmlEscape(c.Name) + `</S:entry>` + "\n")
+	rev := head
+	if e, ok := root.child("revision"); ok {
+		if n, err := strconv.ParseUint(strings.TrimSpace(e.Content), 10, 64); err == nil && n <= head {
+			rev = n
 		}
 	}
-	b.WriteString(`</S:list-report>` + "\n")
+	depth := "infinity"
+	if e, ok := root.child("depth"); ok && strings.TrimSpace(e.Content) != "" {
+		depth = strings.TrimSpace(e.Content)
+	}
+	// Requested props: libsvn asks for DAV:* and expects them as item
+	// attributes (size/created-rev/date) or child elements.
+	var props map[string]bool
+	for _, c := range root.Children {
+		if c.XMLName.Local == "prop" {
+			if props == nil {
+				props = map[string]bool{}
+			}
+			props[strings.TrimSpace(c.Content)] = true
+		}
+	}
+	target := strings.TrimSuffix(reportPath, "/")
+	if rel := strings.Trim(strings.TrimSpace(childText(root, "path")), "/"); rel != "" {
+		target = strings.TrimSuffix(target, "/") + "/" + rel
+	}
+	if target == "" {
+		target = "/"
+	}
+	nr, err := repo.Resolve(rev, target)
+	if err != nil {
+		http.Error(w, "Not Found", http.StatusNotFound)
+		return
+	}
+
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
+	// The svn protocol namespace is literally "svn:" (NS_SVN is the property
+	// namespace and makes clients reject the report).
+	b.WriteString(`<S:list-report xmlns:S="svn:" xmlns:D="` + NS_DAV + `">` + "\n")
+
+	var emit func(path string, node *fs.NodeRev)
+	emit = func(path string, node *fs.NodeRev) {
+		kind := "file"
+		size := int64(-1)
+		if node.Kind == fs.KindDir {
+			kind = "dir"
+		} else if txt, err := repo.GetText(node.Node); err == nil {
+			size = int64(len(txt))
+		}
+		attrs := ` node-kind="` + kind + `"`
+		if props["DAV:getcontentlength"] {
+			attrs += ` size="` + strconv.FormatInt(size, 10) + `"`
+		}
+		if props["DAV:version-name"] {
+			attrs += ` created-rev="` + strconv.FormatUint(node.Node.Rev, 10) + `"`
+		}
+		var author, date string
+		if rp, err := repo.GetRevProps(node.Node.Rev); err == nil && rp != nil {
+			author = rp.Props["svn:author"]
+			date = rp.Props["svn:date"]
+		}
+		if props["DAV:creationdate"] && date != "" {
+			attrs += ` date="` + xmlEscape(date) + `"`
+		}
+		b.WriteString("<S:item" + attrs + ">" + xmlEscape(path))
+		if props["DAV:creator-displayname"] {
+			b.WriteString("<D:creator-displayname>" + xmlEscape(author) + "</D:creator-displayname>")
+		}
+		b.WriteString("</S:item>\n")
+	}
+	emit(target, nr)
+
+	var walk func(path string, level int)
+	walk = func(path string, level int) {
+		children, err := repo.ListDir(rev, path)
+		if err != nil {
+			return
+		}
+		sort.Slice(children, func(i, j int) bool { return children[i].Name < children[j].Name })
+		for _, c := range children {
+			childPath := strings.TrimSuffix(path, "/") + "/" + c.Name
+			cnr, err := repo.GetNodeRev(c.ID)
+			if err != nil {
+				continue
+			}
+			if depth == "files" && cnr.Kind == fs.KindDir {
+				continue
+			}
+			emit(childPath, cnr)
+			if cnr.Kind == fs.KindDir && depth == "infinity" {
+				walk(childPath, level+1)
+			}
+		}
+	}
+	switch depth {
+	case "empty":
+		// target only
+	case "files", "immediates", "infinity":
+		walk(target, 0)
+	}
+	b.WriteString("</S:list-report>\n")
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	io.WriteString(w, b.String())
 }
 
-// --- get-file-revs (svn blame) ---
+// childText returns the trimmed text of the first child element with local
+// name local.
+func childText(e xmlEl, local string) string {
+	for _, c := range e.Children {
+		if c.XMLName.Local == local {
+			return strings.TrimSpace(c.Content)
+		}
+	}
+	return ""
+}
 
 func (s *Server) reportFileRevs(w http.ResponseWriter, repo *fs.Repo, base, urlPath string, body []byte) {
 	var root xmlEl
@@ -813,6 +994,52 @@ func (s *Server) reportFileRevs(w http.ResponseWriter, repo *fs.Repo, base, urlP
 // resPath between location-revision and peg-revision. svn diff uses it to
 // locate a path at an older revision (rename tracking). Without copies the
 // path is constant; a copy point switches the lineage to its copy source.
+// copyOrigin finds the copy that produced a node's lineage: the revision in
+// which the copy was committed (the copy root's node revision, which can be
+// older than the node currently resolved) plus its source path. copyFrom.Rev
+// alone is NOT the copy point — it is the source revision, which made
+// get-location-segments report the wrong ranges for a copied branch.
+func copyOrigin(repo *fs.Repo, nr *fs.NodeRev) (copyRev uint64, srcPath string, ok bool) {
+	if nr == nil || nr.CopyFrom == nil || nr.CopyFromPath == "" {
+		return 0, "", false
+	}
+	srcPath = nr.CopyFromPath
+	srcRev := nr.CopyFrom.Rev
+	cur := nr
+	for !cur.Pred.IsZero() {
+		p, err := repo.GetNodeRev(cur.Pred)
+		if err != nil {
+			break
+		}
+		if p.CopyFrom == nil || p.CopyFromPath != srcPath || p.CopyFrom.Rev != srcRev {
+			break
+		}
+		cur = p
+	}
+	return cur.Node.Rev, srcPath, true
+}
+
+// lineagePaths maps every revision in [end, start] to the path the tracked
+// node had there ("" when it did not exist at that revision).
+func lineagePaths(repo *fs.Repo, path string, start, end uint64) map[uint64]string {
+	out := map[uint64]string{}
+	cur := path
+	for rev := start; ; rev-- {
+		if nr, err := repo.Resolve(rev, cur); err != nil {
+			out[rev] = ""
+		} else {
+			out[rev] = cur
+			if cr, src, ok := copyOrigin(repo, nr); ok && cr >= 1 && rev >= 1 && rev-1 < cr {
+				cur = src
+			}
+		}
+		if rev == end || rev == 0 {
+			break
+		}
+	}
+	return out
+}
+
 func (s *Server) reportGetLocations(w http.ResponseWriter, repo *fs.Repo, base string, resPath string, body []byte) {
 	var root xmlEl
 	if err := xml.Unmarshal(body, &root); err != nil {
@@ -843,20 +1070,9 @@ func (s *Server) reportGetLocations(w http.ResponseWriter, repo *fs.Repo, base s
 	if loc > peg {
 		loc, peg = peg, loc
 	}
-	// Build the lineage: the path as it existed at each revision from peg down
-	// to loc, following copyFrom sources at copy points.
-	lineage := map[uint64]string{}
-	cur := path
-	for rev := peg; rev >= loc && rev >= 1; rev-- {
-		lineage[rev] = cur
-		if nr, err := repo.Resolve(rev, cur); err == nil && nr.CopyFrom != nil {
-			if nr.CopyFrom.Rev < rev && nr.CopyFromPath != "" {
-				cur = nr.CopyFromPath
-			}
-		} else if err != nil {
-			break
-		}
-	}
+	// The path as it existed at each revision from peg down to loc, following
+	// copy sources at the revision where each copy was committed.
+	lineage := lineagePaths(repo, path, peg, loc)
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
 	b.WriteString(`<S:get-locations-report xmlns:S="svn:" xmlns:D="` + NS_DAV + `">` + "\n")
@@ -917,24 +1133,7 @@ func (s *Server) reportGetLocationSegments(w http.ResponseWriter, repo *fs.Repo,
 		start, end = end, start
 	}
 
-	// Walk the lineage downward from start, following copy-from points, and
-	// record the path the node had at every revision in [end, start].
-	pathAt := map[uint64]string{}
-	cur := path
-	for rev := start; rev >= end && rev >= 1; rev-- {
-		nr, err := repo.Resolve(rev, cur)
-		if err != nil {
-			pathAt[rev] = "" // node does not exist at this revision
-		} else {
-			pathAt[rev] = cur
-			if nr.CopyFrom != nil && nr.CopyFromPath != "" && nr.CopyFrom.Rev < rev {
-				cur = nr.CopyFromPath
-			}
-		}
-		if rev == 0 {
-			break
-		}
-	}
+	pathAt := lineagePaths(repo, path, start, end)
 
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
@@ -1039,14 +1238,73 @@ func (s *Server) reportGetLocks(w http.ResponseWriter, repo *fs.Repo, repoName, 
 	fmt.Fprint(w, b.String())
 }
 
-// reportGetMergeinfo answers a get-mergeinfo REPORT. svngod stores no
-// svn:mergeinfo properties (no merge-tracking data), so the report is empty;
-// answering it (rather than 400) lets `svn mergeinfo` / `svn merge --dry-run`
-// complete with "no mergeinfo found" instead of a client protocol error.
+// reportGetMergeinfo answers a mergeinfo-report: for each requested (relative)
+// path it returns that node's svn:mergeinfo property at the requested
+// revision. The response shape is fixed by libsvn_ra_serf/mergeinfo.c:
+//
+//	<S:mergeinfo-report><S:mergeinfo-item>
+//	  <S:mergeinfo-path>REL</S:mergeinfo-path>
+//	  <S:mergeinfo-info>SOURCE:RANGES</S:mergeinfo-info>
+//	</S:mergeinfo-item></S:mergeinfo-report>
+//
+// Inherited mergeinfo (<S:inherit>inherited</S:inherit>) is not expanded yet:
+// own mergeinfo is returned, which is what svn merge/mergeinfo need in the
+// common case where mergeinfo lives on the merge target itself.
 func (s *Server) reportGetMergeinfo(w http.ResponseWriter, repo *fs.Repo, urlPath string, body []byte) {
-	b := `<?xml version="1.0" encoding="utf-8"?>` + "\n" +
-		`<S:mergeinfo-report xmlns:S="svn:" xmlns:D="` + NS_DAV + `">` + "\n" +
-		`</S:mergeinfo-report>` + "\n"
+	var root xmlEl
+	rev := uint64(0)
+	haveRev := false
+	var relPaths []string
+	if err := xml.Unmarshal(body, &root); err == nil {
+		if e, ok := root.child("revision"); ok {
+			if n, err := strconv.ParseUint(strings.TrimSpace(e.Content), 10, 64); err == nil {
+				rev, haveRev = n, true
+			}
+		}
+		for _, c := range root.Children {
+			if c.XMLName.Local == "path" {
+				relPaths = append(relPaths, strings.TrimSpace(c.Content))
+			}
+		}
+	}
+	if !haveRev {
+		head, err := repo.Head()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		rev = head
+	}
+	if len(relPaths) == 0 {
+		relPaths = []string{""}
+	}
+	base := strings.TrimSuffix(urlPath, "/")
+
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
+	b.WriteString(`<S:mergeinfo-report xmlns:S="svn:" xmlns:D="` + NS_DAV + `">` + "\n")
+	for _, rel := range relPaths {
+		actual := base
+		if rel != "" {
+			actual = strings.TrimSuffix(base, "/") + "/" + strings.Trim(rel, "/")
+		}
+		if actual == "" {
+			actual = "/"
+		}
+		nr, err := repo.Resolve(rev, actual)
+		if err != nil {
+			continue
+		}
+		info := nr.Props["svn:mergeinfo"]
+		if info == "" {
+			continue
+		}
+		b.WriteString("  <S:mergeinfo-item>\n")
+		b.WriteString("    <S:mergeinfo-path>" + xmlEscape(rel) + "</S:mergeinfo-path>\n")
+		b.WriteString("    <S:mergeinfo-info>" + xmlEscape(info) + "</S:mergeinfo-info>\n")
+		b.WriteString("  </S:mergeinfo-item>\n")
+	}
+	b.WriteString("</S:mergeinfo-report>\n")
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
-	fmt.Fprint(w, b)
+	fmt.Fprint(w, b.String())
 }

@@ -184,7 +184,7 @@ func (s *Server) handleProppatch(w http.ResponseWriter, r *http.Request, res res
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	sets, removes := parseProppatch(body)
+	sets, removes := parsePropertyUpdate(body)
 
 	switch res.typ {
 	case resActivity:
@@ -200,7 +200,7 @@ func (s *Server) handleProppatch(w http.ResponseWriter, r *http.Request, res res
 			if a.revProps == nil {
 				a.revProps = map[string]string{}
 			}
-			a.revProps[propName(p)] = p.value
+			a.revProps[svnPropertyKey(p.ns, p.local)] = p.value
 		}
 		s.mu.Unlock()
 		w.WriteHeader(http.StatusOK)
@@ -222,10 +222,10 @@ func (s *Server) handleProppatch(w http.ResponseWriter, r *http.Request, res res
 					a.revProps = map[string]string{}
 				}
 				for _, p := range sets {
-					a.revProps[propName(p)] = p.value
+					a.revProps[svnPropertyKey(p.ns, p.local)] = p.value
 				}
 				for _, p := range removes {
-					delete(a.revProps, propName(p))
+					delete(a.revProps, svnPropertyKey(p.ns, p.local))
 				}
 			}
 			s.mu.Unlock()
@@ -237,7 +237,7 @@ func (s *Server) handleProppatch(w http.ResponseWriter, r *http.Request, res res
 			b.WriteString(`    <D:href>` + s.absURL(r, res.repo, "/!svn/txn/"+tx.id+"/") + `</D:href>` + "\n")
 			b.WriteString(`    <D:propstat><D:prop>` + "\n")
 			for _, p := range sets {
-				b.WriteString(`      <` + xmlEscape(propName(p)) + `>` + xmlEscape(p.value) + `</` + xmlEscape(propName(p)) + `>` + "\n")
+				b.WriteString("      " + davPropElement(svnPropertyKey(p.ns, p.local), p.value) + "\n")
 			}
 			b.WriteString(`    </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>` + "\n")
 			b.WriteString(`  </D:response>` + "\n")
@@ -263,10 +263,10 @@ func (s *Server) handleProppatch(w http.ResponseWriter, r *http.Request, res res
 			ch.props = map[string]string{}
 		}
 		for _, p := range sets {
-			ch.props[propName(p)] = p.value
+			ch.props[svnPropertyKey(p.ns, p.local)] = p.value
 		}
 		for _, p := range removes {
-			delete(ch.props, propName(p))
+			delete(ch.props, svnPropertyKey(p.ns, p.local))
 		}
 		s.mu.Unlock()
 		// 207 multistatus acknowledging each prop
@@ -277,7 +277,7 @@ func (s *Server) handleProppatch(w http.ResponseWriter, r *http.Request, res res
 		b.WriteString(`    <D:href>` + s.absURL(r, res.repo, "/!svn/txn/"+tx.id+res.path) + `</D:href>` + "\n")
 		b.WriteString(`    <D:propstat><D:prop>` + "\n")
 		for _, p := range sets {
-			b.WriteString(`      <` + xmlEscape(propName(p)) + `>` + xmlEscape(p.value) + `</` + xmlEscape(propName(p)) + `>` + "\n")
+			b.WriteString("      " + davPropElement(svnPropertyKey(p.ns, p.local), p.value) + "\n")
 		}
 		b.WriteString(`    </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>` + "\n")
 		b.WriteString(`  </D:response>` + "\n")
@@ -289,58 +289,6 @@ func (s *Server) handleProppatch(w http.ResponseWriter, r *http.Request, res res
 		_ = repo
 		http.Error(w, "PROPPATCH not supported on this resource", http.StatusMethodNotAllowed)
 	}
-}
-
-type propSet struct {
-	ns, local string
-	value     string
-}
-
-func propName(p propSet) string {
-	if p.ns == NS_SVN {
-		return "svn:" + p.local
-	}
-	return p.local
-}
-
-// parseProppatch parses a DAV propertyupdate body into sets/removes.
-func parseProppatch(body []byte) (sets []propSet, removes []propSet) {
-	dec := xml.NewDecoder(strings.NewReader(string(body)))
-	var curNS, curLocal string
-	inSet := false
-	for {
-		tok, err := dec.Token()
-		if err != nil {
-			break
-		}
-		switch t := tok.(type) {
-		case xml.StartElement:
-			switch t.Name.Local {
-			case "set":
-				inSet = true
-				curNS, curLocal = "", ""
-			case "remove":
-				inSet = false
-				curNS, curLocal = "", ""
-			case "prop":
-				// container; children are the props themselves
-			default:
-				curNS, curLocal = t.Name.Space, t.Name.Local
-			}
-		case xml.CharData:
-			if curLocal != "" {
-				v := strings.TrimSpace(string(t))
-				ps := propSet{ns: curNS, local: curLocal, value: v}
-				if inSet {
-					sets = append(sets, ps)
-				} else {
-					removes = append(removes, ps)
-				}
-				curNS, curLocal = "", ""
-			}
-		}
-	}
-	return sets, removes
 }
 
 // --- PUT / DELETE / MKCOL on a transaction working resource ---
