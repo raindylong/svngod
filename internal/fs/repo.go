@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -422,6 +423,7 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 			hnr, err := r.Resolve(cur.Head, ch.Path)
 			if err == nil {
 				if hnr.Node.Rev > baseRev {
+					log.Printf("fs: commit OOD file=%s headRev=%d baseRev=%d -> reject", ch.Path, hnr.Node.Rev, baseRev)
 					return 0, ErrOutOfDate
 				}
 				continue
@@ -429,6 +431,7 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 			// Path absent at HEAD but present at baseRev: it was deleted by a
 			// concurrent commit, so a change touching it is out of date.
 			if _, e := r.Resolve(baseRev, ch.Path); e == nil {
+				log.Printf("fs: commit OOD deleted-in-window file=%s head=%d base=%d -> reject", ch.Path, cur.Head, baseRev)
 				return 0, ErrOutOfDate
 			}
 		}

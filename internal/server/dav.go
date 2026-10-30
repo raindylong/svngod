@@ -663,7 +663,9 @@ func (s *Server) handleCopyMove(w http.ResponseWriter, r *http.Request, res reso
 	}
 	// MOVE additionally removes the source.
 	if r.Method == "MOVE" && res.typ == resTxn && res.uuid == dres.uuid {
-		repo, rok := s.repo(w, res)
+		// openRepoOnly (not s.repo): we already hold s.mu here, and a shared
+		// repo cache would re-lock s.mu (non-reentrant) and deadlock.
+		repo, rok := s.openRepoOnly(w, res.repo)
 		if rok {
 			if _, err := repo.Resolve(tx.baseRev, res.path); err == nil {
 				// source existed in base → mark it deleted

@@ -86,6 +86,7 @@ type Server struct {
 	activities map[string]*activity
 	txns       map[string]*txn
 	locks      map[string]*lockEntry // key: repo + "\x00" + path
+	repoCache  map[string]*fs.Repo   // per-name repo singletons (shared r.mu)
 }
 
 // New builds a Server.
@@ -95,6 +96,7 @@ func New(cfg Config) *Server {
 		activities: map[string]*activity{},
 		txns:       map[string]*txn{},
 		locks:      map[string]*lockEntry{},
+		repoCache:  map[string]*fs.Repo{},
 	}
 }
 
@@ -258,7 +260,16 @@ func (s *Server) repo(w http.ResponseWriter, res resource) (*fs.Repo, bool) {
 		http.Error(w, "no repositories configured", http.StatusInternalServerError)
 		return nil, false
 	}
-	r, err := opener(res.repo)
+	// Reuse a per-repo singleton so concurrent requests share the Repo's
+	// commit mutex: CommitTxn then serialises cleanly while still committing
+	// disjoint-path changes as interleaved revisions (path-level OOD check).
+	s.mu.Lock()
+	r := s.repoCache[res.repo]
+	s.mu.Unlock()
+	if r != nil {
+		return r, true
+	}
+	ropen, err := opener(res.repo)
 	if err != nil {
 		if errors.Is(err, fs.ErrRepoNotFound) {
 			http.NotFound(w, nil)
@@ -267,7 +278,13 @@ func (s *Server) repo(w http.ResponseWriter, res resource) (*fs.Repo, bool) {
 		}
 		return nil, false
 	}
-	return r, true
+	s.mu.Lock()
+	if prev := s.repoCache[res.repo]; prev != nil {
+		ropen = prev
+	}
+	s.repoCache[res.repo] = ropen
+	s.mu.Unlock()
+	return ropen, true
 }
 
 // absURL builds an absolute URL for a repo-relative private/public href.
