@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -146,6 +147,7 @@ func (m *MirrorStore) Put(ctx context.Context, key string, data []byte) error {
 		}
 		if err := s.Put(ctx, key, data); err != nil {
 			m.markDown(i)
+			fmt.Printf("mirror[%d] standby Put %q failed: %v\n", i, key, err)
 		}
 	}
 	return nil
