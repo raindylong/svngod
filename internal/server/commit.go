@@ -381,10 +381,18 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 		http.Error(w, "transaction does not exist", http.StatusConflict)
 		return
 	}
-	data, err := io.ReadAll(io.LimitReader(r.Body, 512<<20))
+	const maxPutBody = 512 << 20
+	// Read one byte past the cap so an oversized body is rejected instead of
+	// being silently truncated and stored as a shorter file.
+	data, err := io.ReadAll(io.LimitReader(r.Body, maxPutBody+1))
 	if err != nil {
 		s.mu.Unlock()
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(data) > maxPutBody {
+		s.mu.Unlock()
+		http.Error(w, "file too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 	if e := s.getLockLocked(res.repo, res.path); e != nil && !lockTokenMatches(r.Header.Get("If"), e.token) {

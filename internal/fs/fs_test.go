@@ -451,3 +451,32 @@ func TestCollectTxnData(t *testing.T) {
 		t.Fatal("orphan body was kept")
 	}
 }
+
+// TestLargeTextReadableWithoutCache: texts above the cache bound are simply
+// not retained; reads must still be correct and repeatable.
+func TestLargeTextReadableWithoutCache(t *testing.T) {
+	st := store.NewMemoryStore()
+	repo, err := CreateRepo(st, "r", 4096, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := bytes.Repeat([]byte("0123456789abcdef"), (5<<20)/16) // 5 MiB
+	if _, err := repo.CommitTxn(0, []Change{
+		{Path: "/big.bin", Action: ActionAdd, Kind: KindFile, Data: data},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		nr, err := repo.Resolve(1, "/big.bin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := repo.GetText(nr.Node)
+		if err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+		if !bytes.Equal(got, data) {
+			t.Fatalf("read %d: content mismatch (%d bytes)", i, len(got))
+		}
+	}
+}

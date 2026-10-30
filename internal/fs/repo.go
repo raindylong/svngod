@@ -259,7 +259,7 @@ func (r *Repo) readBlock(rev uint64) (*RevBlock, error) {
 	if err != nil {
 		return nil, err
 	}
-	r.cache.Put(k, data)
+	cachePut(r.cache, k, data)
 	return rb, nil
 }
 
@@ -333,7 +333,7 @@ func (r *Repo) GetText(id NodeID) ([]byte, error) {
 	if sum := md5.Sum(text); !bytes.Equal(sum[:], nr.TextMD5[:]) {
 		return nil, errors.New("fs: text checksum mismatch")
 	}
-	r.cache.Put(k, text)
+	cachePut(r.cache, k, text)
 	return text, nil
 }
 
@@ -892,6 +892,19 @@ func (r *Repo) PackShard(shard uint64) error {
 	}
 	r.cache.Clear()
 	return nil
+}
+
+// maxCachedObject bounds what the LRU keeps. Full texts of large files are
+// built in memory for delta application anyway, but caching them would keep
+// them resident on top of that (and evict small hot blocks); repositories with
+// multi-hundred-MB files otherwise grow without bound.
+const maxCachedObject = 4 << 20
+
+func cachePut(c *cache.LRU, k cache.Key, b []byte) {
+	if len(b) > maxCachedObject {
+		return
+	}
+	c.Put(k, b)
 }
 
 // CollectLoose deletes loose revision and revprops objects that belong to
