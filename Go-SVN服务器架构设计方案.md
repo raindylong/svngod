@@ -51,3 +51,8 @@
 - 检测：`svnadmin verify` 遍历 HEAD 树，node-rev CRC + text delta 链校验，报告损坏项（git b67f7bd + c628491）。
 - 修复边界：node-rev 打包进 RevBlock（非单对象），单 node 损坏**无法对象级重建**（无独立数据源，delta 增量丢失即数据丢失）。自动修复的现实路径是 **MirrorStore 读时从健康镜像自动恢复**（主损坏、备完好时读自动从备补齐，已实现）+ verify 检测报告。
 - 深层 block 级写回（fs 内部重写 block 内单 node）需 fs 核心改动（解 block+改+重写），高风险，按需拍板。
+
+### 混合镜像故障切换（读写两侧，2026-10-30）
+- **读侧**：控制 key（current/format/uuid）读主失败自动回退健康备镜像（git 04185e1）；数据 key 本就 round-robin 从健康镜像读。实测：停主（mv 本地盘主目录）后 svn ls/x.txt 均由备 S3 接管。
+- **写侧（主恢复后补齐备）**：MirrorStore.repair() 启动即触发（`go repair()`）+ 60s tick：listAll(主) → 对 down 备全量 catchUp、healthy 备补缺失对象、current 等可变 key 总镜像（主权威）。实测：删备 revs-loose 全部 block → 重启 server 触发 repair → 备自动补齐（0→2 block）→ 停主读备正常。
+- 配置注意：svngod config.json 的 S3 凭证字段为 **access-key / secret-key**（含连字符）；误用 access/secret 会导致空凭证 → RustFS AccessDenied → 备永不镜像（已修，git e9e9764）。
