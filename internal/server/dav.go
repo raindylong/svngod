@@ -449,7 +449,18 @@ func (s *Server) propNode(b *strings.Builder, repo *fs.Repo, base, name string, 
 	b.WriteString("      <D:version-name>" + strconv.FormatUint(rev, 10) + "</D:version-name>\n")
 	b.WriteString("      <D:checked-in><D:href>" + base + "!svn/bln/" + strconv.FormatUint(rev, 10) + "/" + escapePath(strings.TrimPrefix(path, "/")) + "</D:href></D:checked-in>\n")
 	b.WriteString("      <S:baseline-relative-path>" + escapePath(strings.TrimPrefix(path, "/")) + "</S:baseline-relative-path>\n")
-	b.WriteString("      <D:creator-displayname>" + propVal(nr.Props, "svn:author") + "</D:creator-displayname>\n")
+	// Last-changed metadata comes from the revision properties of the node-rev,
+	// not from node properties (svn:author is a revprop). Without this the
+	// author is blank and svn ls -v shows Jan 01 1970.
+	var lastAuthor, lastDate string
+	if rp, err := repo.GetRevProps(nr.Node.Rev); err == nil && rp != nil {
+		lastAuthor = rp.Props["svn:author"]
+		lastDate = rp.Props["svn:date"]
+	}
+	b.WriteString("      <D:creator-displayname>" + xmlEscape(lastAuthor) + "</D:creator-displayname>\n")
+	if lastDate != "" {
+		b.WriteString("      <D:creationdate>" + xmlEscape(lastDate) + "</D:creationdate>\n")
+	}
 	// svn:entry is a DAV-internal property; emitting it in a propfind makes
 	// `svn proplist` list it as a user property. update-report already delivers
 	// committed-rev/date/author via S:set-prop, so it is not needed here.

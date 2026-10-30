@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"svngod/internal/fs"
 	"svngod/internal/svndiff"
@@ -61,7 +62,9 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request, res resour
 		s.reportList(w, repo, base, res.repo, body)
 	case "file-revs-report", "get-file-revs-report", "get-file-revs":
 		s.reportFileRevs(w, repo, base, res.path, body)
-	case "get-locations", "get-locations-segments", "get-location-segments":
+	case "get-location-segments":
+		s.reportGetLocationSegments(w, repo, res.path, body)
+	case "get-locations":
 		s.reportGetLocations(w, repo, base, res.path, body)
 	case "get-locks-report", "get-locks":
 		s.reportGetLocks(w, repo, res.repo, res.path, body)
@@ -286,7 +289,10 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 			if err != nil {
 				return err
 			}
-			writeNodeProps(b, nr.Props)
+			// NOTE: node props must be emitted *inside* the add-file/open-file
+			// element below. Emitting them here (as a child of the enclosing
+			// directory) applies svn:executable / svn:mime-type / svn:special
+			// and user props to the parent directory instead of the file.
 			var baseText []byte
 			if baseRev > 0 && baseRev != rev {
 				if bid, ok := baseIdx[cpath]; ok {
@@ -325,6 +331,7 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 				b.WriteString("    <S:open-file name=\"" + xmlEscape(c.Name) + "\" rev=\"" + strconv.FormatUint(outRev, 10) + "\">\n")
 				b.WriteString("      <D:checked-in><D:href>" + xmlEscape(ver) + "</D:href></D:checked-in>\n")
 				writeEntryProps(b, rp, uuid, rev)
+				writeNodeProps(b, nr.Props)
 				// fetch-file: client GETs the full text at the checked-in href
 				// (like mod_dav_svn). base-checksum validates the WC baseline.
 				b.WriteString("      <S:fetch-file base-checksum=\"" + hex.EncodeToString(bs[:]) + "\" sha1-checksum=\"" + hex.EncodeToString(ss[:]) + "\"/>\n")
@@ -335,10 +342,36 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 				b.WriteString("    <S:add-file name=\"" + xmlEscape(c.Name) + "\" sha1-checksum=\"" + sha1Hex(text) + "\">\n")
 				b.WriteString("      <D:checked-in><D:href>" + xmlEscape(bc) + "</D:href></D:checked-in>\n")
 				writeEntryProps(b, rp, uuid, rev)
+				writeNodeProps(b, nr.Props)
 				b.WriteString("      <S:txdelta>" + base64.StdEncoding.EncodeToString(delta) + "</S:txdelta>\n")
 				b.WriteString("      <S:prop><V:md5-checksum>" + md5hex + "</V:md5-checksum></S:prop>\n")
 				b.WriteString("    </S:add-file>\n")
 			}
+		}
+	}
+	// Paths present in the client's baseline but absent from the target must be
+	// reported, or deletions never reach the working copy (svn update would
+	// leave stale files forever and svn diff would omit deletions entirely).
+	if baseRev > 0 && !startEmpty {
+		prefix := strings.TrimSuffix(path, "/") + "/"
+		inTarget := make(map[string]bool, len(children))
+		for _, c := range children {
+			inTarget[c.Name] = true
+		}
+		var deleted []string
+		for bp := range baseIdx {
+			if !strings.HasPrefix(bp, prefix) {
+				continue
+			}
+			name := bp[len(prefix):]
+			if strings.Contains(name, "/") || inTarget[name] {
+				continue
+			}
+			deleted = append(deleted, name)
+		}
+		sort.Strings(deleted)
+		for _, name := range deleted {
+			b.WriteString("    <S:delete-entry name=\"" + xmlEscape(name) + "\"/>\n")
 		}
 	}
 	if wrap {
@@ -839,6 +872,105 @@ func (s *Server) reportGetLocations(w http.ResponseWriter, repo *fs.Repo, base s
 	fmt.Fprint(w, b.String())
 }
 
+// reportGetLocationSegments answers get-location-segments, the report svn uses
+// for switch/relocate and merge source tracking (SVN 1.8+). The response root
+// and child element are protocol-defined: <S:get-location-segments-report>
+// with <S:location-segment range-start= range-end= path=>. Answering it with
+// the older get-locations-report shape makes ra_serf abort with
+// "Unexpected root element".
+func (s *Server) reportGetLocationSegments(w http.ResponseWriter, repo *fs.Repo, resPath string, body []byte) {
+	var root xmlEl
+	if err := xml.Unmarshal(body, &root); err != nil {
+		http.Error(w, "bad get-location-segments", http.StatusBadRequest)
+		return
+	}
+	path := resPath
+	if sp, ok := root.child("path"); ok && strings.TrimSpace(sp.Content) != "" {
+		path = strings.TrimSpace(sp.Content)
+	}
+	head, err := repo.Head()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	num := func(name string, def uint64) uint64 {
+		if e, ok := root.child(name); ok {
+			if n, err := strconv.ParseUint(strings.TrimSpace(e.Content), 10, 64); err == nil {
+				return n
+			}
+		}
+		return def
+	}
+	peg := num("peg-revision", head)
+	if peg > head {
+		peg = head
+	}
+	start := num("start-revision", peg)
+	end := num("end-revision", 1)
+	if start > peg {
+		start = peg
+	}
+	if end < 1 {
+		end = 1
+	}
+	if start < end {
+		start, end = end, start
+	}
+
+	// Walk the lineage downward from start, following copy-from points, and
+	// record the path the node had at every revision in [end, start].
+	pathAt := map[uint64]string{}
+	cur := path
+	for rev := start; rev >= end && rev >= 1; rev-- {
+		nr, err := repo.Resolve(rev, cur)
+		if err != nil {
+			pathAt[rev] = "" // node does not exist at this revision
+		} else {
+			pathAt[rev] = cur
+			if nr.CopyFrom != nil && nr.CopyFromPath != "" && nr.CopyFrom.Rev < rev {
+				cur = nr.CopyFromPath
+			}
+		}
+		if rev == 0 {
+			break
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
+	b.WriteString(`<S:get-location-segments-report xmlns:S="svn:" xmlns:D="` + NS_DAV + `">` + "\n")
+	// Emit contiguous runs, highest range first (svn_ra_get_location_segments
+	// delivers segments in descending order).
+	runHi := start
+	runPath := pathAt[start]
+	for rev := int64(start) - 1; rev >= int64(end); rev-- {
+		p := pathAt[uint64(rev)]
+		if p == runPath {
+			continue
+		}
+		writeSegment(&b, runPath, uint64(rev+1), runHi)
+		runHi = uint64(rev)
+		runPath = p
+	}
+	writeSegment(&b, runPath, end, runHi)
+	b.WriteString("</S:get-location-segments-report>\n")
+	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+	fmt.Fprint(w, b.String())
+}
+
+// writeSegment emits one <S:location-segment>. svn_location_segment_t defines
+// range_start as the OLDEST revision and range_end as the YOUNGEST (both
+// inclusive), so lo goes to range-start. The path must be absolute *without* a
+// leading slash (clients re-add it when deriving merge ranges).
+func writeSegment(b *strings.Builder, path string, lo, hi uint64) {
+	p := ""
+	if path != "" {
+		p = ` path="` + xmlEscape(strings.TrimPrefix(path, "/")) + `"`
+	}
+	b.WriteString(`  <S:location-segment range-start="` + strconv.FormatUint(lo, 10) +
+		`" range-end="` + strconv.FormatUint(hi, 10) + `"` + p + "/>\n")
+}
+
 // reportGetLocks answers a get-locks REPORT: the set of active locks for the
 // repository (or, if a <S:path> is given, locks at/under that path).
 func (s *Server) reportGetLocks(w http.ResponseWriter, repo *fs.Repo, repoName, urlPath string, body []byte) {
@@ -847,16 +979,35 @@ func (s *Server) reportGetLocks(w http.ResponseWriter, repo *fs.Repo, repoName, 
 		http.Error(w, "bad get-locks", http.StatusBadRequest)
 		return
 	}
-	filter := ""
+	// The report targets the URL it was sent to; an explicit <S:path> (if any)
+	// narrows it further. depth=immediates means "this node and its direct
+	// children", infinity means the whole subtree.
+	filter := urlPath
 	if c, ok := root.child("path"); ok && strings.TrimSpace(c.Content) != "" {
-		filter = "/" + strings.Trim(strings.TrimSpace(c.Content), "/")
+		filter = strings.TrimSpace(c.Content)
+	}
+	filter = "/" + strings.Trim(filter, "/")
+	if filter == "/" {
+		filter = ""
+	}
+	depth := root.attr("depth")
+	if depth == "" {
+		depth = "infinity"
 	}
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
-	b.WriteString(`<S:locks xmlns:S="svn:" xmlns:D="` + NS_DAV + `">` + "\n")
+	// svn_ra_serf's getlocks parser requires this exact root/child shape:
+	// <S:get-locks-report><S:lock><S:path/><S:token/><S:owner/>...  The DAV
+	// <D:locks> shape used previously is rejected as an unexpected root.
+	b.WriteString(`<S:get-locks-report xmlns:S="svn:" xmlns:D="` + NS_DAV + `">` + "\n")
 	s.mu.Lock()
 	prefix := repoName + "\x00"
-	for key, e := range s.locks {
+	keys := make([]string, 0, len(s.locks))
+	for key := range s.locks {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
 		if !strings.HasPrefix(key, prefix) {
 			continue
 		}
@@ -864,16 +1015,26 @@ func (s *Server) reportGetLocks(w http.ResponseWriter, repo *fs.Repo, repoName, 
 		if filter != "" && p != filter && !strings.HasPrefix(p, filter+"/") {
 			continue
 		}
-		b.WriteString("  <S:lock path=\"" + xmlEscape(p) + "\">\n")
-		b.WriteString("    <D:locktype><D:write/></D:locktype>\n")
-		b.WriteString("    <D:lockowner>" + xmlEscape(e.owner) + "</D:lockowner>\n")
-		b.WriteString("    <D:depth>" + xmlEscape(e.depth) + "</D:depth>\n")
-		b.WriteString("    <D:timeout>Second-" + strconv.Itoa(e.timeout) + "</D:timeout>\n")
-		b.WriteString("    <D:locktoken><D:href>" + xmlEscape(e.token) + "</D:href></D:locktoken>\n")
+		if filter != "" && p != filter && depth == "immediates" {
+			rel := strings.TrimPrefix(p, filter+"/")
+			if strings.Contains(rel, "/") {
+				continue
+			}
+		}
+		e := s.locks[key]
+		b.WriteString("  <S:lock>\n")
+		b.WriteString("    <S:path>" + xmlEscape(p) + "</S:path>\n")
+		b.WriteString("    <S:token>" + xmlEscape(e.token) + "</S:token>\n")
+		b.WriteString("    <S:owner>" + xmlEscape(e.owner) + "</S:owner>\n")
+		b.WriteString("    <S:creationdate>" + e.created.UTC().Format("2006-01-02T15:04:05.000000Z") + "</S:creationdate>\n")
+		if e.timeout > 0 {
+			exp := e.created.Add(time.Duration(e.timeout) * time.Second).UTC()
+			b.WriteString("    <S:expirationdate>" + exp.Format("2006-01-02T15:04:05.000000Z") + "</S:expirationdate>\n")
+		}
 		b.WriteString("  </S:lock>\n")
 	}
 	s.mu.Unlock()
-	b.WriteString("</S:locks>\n")
+	b.WriteString("</S:get-locks-report>\n")
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 	fmt.Fprint(w, b.String())
 }
