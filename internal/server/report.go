@@ -2,6 +2,7 @@ package server
 
 import (
 	"crypto/md5"
+	"crypto/sha1"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
@@ -111,7 +112,14 @@ func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name s
 	// <S:revision>; used so the txdelta is sent as a delta from the baseline
 	// revision's text rather than an empty base.
 	var baseRev uint64
+	// start-empty="true" on <S:entry> means the client's WC has no such node
+	// (fresh checkout / sparse). In that case the server must send add-file /
+	// add-directory, never open-file, even when the baseline has the node.
+	startEmpty := false
 	if e, ok := root.child("entry"); ok {
+		if v := e.attr("start-empty"); v == "true" || v == "yes" {
+			startEmpty = true
+		}
 		if v := e.attr("rev"); v != "" {
 			if n, err := strconv.ParseUint(v, 10, 64); err == nil {
 				baseRev = n
@@ -142,7 +150,7 @@ func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name s
 
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
-	b.WriteString(`<S:update-report xmlns:S="svn:" xmlns:D="` + NS_DAV + `">` + "\n")
+	b.WriteString(`<S:update-report xmlns:S="svn:" xmlns:D="` + NS_DAV + `" xmlns:V="http://subversion.tigris.org/xmlns/dav/" inline-props="true">` + "\n")
 	b.WriteString("  <S:target-revision rev=\"" + strconv.FormatUint(rev, 10) + "\"/>\n")
 	rp, _ := repo.GetRevProps(rev)
 	uuid, _ := repo.UUID()
@@ -150,13 +158,13 @@ func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name s
 	// resolve each file's baseline text by map lookup instead of a per-file
 	// Resolve(baseRev, path) that re-walks the tree for every node.
 	baseIdx := map[string]fs.NodeID{}
-	if baseRev > 0 && baseRev != rev {
+	if baseRev > 0 {
 		if err := indexTree(repo, baseRev, rootPath, baseIdx); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 	}
-	if err := s.updateWalkDir(&b, repo, base, rev, baseRev, rootPath, "open-directory", true, rp, uuid, baseIdx); err != nil {
+	if err := s.updateWalkDir(&b, repo, base, rev, baseRev, rootPath, "open-directory", true, rp, uuid, baseIdx, startEmpty); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -207,9 +215,16 @@ func writeEntryProps(b *strings.Builder, rp *fs.RevProps, uuid string, rev uint6
 // add-file with fulltext txdelta), walking the whole subtree at rev. baseRev
 // is the client's WC baseline revision (from <S:revision>); when > 0 the file
 // txdelta is sent as a delta from the baseline revision's text (svn diff).
-func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, rev uint64, baseRev uint64, path, openEl string, wrap bool, rp *fs.RevProps, uuid string, baseIdx map[string]fs.NodeID) error {
+func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, rev uint64, baseRev uint64, path, openEl string, wrap bool, rp *fs.RevProps, uuid string, baseIdx map[string]fs.NodeID, startEmpty bool) error {
+	// Element rev (open-directory / open-file) mirrors the client's WC baseline
+	// revision; on a fresh checkout (baseRev==0) we emit HEAD. The checked-in
+	// href still points at the target revision.
+	outRev := rev
+	if baseRev > 0 {
+		outRev = baseRev
+	}
 	if wrap {
-		b.WriteString("  <S:" + openEl + " rev=\"" + strconv.FormatUint(rev, 10) + "\">\n")
+		b.WriteString("  <S:" + openEl + " rev=\"" + strconv.FormatUint(outRev, 10) + "\">\n")
 	}
 	writeEntryProps(b, rp, uuid, rev)
 	children, err := repo.ListDir(rev, path)
@@ -221,20 +236,31 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 	for _, c := range children {
 		cpath := strings.TrimSuffix(path, "/") + "/" + c.Name
 		if c.Kind == fs.KindDir {
-			bc := base + "!svn/bc/" + strconv.FormatUint(rev, 10) + "/" + strings.TrimPrefix(cpath, "/")
-			b.WriteString("    <S:add-directory name=\"" + xmlEscape(c.Name) + "\" bc-url=\"" + xmlEscape(bc) + "\">\n")
-			b.WriteString("      <D:checked-in><D:href>" + xmlEscape(bc) + "</D:href></D:checked-in>\n")
-			writeEntryProps(b, rp, uuid, rev)
-			writeNodeProps(b, c.Props)
-			if err := s.updateWalkDir(b, repo, base, rev, baseRev, cpath, "add-directory", false, rp, uuid, baseIdx); err != nil {
-				return err
+			if _, inBase := baseIdx[cpath]; inBase && !startEmpty {
+				// existing dir in client's WC -> open-directory (update semantics)
+				ver := base + "!svn/ver/" + strconv.FormatUint(rev, 10) + "/" + strings.TrimPrefix(cpath, "/")
+				b.WriteString("    <S:open-directory name=\"" + xmlEscape(c.Name) + "\" rev=\"" + strconv.FormatUint(outRev, 10) + "\">\n")
+				b.WriteString("      <D:checked-in><D:href>" + xmlEscape(ver) + "</D:href></D:checked-in>\n")
+				writeEntryProps(b, rp, uuid, rev)
+				writeNodeProps(b, c.Props)
+				if err := s.updateWalkDir(b, repo, base, rev, baseRev, cpath, "open-directory", false, rp, uuid, baseIdx, startEmpty); err != nil {
+					return err
+				}
+				b.WriteString("    </S:open-directory>\n")
+			} else {
+				bc := base + "!svn/bc/" + strconv.FormatUint(rev, 10) + "/" + strings.TrimPrefix(cpath, "/")
+				b.WriteString("    <S:add-directory name=\"" + xmlEscape(c.Name) + "\" bc-url=\"" + xmlEscape(bc) + "\">\n")
+				b.WriteString("      <D:checked-in><D:href>" + xmlEscape(bc) + "</D:href></D:checked-in>\n")
+				writeEntryProps(b, rp, uuid, rev)
+				writeNodeProps(b, c.Props)
+				if err := s.updateWalkDir(b, repo, base, rev, baseRev, cpath, "add-directory", false, rp, uuid, baseIdx, startEmpty); err != nil {
+					return err
+				}
+				b.WriteString("    </S:add-directory>\n")
 			}
-			b.WriteString("    </S:add-directory>\n")
 		} else {
-			b.WriteString("    <S:add-file name=\"" + xmlEscape(c.Name) + "\">\n")
-			bc := base + "!svn/bc/" + strconv.FormatUint(rev, 10) + "/" + strings.TrimPrefix(cpath, "/")
-			b.WriteString("      <D:checked-in><D:href>" + xmlEscape(bc) + "</D:href></D:checked-in>\n")
-			writeEntryProps(b, rp, uuid, rev)
+			_, inBase := baseIdx[cpath]
+			inBase = inBase && !startEmpty
 			// use the child's immutable node id from ListDir directly, avoiding a
 			// per-file Resolve (which re-walks the root->path chain and re-reads
 			// every block on the way).
@@ -259,16 +285,42 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 			if err != nil {
 				return err
 			}
-			b.WriteString("      <S:txdelta>" + base64.StdEncoding.EncodeToString(delta) + "</S:txdelta>\n")
 			sum := md5.Sum(text)
-			b.WriteString("      <S:prop><D:md5-checksum>" + hex.EncodeToString(sum[:]) + "</D:md5-checksum></S:prop>\n")
-			b.WriteString("    </S:add-file>\n")
+			md5hex := hex.EncodeToString(sum[:])
+			if inBase {
+				// existing file in client's WC -> open-file (update semantics).
+				// add-file would make the client's add_file() editor skip the
+				// already-versioned file as an obstructing working copy.
+				ver := base + "!svn/ver/" + strconv.FormatUint(rev, 10) + "/" + strings.TrimPrefix(cpath, "/")
+				ss := sha1.Sum(text)
+				bs := md5.Sum(baseText)
+				b.WriteString("    <S:open-file name=\"" + xmlEscape(c.Name) + "\" rev=\"" + strconv.FormatUint(outRev, 10) + "\" sha1-checksum=\"" + hex.EncodeToString(ss[:]) + "\" base-checksum=\"" + hex.EncodeToString(bs[:]) + "\">\n")
+				b.WriteString("      <D:checked-in><D:href>" + xmlEscape(ver) + "</D:href></D:checked-in>\n")
+				writeEntryProps(b, rp, uuid, rev)
+				b.WriteString("      <S:txdelta>" + base64.StdEncoding.EncodeToString(delta) + "</S:txdelta>\n")
+				b.WriteString("      <S:prop><V:md5-checksum>" + md5hex + "</V:md5-checksum></S:prop>\n")
+				b.WriteString("    </S:open-file>\n")
+			} else {
+				bc := base + "!svn/bc/" + strconv.FormatUint(rev, 10) + "/" + strings.TrimPrefix(cpath, "/")
+				b.WriteString("    <S:add-file name=\"" + xmlEscape(c.Name) + "\" sha1-checksum=\"" + sha1Hex(text) + "\">\n")
+				b.WriteString("      <D:checked-in><D:href>" + xmlEscape(bc) + "</D:href></D:checked-in>\n")
+				writeEntryProps(b, rp, uuid, rev)
+				b.WriteString("      <S:txdelta>" + base64.StdEncoding.EncodeToString(delta) + "</S:txdelta>\n")
+				b.WriteString("      <S:prop><V:md5-checksum>" + md5hex + "</V:md5-checksum></S:prop>\n")
+				b.WriteString("    </S:add-file>\n")
+			}
 		}
 	}
 	if wrap {
 		b.WriteString("  </S:" + openEl + ">\n")
 	}
 	return nil
+}
+
+// sha1Hex returns the lowercase hex SHA-1 of data.
+func sha1Hex(b []byte) string {
+	s := sha1.Sum(b)
+	return hex.EncodeToString(s[:])
 }
 
 // writeNodeProps emits <S:set-prop> for each node property (svn namespace and
