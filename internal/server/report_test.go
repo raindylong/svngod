@@ -36,7 +36,7 @@ func TestReportUpdateCheckout(t *testing.T) {
 		"S:update-report", `target-revision rev="1"`,
 		"S:open-directory rev=\"1\"", "add-directory name=\"trunk\"",
 		"add-file name=\"README.txt\"", "D:checked-in", "S:txdelta",
-		"D:md5-checksum",
+		"V:md5-checksum",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("update-report missing %q:\n%s", want, out)
