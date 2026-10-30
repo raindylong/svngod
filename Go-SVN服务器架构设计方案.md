@@ -56,3 +56,9 @@
 - **读侧**：控制 key（current/format/uuid）读主失败自动回退健康备镜像（git 04185e1）；数据 key 本就 round-robin 从健康镜像读。实测：停主（mv 本地盘主目录）后 svn ls/x.txt 均由备 S3 接管。
 - **写侧（主恢复后补齐备）**：MirrorStore.repair() 启动即触发（`go repair()`）+ 60s tick：listAll(主) → 对 down 备全量 catchUp、healthy 备补缺失对象、current 等可变 key 总镜像（主权威）。实测：删备 revs-loose 全部 block → 重启 server 触发 repair → 备自动补齐（0→2 block）→ 停主读备正常。
 - 配置注意：svngod config.json 的 S3 凭证字段为 **access-key / secret-key**（含连字符）；误用 access/secret 会导致空凭证 → RustFS AccessDenied → 备永不镜像（已修，git e9e9764）。
+
+### 高并发写验证（多节点并发提交，2026-10-30）
+- 场景：10 个独立 wc（多客户端节点）并发 commit，每 wc 独立文件，两轮共 20 个 commit。
+- 结果：**修订号严格连续 2..21（无空洞、无丢失）**；每轮 10 文件内容读回 10/10 正确（原子性，无错乱）；HEAD 校验 = base+20 精确。
+- 混合镜像同步：并发写后 S3 备同步 22 block；停主（mv 本地盘主）后 svn ls/cat 全部由备接管，故障切换在并发写压力下仍可用。
+- 架构对比：原生 svn FSFS 在高并发写时因乐观锁（wc 基线与 HEAD 冲突）产生 E160024 冲突，需 merge/resolve 重试；svngod 单写者强一致（repo.mu 串行 + CommitTxn 原子合并）天然规避冲突，全提交成功、修订连续。
