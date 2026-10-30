@@ -373,3 +373,43 @@ func TestCommitStaleBaseRev(t *testing.T) {
 		t.Fatalf("content changed to %q, want v2", txt)
 	}
 }
+
+// TestCollectLooseRemovesPackedShards: auto-packing writes the pack but used
+// to leave the loose objects behind forever; CollectLoose must remove only
+// objects of packed shards and reads must keep working from the pack.
+func TestCollectLooseRemovesPackedShards(t *testing.T) {
+	st := store.NewMemoryStore()
+	repo, err := CreateRepo(st, "r", 4, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 5; i++ {
+		if _, err := repo.CommitTxn(uint64(i-1), []Change{
+			{Path: "/f" + string(rune('0'+i)) + ".txt", Action: ActionAdd, Kind: KindFile, Data: []byte("x")},
+		}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// shard 0 (revs 0..3) is complete; pack it.
+	if err := repo.PackShard(0); err != nil {
+		t.Fatal(err)
+	}
+	n, err := repo.CollectLoose(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n == 0 {
+		t.Fatal("no loose objects collected")
+	}
+	// Packed shard reads still work; the active shard keeps its loose objects.
+	if nr, err := repo.Resolve(2, "/f2.txt"); err != nil {
+		t.Fatalf("resolve packed: %v", err)
+	} else if txt, _ := repo.GetText(nr.Node); string(txt) != "x" {
+		t.Fatalf("packed text = %q", txt)
+	}
+	if nr, err := repo.Resolve(4, "/f4.txt"); err != nil {
+		t.Fatalf("resolve loose: %v", err)
+	} else if txt, _ := repo.GetText(nr.Node); string(txt) != "x" {
+		t.Fatalf("loose text = %q", txt)
+	}
+}

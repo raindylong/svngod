@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 
 	"github.com/minio/minio-go/v7"
@@ -139,22 +140,37 @@ func (s *S3Store) Head(ctx context.Context, key string) (string, bool, error) {
 	return info.ETag, true, nil
 }
 
-// CreateIfAbsent is single-writer best-effort (see NewS3Store note).
+// CreateIfAbsent creates the object only if it does not exist. The write uses
+// If-None-Match: * so it is atomic across replicas; gateways that do not
+// implement conditional writes fall back to a HEAD+PUT (best effort).
 func (s *S3Store) CreateIfAbsent(ctx context.Context, key string, data []byte) error {
-	if _, ok, err := s.Head(ctx, key); err != nil {
-		return err
-	} else if ok {
+	opts := minio.PutObjectOptions{ContentType: "application/octet-stream"}
+	opts.SetMatchETagExcept("*")
+	_, err := s.client.PutObject(ctx, s.bucket, s.key(key), bytes.NewReader(data), int64(len(data)), opts)
+	if err == nil {
+		return nil
+	}
+	if isPreconditionFailed(err) {
 		return ErrPreconditionFailed
 	}
-	return s.Put(ctx, key, data)
+	resp := minio.ToErrorResponse(err)
+	switch resp.Code {
+	case "NotImplemented", "MethodNotAllowed", "InvalidRequest", "XNotImplemented":
+		if _, ok, herr := s.Head(ctx, key); herr != nil {
+			return herr
+		} else if ok {
+			return ErrPreconditionFailed
+		}
+		return s.Put(ctx, key, data)
+	}
+	return err
 }
 
-// CAS is a real content-hash compare-and-swap: read the current object, compare
-// its content ETag (MD5 of bytes) against expectETag, and only then overwrite.
-// The HEAD existence check is deliberately avoided here — a HEAD read is not
-// needed because the GET body already proves existence, and on some S3 gateways
-// (e.g. RustFS) HEAD/GET ETag headers are unstable while the body is always
-// byte-exact. Return value is the new content ETag of the written object.
+// CAS is a compare-and-swap on the object's content ETag. Verification reads
+// the current body (some gateways return unstable HEAD ETags), then the write
+// is issued with If-Match so two replicas cannot both win the race: the loser
+// gets a 412 and ErrPreconditionFailed. Without the conditional write this was
+// a TOCTOU check and silently dropped a committed revision.
 func (s *S3Store) CAS(ctx context.Context, key string, expectETag string, data []byte) (string, error) {
 	cur, err := s.Get(ctx, key, nil)
 	if err != nil {
@@ -166,10 +182,36 @@ func (s *S3Store) CAS(ctx context.Context, key string, expectETag string, data [
 	if ContentETag(cur) != expectETag {
 		return "", ErrPreconditionFailed
 	}
-	if err := s.Put(ctx, key, data); err != nil {
+	info, err := s.client.StatObject(ctx, s.bucket, s.key(key), minio.StatObjectOptions{})
+	if err != nil {
+		return "", err
+	}
+	etag := strings.Trim(info.ETag, `"`)
+	opts := minio.PutObjectOptions{ContentType: "application/octet-stream"}
+	opts.SetMatchETag(etag)
+	_, err = s.client.PutObject(ctx, s.bucket, s.key(key), bytes.NewReader(data), int64(len(data)), opts)
+	if err != nil {
+		if isPreconditionFailed(err) {
+			return "", ErrPreconditionFailed
+		}
 		return "", err
 	}
 	return ContentETag(data), nil
+}
+
+// isPreconditionFailed reports whether an S3 error is a failed If-Match /
+// If-None-Match condition.
+func isPreconditionFailed(err error) bool {
+	resp := minio.ToErrorResponse(err)
+	switch resp.StatusCode {
+	case http.StatusPreconditionFailed, http.StatusConflict:
+		return true
+	}
+	switch resp.Code {
+	case "PreconditionFailed", "ConditionalRequestConflict", "NoSuchKey":
+		return resp.Code == "PreconditionFailed" || resp.Code == "ConditionalRequestConflict"
+	}
+	return false
 }
 
 func (s *S3Store) ListPrefix(ctx context.Context, prefix, continuation string, max int) ([]ListedObj, string, error) {

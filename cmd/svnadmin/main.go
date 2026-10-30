@@ -13,12 +13,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"path/filepath"
 	"io"
 	"os"
+	"path/filepath"
 
 	"svngod/internal/dump"
 	"svngod/internal/fs"
@@ -31,12 +32,12 @@ const (
 )
 
 type options struct {
-	endpoint  string
-	accessKey string
-	secretKey string
-	bucket    string
-	prefix    string
-	useSSL    bool
+	endpoint   string
+	accessKey  string
+	secretKey  string
+	bucket     string
+	prefix     string
+	useSSL     bool
 	mirrorFile string
 }
 
@@ -149,6 +150,12 @@ func main() {
 	fs.BoolVar(&o.useSSL, "ssl", false, "use https for S3")
 	fs.StringVar(&o.mirrorFile, "mirror-file", "", "JSON array of backends to create a mirror store (local-primary + S3-standby etc.)")
 	var output, input string
+	shardSize := uint64(defaultShardSize)
+	maxDelta := uint64(defaultMaxDelta)
+	if cmd == "create" {
+		fs.Uint64Var(&shardSize, "shard-size", defaultShardSize, "revisions per shard (packing granularity)")
+		fs.Uint64Var(&maxDelta, "max-delta", defaultMaxDelta, "maximum text delta chain length")
+	}
 	if cmd == "dump" {
 		fs.StringVar(&output, "output", "", "write dump to file (default stdout)")
 	}
@@ -167,13 +174,15 @@ func main() {
 
 	switch cmd {
 	case "create":
-		doCreate(&o, repoName)
+		doCreate(&o, repoName, shardSize, maxDelta)
 	case "dump":
 		doDump(&o, repoName, output)
 	case "load":
 		doLoad(&o, repoName, input)
 	case "verify":
 		doVerify(&o, repoName)
+	case "gc":
+		doGC(&o, repoName)
 	default:
 		usage()
 		os.Exit(2)
@@ -188,17 +197,18 @@ usage:
   svnadmin dump   [--output FILE] [s3 flags] <repo>
   svnadmin load   [--input FILE] [s3 flags] <repo>
   svnadmin verify [s3 flags] <repo>   # integrity walk; prints corrupted nodes
+  svnadmin gc     [s3 flags] <repo>   # delete loose objects of packed shards
 
 s3 flags: --endpoint H:PORT --access-key K --secret-key S --bucket B [--prefix P] [--ssl]
 `)
 }
 
-func doCreate(o *options, repoName string) {
+func doCreate(o *options, repoName string, shardSize, maxDelta uint64) {
 	st, prefix, err := o.repoStore(repoName)
 	if err != nil {
 		fatal(err)
 	}
-	repo, err := fs.CreateRepo(st, prefix, defaultShardSize, defaultMaxDelta)
+	repo, err := fs.CreateRepo(st, prefix, shardSize, maxDelta)
 	if err != nil {
 		fatal(err)
 	}
@@ -207,6 +217,25 @@ func doCreate(o *options, repoName string) {
 		fatal(err)
 	}
 	fmt.Printf("created repository %q uuid=%s\n", repoName, uuid)
+}
+
+// doGC removes loose revision objects that have been superseded by a shard
+// pack. Auto-packing only writes the pack; without this the loose copies stay
+// forever and storage doubles.
+func doGC(o *options, repoName string) {
+	st, prefix, err := o.repoStore(repoName)
+	if err != nil {
+		fatal(err)
+	}
+	repo, err := fs.OpenRepo(st, prefix)
+	if err != nil {
+		fatal(err)
+	}
+	n, err := repo.CollectLoose(context.Background())
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Printf("gc: removed %d loose objects from %q\n", n, repoName)
 }
 
 func doVerify(o *options, repoName string) {

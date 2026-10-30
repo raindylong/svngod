@@ -1,14 +1,21 @@
 package server
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
+
+	"svngod/internal/fs"
+	"svngod/internal/fs/store"
 )
 
 // lockEntry is one exclusive write lock on a repository path.
@@ -28,17 +35,22 @@ func lockKey(repo, path string) string {
 
 // handleLockUnlock implements the LOCK and UNLOCK methods.
 func (s *Server) handleLockUnlock(w http.ResponseWriter, r *http.Request, res resource) {
+	// Opening the repo also restores persisted locks for this repository.
+	repo, ok := s.repo(w, res)
+	if !ok {
+		return
+	}
 	switch r.Method {
 	case MethodLock:
-		s.handleLock(w, r, res)
+		s.handleLock(w, r, res, repo)
 	case MethodUnlock:
-		s.handleUnlock(w, r, res)
+		s.handleUnlock(w, r, res, repo)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-func (s *Server) handleLock(w http.ResponseWriter, r *http.Request, res resource) {
+func (s *Server) handleLock(w http.ResponseWriter, r *http.Request, res resource, repo *fs.Repo) {
 	// Locking requires an authenticated principal when the repo has auth
 	// configured; otherwise the lockowner would be meaningless and anonymous
 	// callers could lock any path. Challenge (401) so the svn client retries
@@ -79,6 +91,7 @@ func (s *Server) handleLock(w http.ResponseWriter, r *http.Request, res resource
 	if isLocked && lockTokenMatches(r.Header.Get("If"), existing.token) {
 		existing.created = time.Now()
 		s.mu.Unlock()
+		s.persistLocks(res.repo, repo)
 		s.writeLockDiscovery(w, res, existing)
 		return
 	}
@@ -86,12 +99,13 @@ func (s *Server) handleLock(w http.ResponseWriter, r *http.Request, res resource
 	entry := &lockEntry{token: tok, owner: owner, comment: comment, depth: "infinity", created: time.Now(), timeout: 3600}
 	s.locks[key] = entry
 	s.mu.Unlock()
+	s.persistLocks(res.repo, repo)
 
 	w.Header().Set("Lock-Token", "<"+tok+">")
 	s.writeLockDiscovery(w, res, entry)
 }
 
-func (s *Server) handleUnlock(w http.ResponseWriter, r *http.Request, res resource) {
+func (s *Server) handleUnlock(w http.ResponseWriter, r *http.Request, res resource, repo *fs.Repo) {
 	if s.cfg.authFor(res.repo) != nil && IdentityFrom(r.Context()).Username == "" {
 		s.unauthorized(w)
 		return
@@ -118,6 +132,7 @@ func (s *Server) handleUnlock(w http.ResponseWriter, r *http.Request, res resour
 	}
 	delete(s.locks, key)
 	s.mu.Unlock()
+	s.persistLocks(res.repo, repo)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -226,4 +241,88 @@ func writeActivelock(b *strings.Builder, e *lockEntry) {
 	b.WriteString("          <D:locktoken><D:href>" + e.token + "</D:href></D:locktoken>\n")
 	b.WriteString("        </D:activelock>\n")
 	b.WriteString("      </D:lockdiscovery>\n")
+}
+
+// --- lock persistence -------------------------------------------------------
+
+// lockedJSON is the on-disk form of a lock bucket entry.
+type lockedJSON struct {
+	Path    string `json:"path"`
+	Token   string `json:"token"`
+	Owner   string `json:"owner"`
+	Comment string `json:"comment,omitempty"`
+	Depth   string `json:"depth"`
+	Created int64  `json:"created"`
+	Timeout int    `json:"timeout"`
+}
+
+func lockStateKey(repo *fs.Repo) string {
+	return repo.Keys().Prefix + "/dav-locks/locks.json"
+}
+
+// persistLocks writes this repository's lock bucket to its object store.
+// Best effort: a failed write must not fail the LOCK/UNLOCK request.
+func (s *Server) persistLocks(repoName string, repo *fs.Repo) {
+	s.mu.Lock()
+	prefix := repoName + "\x00"
+	out := []lockedJSON{}
+	for key, e := range s.locks {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		out = append(out, lockedJSON{
+			Path: key[len(prefix):], Token: e.token, Owner: e.owner,
+			Comment: e.comment, Depth: e.depth,
+			Created: e.created.Unix(), Timeout: e.timeout,
+		})
+	}
+	s.mu.Unlock()
+	data, err := json.Marshal(out)
+	if err != nil {
+		return
+	}
+	if err := repo.Store().Put(context.Background(), lockStateKey(repo), data); err != nil {
+		log.Printf("locks: persist %q: %v", repoName, err)
+	}
+}
+
+// ensureLocksLoaded restores a repository's locks after a restart (or on
+// another replica's first request for it). Locks already in memory win.
+func (s *Server) ensureLocksLoaded(repoName string, repo *fs.Repo) {
+	s.mu.Lock()
+	if s.locksLoaded[repoName] {
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
+
+	data, err := repo.Store().Get(context.Background(), lockStateKey(repo), nil)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		log.Printf("locks: load %q: %v", repoName, err)
+	}
+	var loaded []lockedJSON
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &loaded); err != nil {
+			log.Printf("locks: parse %q: %v", repoName, err)
+			loaded = nil
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, l := range loaded {
+		key := lockKey(repoName, l.Path)
+		if _, exists := s.locks[key]; exists {
+			continue
+		}
+		e := &lockEntry{token: l.Token, owner: l.Owner, comment: l.Comment,
+			depth: l.Depth, created: time.Unix(l.Created, 0), timeout: l.Timeout}
+		if e.expired() {
+			continue
+		}
+		if e.depth == "" {
+			e.depth = "infinity"
+		}
+		s.locks[key] = e
+	}
+	s.locksLoaded[repoName] = true
 }

@@ -1591,12 +1591,16 @@ func (s *Server) reportGetMergeinfo(w http.ResponseWriter, repo *fs.Repo, urlPat
 	var root xmlEl
 	rev := uint64(0)
 	haveRev := false
+	inherited := false
 	var relPaths []string
 	if err := xml.Unmarshal(body, &root); err == nil {
 		if e, ok := root.child("revision"); ok {
 			if n, err := strconv.ParseUint(strings.TrimSpace(e.Content), 10, 64); err == nil {
 				rev, haveRev = n, true
 			}
+		}
+		if e, ok := root.child("inherit"); ok {
+			inherited = strings.EqualFold(strings.TrimSpace(e.Content), "inherited")
 		}
 		for _, c := range root.Children {
 			if c.XMLName.Local == "path" {
@@ -1632,7 +1636,34 @@ func (s *Server) reportGetMergeinfo(w http.ResponseWriter, repo *fs.Repo, urlPat
 		if err != nil {
 			continue
 		}
-		info := nr.Props["svn:mergeinfo"]
+		mi := parseMergeinfo(nr.Props["svn:mergeinfo"])
+		if inherited {
+			// Ancestors' mergeinfo applies to the descendant with its source
+			// paths shifted by the relative path; only inheritable ranges
+			// propagate.
+			anc := actual
+			for {
+				anc = strings.TrimSuffix(anc, "/")
+				if i := strings.LastIndex(anc, "/"); i > 0 {
+					anc = anc[:i]
+				} else {
+					anc = "/"
+				}
+				anr, aerr := repo.Resolve(rev, anc)
+				if aerr == nil && anr.Props["svn:mergeinfo"] != "" {
+					rel := strings.TrimPrefix(actual, anc)
+					rel = strings.TrimPrefix(rel, "/")
+					if anc == "/" {
+						rel = strings.TrimPrefix(actual, "/")
+					}
+					mi = unionMergeinfo(mi, translateMergeinfo(inheritableOnly(parseMergeinfo(anr.Props["svn:mergeinfo"])), rel))
+				}
+				if anc == "/" {
+					break
+				}
+			}
+		}
+		info := formatMergeinfo(mi)
 		if info == "" {
 			continue
 		}

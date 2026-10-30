@@ -44,6 +44,9 @@ import (
 type fileConfig struct {
 	Addr     string     `json:"addr"`
 	BasePath string     `json:"base-path"`
+	Hooks    string     `json:"hooks"`
+	TLSCert  string     `json:"tls-cert"`
+	TLSKey   string     `json:"tls-key"`
 	Repos    []fileRepo `json:"repos"`
 }
 

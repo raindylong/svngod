@@ -50,6 +50,10 @@ type options struct {
 	bucket    string
 	prefix    string
 	useSSL    bool
+
+	hooksDir string
+	tlsCert  string
+	tlsKey   string
 }
 
 func (o *options) makeStore() (store.Store, error) {
@@ -118,6 +122,9 @@ func main() {
 	fl.StringVar(&o.bucket, "bucket", "", "S3 bucket")
 	fl.StringVar(&o.prefix, "prefix", "", "S3 repo prefix")
 	fl.BoolVar(&o.useSSL, "ssl", false, "use https for S3")
+	fl.StringVar(&o.hooksDir, "hooks-dir", "", "directory with pre-commit / post-commit hooks")
+	fl.StringVar(&o.tlsCert, "tls-cert", "", "TLS certificate file (serve HTTPS)")
+	fl.StringVar(&o.tlsKey, "tls-key", "", "TLS key file (serve HTTPS)")
 	var configPath string
 	fl.StringVar(&configPath, "config", "", "JSON config file (multi-repo; overrides flags)")
 	_ = fl.Parse(os.Args[1:])
@@ -159,10 +166,18 @@ func main() {
 			}
 			return r, nil
 		},
-		Logger: log.New(os.Stderr, "svngod ", log.LstdFlags),
+		HooksDir: o.hooksDir,
+		Logger:   log.New(os.Stderr, "svngod ", log.LstdFlags),
 	})
 
 	log.Printf("svngod listening on %s (base %s, repo-root %s)", o.addr, o.basePath, o.repoRoot)
+	if o.tlsCert != "" && o.tlsKey != "" {
+		log.Printf("serving HTTPS (cert %s)", o.tlsCert)
+		if err := http.ListenAndServeTLS(o.addr, o.tlsCert, o.tlsKey, srv.Handler()); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if err := http.ListenAndServe(o.addr, srv.Handler()); err != nil {
 		log.Fatal(err)
 	}
@@ -186,9 +201,17 @@ func runMultiRepo(configPath string) {
 	srv := server.New(server.Config{
 		BasePath: cfg.BasePath,
 		Repos:    repos,
+		HooksDir: cfg.Hooks,
 		Logger:   log.New(os.Stderr, "svngod ", log.LstdFlags),
 	})
 	log.Printf("svngod listening on %s (base %s, %d repos)", addr, cfg.BasePath, len(repos))
+	if cfg.TLSCert != "" && cfg.TLSKey != "" {
+		log.Printf("serving HTTPS (cert %s)", cfg.TLSCert)
+		if err := http.ListenAndServeTLS(addr, cfg.TLSCert, cfg.TLSKey, srv.Handler()); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if err := http.ListenAndServe(addr, srv.Handler()); err != nil {
 		log.Fatal(err)
 	}

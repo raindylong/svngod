@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -880,6 +881,52 @@ func (r *Repo) PackShard(shard uint64) error {
 	}
 	r.cache.Clear()
 	return nil
+}
+
+// CollectLoose deletes loose revision and revprops objects that belong to
+// shards already packed. PackShard leaves them behind (readers switched to the
+// pack via the .done marker), so storage grew without bound on long-running
+// repositories. Returns the number of objects removed.
+func (r *Repo) CollectLoose(ctx context.Context) (int, error) {
+	deleted := 0
+	for _, sub := range []string{"revs-loose/", "revprops-loose/"} {
+		prefix := r.keys.Prefix + "/" + sub
+		next := ""
+		for {
+			objs, n, err := r.store.ListPrefix(ctx, prefix, next, 1000)
+			if err != nil {
+				return deleted, err
+			}
+			var victims []string
+			for _, o := range objs {
+				rel := strings.TrimPrefix(o.Key, prefix)
+				shardStr := rel
+				if i := strings.IndexByte(rel, '/'); i >= 0 {
+					shardStr = rel[:i]
+				}
+				shard, err := strconv.ParseUint(shardStr, 10, 64)
+				if err != nil {
+					continue
+				}
+				packed, err := r.isPacked(shard)
+				if err != nil || !packed {
+					continue
+				}
+				victims = append(victims, o.Key)
+			}
+			if len(victims) > 0 {
+				if err := r.store.Delete(ctx, victims); err != nil {
+					return deleted, err
+				}
+				deleted += len(victims)
+			}
+			if n == "" {
+				break
+			}
+			next = n
+		}
+	}
+	return deleted, nil
 }
 
 // GetRevProps returns a revision's properties (loose or packed).

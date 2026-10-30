@@ -35,6 +35,11 @@ type Config struct {
 	// global defaults.
 	Repos []*RepoConfig
 
+	// HooksDir holds optional pre-commit / post-commit executables. They run
+	// with SVN_USER/SVN_REPO/SVN_TXN (and SVN_REV for post-commit) in the
+	// environment; a non-zero pre-commit exit rejects the commit.
+	HooksDir string
+
 	// Logger for request logging; nil disables.
 	Logger *log.Logger
 }
@@ -82,21 +87,23 @@ func (c *Config) openerFor(name string) RepoOpener {
 type Server struct {
 	cfg Config
 
-	mu         sync.Mutex
-	activities map[string]*activity
-	txns       map[string]*txn
-	locks      map[string]*lockEntry // key: repo + "\x00" + path
-	repoCache  map[string]*fs.Repo   // per-name repo singletons (shared r.mu)
+	mu          sync.Mutex
+	activities  map[string]*activity
+	txns        map[string]*txn
+	locks       map[string]*lockEntry // key: repo + "\x00" + path
+	locksLoaded map[string]bool       // repositories whose persisted locks were restored
+	repoCache   map[string]*fs.Repo   // per-name repo singletons (shared r.mu)
 }
 
 // New builds a Server.
 func New(cfg Config) *Server {
 	return &Server{
-		cfg:        cfg,
-		activities: map[string]*activity{},
-		txns:       map[string]*txn{},
-		locks:      map[string]*lockEntry{},
-		repoCache:  map[string]*fs.Repo{},
+		cfg:         cfg,
+		activities:  map[string]*activity{},
+		txns:        map[string]*txn{},
+		locks:       map[string]*lockEntry{},
+		locksLoaded: map[string]bool{},
+		repoCache:   map[string]*fs.Repo{},
 	}
 }
 
@@ -309,6 +316,7 @@ func (s *Server) repo(w http.ResponseWriter, res resource) (*fs.Repo, bool) {
 	r := s.repoCache[res.repo]
 	s.mu.Unlock()
 	if r != nil {
+		s.ensureLocksLoaded(res.repo, r)
 		return r, true
 	}
 	ropen, err := opener(res.repo)
@@ -326,6 +334,7 @@ func (s *Server) repo(w http.ResponseWriter, res resource) (*fs.Repo, bool) {
 	}
 	s.repoCache[res.repo] = ropen
 	s.mu.Unlock()
+	s.ensureLocksLoaded(res.repo, ropen)
 	return ropen, true
 }
 

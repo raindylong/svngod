@@ -191,6 +191,18 @@ func clientBaseRevision(r *http.Request) uint64 {
 	return 0
 }
 
+// writeHookFailure reports a pre-commit veto the way mod_dav_svn does: 403
+// with errcode 165001 so svn prints the hook's own message (E165001).
+func writeHookFailure(w http.ResponseWriter, msg string) {
+	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+	w.WriteHeader(http.StatusForbidden)
+	fmt.Fprintf(w, `<?xml version="1.0" encoding="utf-8"?>`+"\n"+
+		`<D:error xmlns:D="DAV:" xmlns:m="http://apache.org/dav/xmlns" xmlns:C="svn:">`+"\n"+
+		`<C:error/>`+"\n"+
+		`<m:human-readable errcode="165001">%s</m:human-readable>`+"\n"+
+		`</D:error>`+"\n", xmlEscape("Commit blocked by pre-commit hook: "+msg))
+}
+
 // writeOutOfDate rejects a stale working copy the way mod_dav_svn does: 409
 // with a DAV error body whose errcode makes the client report E170004
 // ("File ... is out of date") instead of a generic HTTP failure.
@@ -569,6 +581,21 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 	delete(s.txns, tx.id)
 	s.mu.Unlock()
 
+	user := IdentityFrom(r.Context()).Username
+	// pre-commit hooks can veto the transaction (policy checks that authz
+	// cannot express: log message rules, file names, sizes...). They run
+	// outside the server lock so a slow hook does not block other requests.
+	if s.cfg.HooksDir != "" {
+		if herr := runHook(s.cfg.HooksDir, "pre-commit", res.repo, tx.id, map[string]string{
+			"SVN_USER": user,
+			"SVN_REPO": res.repo,
+			"SVN_TXN":  tx.id,
+		}, nil); herr != nil {
+			writeHookFailure(w, herr.Error())
+			return
+		}
+	}
+
 	rev, err := repo.CommitTxn(tx.baseRev, changes, revProps)
 	if err != nil {
 		log.Printf("CommitTxn failed: %v", err)
@@ -586,6 +613,17 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 		}
 		http.Error(w, "commit failed: "+err.Error(), http.StatusConflict)
 		return
+	}
+	if s.cfg.HooksDir != "" {
+		go func(rev uint64) {
+			if herr := runHook(s.cfg.HooksDir, "post-commit", res.repo, tx.id, map[string]string{
+				"SVN_USER": user,
+				"SVN_REPO": res.repo,
+				"SVN_REV":  strconv.FormatUint(rev, 10),
+			}, nil); herr != nil {
+				log.Printf("post-commit hook: %v", herr)
+			}
+		}(rev)
 	}
 	// Always return a full merge-response so the client's XML parser gets a
 	// root element; a bare 200 triggers "no element found" in ra_serf even when
