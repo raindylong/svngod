@@ -396,8 +396,31 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 	// revision. If the repository head has moved past it (another writer won
 	// the race), refuse so a stale txn cannot clobber newer data (lost update).
 	// baseRev==0 skips the check (internal / bulk-load writers).
-	if baseRev > 0 && baseRev != cur.Head {
-		return 0, ErrOutOfDate
+	//
+	// Unlike a whole-repo base==head gate, we do per-path out-of-date checks:
+	// a change is only refused when its own target path was modified in the
+	// baseRev..HEAD window by another commit. Concurrent commits that touch
+	// disjoint paths merge cleanly; concurrent commits to the same path are
+	// rejected (native svn raises E160024 here) instead of silently
+	// last-write-wins over each other.
+	if baseRev > 0 {
+		for _, ch := range changes {
+			if ch.Path == "/" {
+				continue
+			}
+			hnr, err := r.Resolve(cur.Head, ch.Path)
+			if err == nil {
+				if hnr.Node.Rev > baseRev {
+					return 0, ErrOutOfDate
+				}
+				continue
+			}
+			// Path absent at HEAD but present at baseRev: it was deleted by a
+			// concurrent commit, so a change touching it is out of date.
+			if _, e := r.Resolve(baseRev, ch.Path); e == nil {
+				return 0, ErrOutOfDate
+			}
+		}
 	}
 	N := cur.Head + 1
 	ctx := context.Background()
