@@ -358,7 +358,7 @@ func pathCreatedRev(repo *fs.Repo, nr *fs.NodeRev) uint64 {
 	if nr == nil {
 		return 0
 	}
-	if cr, _, ok := copyOrigin(repo, nr); ok {
+	if cr, _, _, ok := copyOrigin(repo, nr); ok {
 		return cr
 	}
 	return nr.Node.Rev
@@ -422,7 +422,7 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 	// rvr URL must still name the path's location, so the copy revision acts
 	// as a floor for created revisions.
 	if dnr, derr := repo.Resolve(rev, path); derr == nil {
-		if cr, _, ok := copyOrigin(repo, dnr); ok && cr > copyFloor {
+		if cr, _, _, ok := copyOrigin(repo, dnr); ok && cr > copyFloor {
 			copyFloor = cr
 		}
 	}
@@ -1349,12 +1349,12 @@ func (s *Server) reportFileRevs(w http.ResponseWriter, repo *fs.Repo, base, urlP
 // older than the node currently resolved) plus its source path. copyFrom.Rev
 // alone is NOT the copy point — it is the source revision, which made
 // get-location-segments report the wrong ranges for a copied branch.
-func copyOrigin(repo *fs.Repo, nr *fs.NodeRev) (copyRev uint64, srcPath string, ok bool) {
+func copyOrigin(repo *fs.Repo, nr *fs.NodeRev) (copyRev uint64, srcPath string, srcRev uint64, ok bool) {
 	if nr == nil || nr.CopyFrom == nil || nr.CopyFromPath == "" {
-		return 0, "", false
+		return 0, "", 0, false
 	}
 	srcPath = nr.CopyFromPath
-	srcRev := nr.CopyFrom.Rev
+	srcRev = nr.CopyFrom.Rev
 	cur := nr
 	for !cur.Pred.IsZero() {
 		p, err := repo.GetNodeRev(cur.Pred)
@@ -1366,7 +1366,7 @@ func copyOrigin(repo *fs.Repo, nr *fs.NodeRev) (copyRev uint64, srcPath string, 
 		}
 		cur = p
 	}
-	return cur.Node.Rev, srcPath, true
+	return cur.Node.Rev, srcPath, srcRev, true
 }
 
 // lineagePaths maps every revision in [end, start] to the path the tracked
@@ -1374,18 +1374,47 @@ func copyOrigin(repo *fs.Repo, nr *fs.NodeRev) (copyRev uint64, srcPath string, 
 func lineagePaths(repo *fs.Repo, path string, start, end uint64) map[uint64]string {
 	out := map[uint64]string{}
 	cur := path
-	for rev := start; ; rev-- {
-		if nr, err := repo.Resolve(rev, cur); err != nil {
+	rev := start
+	for rev >= end && rev >= 1 {
+		nr, err := repo.Resolve(rev, cur)
+		if err != nil {
 			out[rev] = ""
-		} else {
-			out[rev] = cur
-			if cr, src, ok := copyOrigin(repo, nr); ok && cr >= 1 && rev >= 1 && rev-1 < cr {
-				cur = src
-			}
+			rev--
+			continue
 		}
-		if rev == end || rev == 0 {
+		out[rev] = cur
+		cr, src, srcRev, ok := copyOrigin(repo, nr)
+		if !ok || rev-1 >= cr {
+			rev--
+			continue
+		}
+		// Crossing below the copy point. The copied node corresponds to the
+		// source AT srcRev only: revisions between srcRev and the copy are a
+		// gap (the path did not exist then), and svn reports them as a segment
+		// without a path. Reporting the source path there made merge ranges
+		// start one revision late.
+		if srcRev >= 1 && rev-1 >= srcRev {
+			for r := rev - 1; r > srcRev && r >= end && r >= 1; r-- {
+				out[r] = ""
+			}
+			if srcRev >= end {
+				out[srcRev] = src
+			}
+			cur = src
+			if srcRev <= 1 {
+				break
+			}
+			rev = srcRev - 1
+			continue
+		}
+		if srcRev <= 1 {
+			if srcRev == 1 && srcRev >= end {
+				out[srcRev] = src
+			}
 			break
 		}
+		cur = src
+		rev = srcRev - 1
 	}
 	return out
 }

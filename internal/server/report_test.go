@@ -350,3 +350,35 @@ func TestReportTwoTreeDiff(t *testing.T) {
 		t.Fatalf("unchanged subtree emitted:\n%s", out)
 	}
 }
+
+// TestLineageGapBetweenSourceAndCopy: a copy made at r3 from a source last
+// changed at r1 does not exist at r2; svn reports a pathless gap there so
+// merge ranges start at the right revision (r2, not r3).
+func TestLineageGapBetweenSourceAndCopy(t *testing.T) {
+	st := store.NewMemoryStore()
+	repo, err := fs.CreateRepo(st, "r", 4096, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r1, _ := repo.CommitTxn(0, []fs.Change{
+		{Path: "/trunk", Action: fs.ActionAdd, Kind: fs.KindDir, Props: map[string]string{}},
+		{Path: "/trunk/a.txt", Action: fs.ActionAdd, Kind: fs.KindFile, Data: []byte("a\n")},
+	}, nil)
+	r2, _ := repo.CommitTxn(r1, []fs.Change{
+		{Path: "/trunk/a.txt", Action: fs.ActionModify, Kind: fs.KindFile, Data: []byte("a2\n")},
+	}, nil)
+	r3, err := repo.CommitTxn(r2, []fs.Change{
+		{Path: "/branch", Action: fs.ActionCopy, Kind: fs.KindDir, CopyFromPath: "/trunk", CopyFromRev: r1},
+		{Path: "/branch/a.txt", Action: fs.ActionCopy, Kind: fs.KindFile, CopyFromPath: "/trunk/a.txt", CopyFromRev: r2},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := lineagePaths(repo, "/branch", r3, r1)
+	want := map[uint64]string{r3: "/branch", r2: "", r1: "/trunk"}
+	for rev, p := range want {
+		if got[rev] != p {
+			t.Errorf("rev %d = %q, want %q (all: %v)", rev, got[rev], p, got)
+		}
+	}
+}
