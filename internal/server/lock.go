@@ -38,6 +38,14 @@ func (s *Server) handleLockUnlock(w http.ResponseWriter, r *http.Request, res re
 }
 
 func (s *Server) handleLock(w http.ResponseWriter, r *http.Request, res resource) {
+	// Locking requires an authenticated principal when the repo has auth
+	// configured; otherwise the lockowner would be meaningless and anonymous
+	// callers could lock any path. Challenge (401) so the svn client retries
+	// with credentials, then the owner is the real user.
+	if s.cfg.authFor(res.repo) != nil && IdentityFrom(r.Context()).Username == "" {
+		s.unauthorized(w)
+		return
+	}
 	// The lock owner must be the authenticated principal, never the client's
 	// <D:owner> (svn lock -m puts the comment there, and LOCK may arrive
 	// without credentials / challenge). Anonymous -> "anonymous".
@@ -78,6 +86,10 @@ func (s *Server) handleLock(w http.ResponseWriter, r *http.Request, res resource
 }
 
 func (s *Server) handleUnlock(w http.ResponseWriter, r *http.Request, res resource) {
+	if s.cfg.authFor(res.repo) != nil && IdentityFrom(r.Context()).Username == "" {
+		s.unauthorized(w)
+		return
+	}
 	path := res.path
 	if path == "" {
 		path = "/"
