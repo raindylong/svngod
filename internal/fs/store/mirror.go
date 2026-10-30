@@ -157,6 +157,22 @@ func (m *MirrorStore) Get(ctx context.Context, key string, rng *Range) ([]byte, 
 		b, err := p.Get(ctx, key, rng)
 		if err != nil {
 			m.markDown(pi)
+			// Failover for reads: the primary's control key (e.g. current) is
+			// unavailable, so fall back to a healthy standby mirror so HEAD
+			// lookups still work. Writes are unaffected (Put still fails when
+			// the primary is down, a sane degraded mode).
+			n := len(m.mirrors)
+			for step := 1; step < n; step++ {
+				idx := (pi + step) % n
+				if !m.isHealthy(idx) {
+					continue
+				}
+				bb, e := m.mirrors[idx].Get(ctx, key, rng)
+				if e == nil {
+					return bb, nil
+				}
+				m.markDown(idx)
+			}
 			return nil, err
 		}
 		return b, nil
