@@ -734,6 +734,9 @@ func (r *Repo) applyChange(root *tnode, ch *Change) error {
 		}
 		cp := deepCopy(src)
 		cp.dirty = true
+		// copyfrom is the source node's own revision, exactly as svn records
+		// it; children that were updated after the parent's source revision
+		// then show up as "replaced" with their own copy source.
 		cp.copyFrom = &src.id
 		cp.copyFromPath = ch.CopyFromPath
 		if err := r.ensureDir(parent); err != nil {

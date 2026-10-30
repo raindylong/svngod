@@ -863,6 +863,54 @@ func (s *Server) logChangedPaths(b *strings.Builder, repo *fs.Repo, rev uint64, 
 	if changes == nil {
 		return
 	}
+	// A directory copy is ONE change: its subtree comes with it. svn only
+	// lists descendants whose content differs from the copy source (as
+	// replaced), never as plain additions; dumping every child made svn log -v
+	// and dump streams disagree with the reference implementation.
+	type copyRoot struct {
+		path, src string
+		srcRev    uint64
+	}
+	var roots []copyRoot
+	for p, ch := range changes {
+		if ch.action != chAdded {
+			continue
+		}
+		if nr, err := repo.Resolve(rev, p); err == nil && nr.CopyFrom != nil && nr.CopyFromPath != "" {
+			roots = append(roots, copyRoot{path: p, src: nr.CopyFromPath, srcRev: nr.CopyFrom.Rev})
+		}
+	}
+	for _, cr := range roots {
+		for p := range changes {
+			if !strings.HasPrefix(p, cr.path+"/") {
+				continue
+			}
+			suffix := p[len(cr.path):]
+			nr, err := repo.Resolve(rev, p)
+			if err != nil {
+				continue
+			}
+			// Redundant copy node (the client re-copies every child) or the
+			// very same object as the source: not a distinct change.
+			if nr.CopyFrom != nil && nr.CopyFromPath == cr.src+suffix && nr.CopyFrom.Rev == cr.srcRev {
+				delete(changes, p)
+				continue
+			}
+			src, serr := repo.Resolve(cr.srcRev, cr.src+suffix)
+			if serr == nil && src.Node == nr.Node {
+				delete(changes, p)
+				continue
+			}
+			if serr != nil {
+				// Not part of the copy source (added after the copy): a plain
+				// addition, not a replacement.
+				continue
+			}
+			// Present in the source but different here: svn reports replaced.
+			changes[p] = change{action: chReplaced, kind: nr.Kind,
+				textMods: nr.Kind == fs.KindFile, propMods: false}
+		}
+	}
 	paths := make([]string, 0, len(changes))
 	for p := range changes {
 		paths = append(paths, p)
