@@ -62,7 +62,10 @@ func NewS3Store(cfg S3Config) (*S3Store, error) {
 		// bucket-root HEAD probe with a 301 redirect even though object-path
 		// requests work fine. Treat such gateway-level redirects as "bucket
 		// exists" and let the first object write surface a real problem.
-		if merr := minio.ToErrorResponse(err); merr.StatusCode == 301 || merr.StatusCode == 307 || merr.StatusCode == 405 {
+		if merr := minio.ToErrorResponse(err); merr.StatusCode == 301 || merr.StatusCode == 307 || merr.StatusCode == 405 || merr.StatusCode == 403 || merr.StatusCode == 401 {
+			// Gateway-level redirects and RustFS denying bucket-root HEAD
+			// probes are both compatible with fully-working object-path I/O;
+			// let the first object write surface a real problem.
 			exists = true
 		} else {
 			return nil, fmt.Errorf("store: check bucket %s: %w", cfg.Bucket, err)
