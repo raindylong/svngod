@@ -13,6 +13,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"path/filepath"
@@ -36,10 +37,27 @@ type options struct {
 	bucket    string
 	prefix    string
 	useSSL    bool
+	mirrorFile string
+}
+
+// mirrorEntry is one backend in a --mirror-file JSON array (same shape as the
+// svngod config "mirrors" list): {"type":"file","root":...} or
+// {"type":"s3","endpoint":...,"access":...,"secret":...,"bucket":...,"ssl":...}.
+type mirrorEntry struct {
+	Type     string `json:"type"`
+	Root     string `json:"root"`
+	Endpoint string `json:"endpoint"`
+	Access   string `json:"access"`
+	Secret   string `json:"secret"`
+	Bucket   string `json:"bucket"`
+	SSL      bool   `json:"ssl"`
 }
 
 func (o *options) repoStore(localPath string) (store.Store, string, error) {
 	name := filepath.Base(localPath)
+	if o.mirrorFile != "" {
+		return o.mirrorStore(name)
+	}
 	if o.endpoint == "" {
 		// localPath is <parent>/<repoName>; base is the parent directory so the
 		// same store layout is shared with the server (--repo-root <parent>).
@@ -68,6 +86,46 @@ func (o *options) repoStore(localPath string) (store.Store, string, error) {
 	return st, prefix, nil
 }
 
+// mirrorStore builds a MirrorStore from a --mirror-file JSON array so the repo
+// can be created once across a local-primary + S3-standby (or any mix) set.
+func (o *options) mirrorStore(name string) (store.Store, string, error) {
+	data, err := os.ReadFile(o.mirrorFile)
+	if err != nil {
+		return nil, "", err
+	}
+	var entries []mirrorEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, "", fmt.Errorf("parse --mirror-file: %v", err)
+	}
+	ms := make([]store.Store, 0, len(entries))
+	for _, e := range entries {
+		if e.Type == "s3" {
+			st, err := store.NewS3Store(store.S3Config{
+				Endpoint:  e.Endpoint,
+				AccessKey: e.Access,
+				SecretKey: e.Secret,
+				Bucket:    e.Bucket,
+				Region:    "us-east-1",
+				UseSSL:    e.SSL,
+			})
+			if err != nil {
+				return nil, "", err
+			}
+			ms = append(ms, st)
+		} else {
+			st, err := store.NewFileStore(e.Root)
+			if err != nil {
+				return nil, "", err
+			}
+			ms = append(ms, st)
+		}
+	}
+	if len(ms) < 2 {
+		return nil, "", fmt.Errorf("--mirror-file requires at least 2 backends (got %d)", len(ms))
+	}
+	return store.NewMirror(ms), "repos/" + name, nil
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -84,6 +142,7 @@ func main() {
 	fs.StringVar(&o.bucket, "bucket", "", "S3 bucket")
 	fs.StringVar(&o.prefix, "prefix", "", "S3 repo prefix")
 	fs.BoolVar(&o.useSSL, "ssl", false, "use https for S3")
+	fs.StringVar(&o.mirrorFile, "mirror-file", "", "JSON array of backends to create a mirror store (local-primary + S3-standby etc.)")
 	var output, input string
 	if cmd == "dump" {
 		fs.StringVar(&output, "output", "", "write dump to file (default stdout)")
@@ -120,7 +179,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `svnadmin - svngod repository administration
 
 usage:
-  svnadmin create [s3 flags] <repo>
+  svnadmin create [s3 flags | --mirror-file FILE] <repo>
   svnadmin dump   [--output FILE] [s3 flags] <repo>
   svnadmin load   [--input FILE] [s3 flags] <repo>
   svnadmin verify [s3 flags] <repo>   # integrity walk; prints corrupted nodes
