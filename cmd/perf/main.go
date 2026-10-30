@@ -73,7 +73,7 @@ func main() {
 	}
 	total := time.Since(start)
 	fmt.Printf("\nHEAD=%d shards=%d total=%.2fs avg=%.3fms/rev p99>=%.1fms\n",
-		head, head/4096+1, total.Seconds(), float64(total.Milliseconds())/float64(n), p99.Milliseconds())
+		head, head/4096+1, total.Seconds(), float64(total.Milliseconds())/float64(n), float64(p99.Milliseconds()))
 
 	// correctness: resolved content matches the last revision.
 	nr, err := repo.Resolve(head, "/hello.txt")
