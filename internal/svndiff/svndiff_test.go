@@ -112,3 +112,50 @@ func TestVersion(t *testing.T) {
 		t.Fatalf("non-delta: got %d", v)
 	}
 }
+
+// TestApplyV0LiteralStartingWithZlibHeader guards against sniffing v0 data
+// sections for a zlib header: random binary whose first bytes look like
+// 0x78 0x?? must round-trip unchanged.
+func TestApplyV0LiteralStartingWithZlibHeader(t *testing.T) {
+	src := []byte("base")
+	tgt := append([]byte{0x78, 0x9c}, bytes.Repeat([]byte("payload "), 40)...)
+	delta, err := Encode(src, tgt)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	got, err := Apply(src, delta)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if !bytes.Equal(got, tgt) {
+		t.Fatalf("round-trip mismatch: got %d bytes, want %d", len(got), len(tgt))
+	}
+}
+
+// TestEncodeLargeLocalEditIsSmall pins the delta-size behaviour for a large
+// binary file with a small edit: the encoder used to rebuild a full source
+// index per window (O(n^2)) and, after four-byte coincidences, emit megabytes
+// of literal data. Both regressions show up here.
+func TestEncodeLargeLocalEditIsSmall(t *testing.T) {
+	r := rand.New(rand.NewSource(7))
+	src := make([]byte, 2<<20)
+	r.Read(src)
+	tgt := append([]byte(nil), src...)
+	for i := 500_000; i < 501_000; i++ {
+		tgt[i] = byte(r.Intn(256))
+	}
+	delta, err := Encode(src, tgt)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if max := 64 << 10; len(delta) > max {
+		t.Fatalf("delta too large for a 1000-byte edit: %d bytes (max %d)", len(delta), max)
+	}
+	got, err := Apply(src, delta)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if !bytes.Equal(got, tgt) {
+		t.Fatal("round-trip mismatch")
+	}
+}

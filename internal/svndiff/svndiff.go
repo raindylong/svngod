@@ -25,26 +25,11 @@ import (
 	"github.com/pierrec/lz4/v4"
 )
 
-// maybeInflate decompresses b when it carries a zlib header; a stream without
-// one is returned unchanged. svn clients send the ins/data sections of an
-// svndiff window zlib-compressed by default.
-func maybeInflate(b []byte) ([]byte, error) {
-	if len(b) >= 2 && b[0] == 0x78 && b[1]&0x20 == 0 {
-		r, err := zlib.NewReader(bytes.NewReader(b))
-		if err != nil {
-			return nil, err
-		}
-		defer r.Close()
-		return io.ReadAll(r)
-	}
-	return b, nil
-}
-
 // decompressSeg decompresses an svndiff ins/data section according to the
 // window version, using subversion's exact semantics (svn__compress_zlib /
 // svn__compress_lz4 in libsvn_subr/compress_{zlib,lz4}.c):
 //
-//   segment = svn__encode_uint(original_len) ++ payload
+//	segment = svn__encode_uint(original_len) ++ payload
 //
 // where payload is the raw (uncompressed) data when the original length is
 // small (< MIN_COMPRESS_SIZE = 512 for zlib) or when compression did not help
@@ -56,7 +41,10 @@ func maybeInflate(b []byte) ([]byte, error) {
 // into exactly original_len bytes (svn__decompress_zlib / svn__decompress_lz4).
 func decompressSeg(version byte, b []byte) ([]byte, error) {
 	if version == 0 {
-		return maybeInflate(b)
+		// v0 sections are raw opcodes/data by definition. Sniffing for a zlib
+		// header here (the previous behaviour) corrupts random binary data
+		// whose first bytes happen to look like 0x78 0x??.
+		return b, nil
 	}
 	if len(b) == 0 {
 		return nil, errors.New("svndiff: empty compressed section")
@@ -113,8 +101,12 @@ const (
 // windowSize is the target window size used by the encoder.
 const windowSize = 102400
 
-// minMatch is the minimum match length to emit a copy_from_source op.
-const minMatch = 4
+// minMatch is the minimum match length to emit a copy_from_source op. It must
+// exceed the instruction cost (opcode + offset varint) and be long enough that
+// accidental four-byte coincidences in binary data do not derail the encoder
+// (a 4-byte hit is cheaper to emit as literals, and jumping to it loses the
+// expected-offset alignment, producing multi-megabyte literal runs).
+const minMatch = 8
 
 // Action codes (mirror enum svn_delta_action).
 const (
@@ -211,39 +203,76 @@ func encodeInstruction(buf *bytes.Buffer, it instr) {
 	}
 }
 
-// matchWindow computes copy_from_source / copy_from_new instructions for one
-// target window against the whole source.
-func matchWindow(src, tview []byte) ([]instr, []byte) {
-	// Index source by 3-byte hash.
-	posByHash := make(map[uint32][]int)
-	if len(src) >= 3 {
-		for i := 0; i+3 <= len(src); i++ {
-			h := hash3(src[i:])
-			posByHash[h] = append(posByHash[h], i)
-		}
-	}
-	findMatch := func(t []byte) (int, int) {
-		if len(t) < 3 {
-			return 0, 0
-		}
-		h := hash3(t)
-		bestLen, bestOff := 0, -1
-		cands := posByHash[h]
-		if len(cands) > 64 {
-			cands = cands[:64] // bound worst-case matching cost
-		}
-		for _, p := range cands {
-			l := 0
-			for l < len(t) && p+l < len(src) && t[l] == src[p+l] {
-				l++
-			}
-			if l > bestLen {
-				bestLen, bestOff = l, p
-			}
-		}
-		return bestLen, bestOff
-	}
+// srcIndex is a bounded, fixed-size index of the source text for match
+// finding. It is built once per Encode call: rebuilding a full hash map for
+// every 100 KiB target window made encoding a 30 MiB file take minutes
+// (O(src_len * windows) map inserts). Two slots per hash give a little
+// slack against collisions while keeping memory at 8 MiB.
+type srcIndex struct {
+	src []byte
+	tab []int32 // two slots per bucket, storing position+1 (0 = empty)
+}
 
+const srcIndexBits = 20 // 1<<20 buckets -> 2M int32 = 8 MiB
+
+func newSrcIndex(src []byte) *srcIndex {
+	ix := &srcIndex{src: src, tab: make([]int32, 2<<srcIndexBits)}
+	if len(src) < 4 {
+		return ix
+	}
+	mask := uint32(1<<srcIndexBits - 1)
+	for i := 0; i+4 <= len(src); i++ {
+		h := hash4(src[i:])
+		h ^= h >> 13
+		b := (h & mask) * 2
+		// Keep the two most recent positions for this hash.
+		ix.tab[b+1] = ix.tab[b]
+		ix.tab[b] = int32(i + 1)
+	}
+	return ix
+}
+
+// findMatch returns (length, offset) of the longest source match for t.
+func (ix *srcIndex) findMatch(t []byte) (int, int) {
+	if len(t) < 4 || len(ix.tab) == 0 {
+		return 0, 0
+	}
+	h := hash4(t)
+	h ^= h >> 13
+	mask := uint32(1<<srcIndexBits - 1)
+	b := (h & mask) * 2
+	bestLen, bestOff := 0, -1
+	for _, raw := range ix.tab[b : b+2] {
+		if raw == 0 {
+			continue
+		}
+		p := int(raw - 1)
+		if p < 0 || p+4 > len(ix.src) {
+			continue
+		}
+		l := 0
+		for l < len(t) && p+l < len(ix.src) && t[l] == ix.src[p+l] {
+			l++
+		}
+		if l > bestLen {
+			bestLen, bestOff = l, p
+		}
+	}
+	return bestLen, bestOff
+}
+
+// hash4 hashes four source bytes; minMatch is 4, and four-byte keys make
+// collisions rare enough that a small fixed table still finds real matches.
+func hash4(b []byte) uint32 {
+	return (uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])) * 2654435761
+}
+
+// matchWindow computes copy_from_source / copy_from_new instructions for one
+// target window. expected is the source offset that corresponds to tview[0]
+// (carried across windows); it lets the encoder follow a local edit by
+// verifying one candidate before falling back to the hash index, which is
+// what keeps deltas small for large files with small changes.
+func matchWindow(ix *srcIndex, tview []byte, expected int) ([]instr, []byte, int) {
 	var ops []instr
 	var newData []byte
 	newStart := -1
@@ -253,26 +282,43 @@ func matchWindow(src, tview []byte) ([]instr, []byte) {
 			newStart = -1
 		}
 	}
+	matchLen := func(p int, t []byte) int {
+		l := 0
+		for l < len(t) && p+l < len(ix.src) && t[l] == ix.src[p+l] {
+			l++
+		}
+		return l
+	}
 	for i := 0; i < len(tview); {
-		bestLen, bestOff := findMatch(tview[i:])
+		// Prefer the position predicted from the previous copy/literal run.
+		if expected >= 0 && expected < len(ix.src) && i+minMatch <= len(tview) {
+			if l := matchLen(expected, tview[i:]); l >= minMatch {
+				flushNew()
+				ops = append(ops, instr{action: actionSource, offset: uint64(expected), length: uint64(l)})
+				i += l
+				expected += l
+				continue
+			}
+		}
+		bestLen, bestOff := ix.findMatch(tview[i:])
 		if bestLen >= minMatch {
 			flushNew()
 			ops = append(ops, instr{action: actionSource, offset: uint64(bestOff), length: uint64(bestLen)})
 			i += bestLen
+			expected = bestOff + bestLen
 		} else {
 			if newStart < 0 {
 				newStart = len(newData)
 			}
 			newData = append(newData, tview[i])
 			i++
+			if expected >= 0 {
+				expected++
+			}
 		}
 	}
 	flushNew()
-	return ops, newData
-}
-
-func hash3(b []byte) uint32 {
-	return uint32(b[0])<<16 | uint32(b[1])<<8 | uint32(b[2])
+	return ops, newData, expected
 }
 
 // Encode produces a v0 svndiff delta transforming src into tgt.
@@ -281,13 +327,17 @@ func Encode(src, tgt []byte) ([]byte, error) {
 	out.WriteString("SVN")
 	out.WriteByte(0)
 
+	// One index for the whole source; windows reuse it (see srcIndex).
+	ix := newSrcIndex(src)
+	expected := 0 // source offset aligned with the target position
 	for base := 0; base < len(tgt); base += windowSize {
 		end := base + windowSize
 		if end > len(tgt) {
 			end = len(tgt)
 		}
 		tview := tgt[base:end]
-		ops, newData := matchWindow(src, tview)
+		ops, newData, next := matchWindow(ix, tview, expected)
+		expected = next
 
 		var ins bytes.Buffer
 		for _, it := range ops {
@@ -295,7 +345,7 @@ func Encode(src, tgt []byte) ([]byte, error) {
 		}
 
 		// window header: sview_offset, sview_len, tview_len, ins_len, data_len
-		writeUint(&out, 0)            // sview_offset (whole source)
+		writeUint(&out, 0)                // sview_offset (whole source)
 		writeUint(&out, uint64(len(src))) // sview_len
 		writeUint(&out, uint64(len(tview)))
 		writeUint(&out, uint64(ins.Len()))
