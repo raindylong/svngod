@@ -62,6 +62,8 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request, res resour
 		s.reportGetLocations(w, repo, base, res.path, body)
 	case "get-locks-report", "get-locks":
 		s.reportGetLocks(w, repo, res.repo, res.path, body)
+	case "get-mergeinfo-report", "get-mergeinfo":
+		s.reportGetMergeinfo(w, repo, res.path, body)
 	default:
 		http.Error(w, "unsupported REPORT: "+root.XMLName.Local, http.StatusBadRequest)
 	}
@@ -871,4 +873,16 @@ func (s *Server) reportGetLocks(w http.ResponseWriter, repo *fs.Repo, repoName, 
 	b.WriteString("</S:locks>\n")
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 	fmt.Fprint(w, b.String())
+}
+
+// reportGetMergeinfo answers a get-mergeinfo REPORT. svngod stores no
+// svn:mergeinfo properties (no merge-tracking data), so the report is empty;
+// answering it (rather than 400) lets `svn mergeinfo` / `svn merge --dry-run`
+// complete with "no mergeinfo found" instead of a client protocol error.
+func (s *Server) reportGetMergeinfo(w http.ResponseWriter, repo *fs.Repo, urlPath string, body []byte) {
+	b := `<?xml version="1.0" encoding="utf-8"?>` + "\n" +
+		`<S:mergeinfo-report xmlns:S="svn:" xmlns:D="` + NS_DAV + `">` + "\n" +
+		`</S:mergeinfo-report>` + "\n"
+	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+	fmt.Fprint(w, b)
 }
