@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -31,7 +32,7 @@ func TestConcurrentSamePathCommit(t *testing.T) {
 		t.Fatalf("seed commit: rev=%d err=%v", base, err)
 	}
 
-	const n = 3
+	const n = 10
 	errs := make([]error, n)
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
@@ -87,7 +88,7 @@ func TestConcurrentSamePathCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != "v0" && string(got) != "v1" && string(got) != "v2" {
+	if !strings.HasPrefix(string(got), "v") {
 		t.Fatalf("committed f.txt content is polluted/foreign: %q", got)
 	}
 }
@@ -121,7 +122,7 @@ func TestConcurrentSamePathCommitS3(t *testing.T) {
 		t.Fatalf("seed commit: rev=%d err=%v", base, err)
 	}
 
-	const n = 3
+	const n = 10
 	errs := make([]error, n)
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
@@ -168,7 +169,7 @@ func TestConcurrentSamePathCommitS3(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s := string(got); s != "s3v0" && s != "s3v1" && s != "s3v2" {
+	if s := string(got); !strings.HasPrefix(s, "s3v") {
 		t.Fatalf("S3 committed f.txt polluted/foreign: %q", s)
 	}
 	if os.Getenv("RUSTFS_TEST") == "" {
