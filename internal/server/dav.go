@@ -301,6 +301,10 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request, res reso
 	}
 
 	b.WriteString("</D:multistatus>\n")
+	if e := s.getLock(res.repo, path); e != nil {
+		w.Header().Set("X-SVN-Lock-Owner", e.owner)
+		w.Header().Set("X-SVN-Creation-Date", e.created.UTC().Format("2006-01-02T15:04:05.000000Z"))
+	}
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 	writeDAVCapabilities(w.Header())
 	w.WriteHeader(http.StatusMultiStatus)

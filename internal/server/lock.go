@@ -149,6 +149,10 @@ func lockTokenMatches(ifHeader, token string) bool {
 
 // writeLockDiscovery writes a 200 prop response with a lockdiscovery block.
 func (s *Server) writeLockDiscovery(w http.ResponseWriter, res resource, e *lockEntry) {
+	// svn reads the lock owner and creation time from these headers (the
+	// DAV:owner element carries the client's comment, not the username).
+	w.Header().Set("X-SVN-Lock-Owner", e.owner)
+	w.Header().Set("X-SVN-Creation-Date", e.created.UTC().Format("2006-01-02T15:04:05.000000Z"))
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
 	b.WriteString(`<D:prop xmlns:D="` + NS_DAV + `">` + "\n")
@@ -174,11 +178,32 @@ func (s *Server) writeLockDiscovery(w http.ResponseWriter, res resource, e *lock
 	io.WriteString(w, b.String())
 }
 
-// getLock returns the lock on a repo path, if any.
+// expired reports whether the lock's timeout has elapsed.
+func (e *lockEntry) expired() bool {
+	return e.timeout > 0 && time.Since(e.created) > time.Duration(e.timeout)*time.Second
+}
+
+// getLock returns the lock on a repo path, if any. Expired locks are removed
+// lazily so a leftover entry cannot block commits forever.
 func (s *Server) getLock(repo, path string) *lockEntry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.locks[lockKey(repo, path)]
+	return s.getLockLocked(repo, path)
+}
+
+// getLockLocked is getLock for callers that already hold s.mu (commit
+// handlers hold it while validating a transaction).
+func (s *Server) getLockLocked(repo, path string) *lockEntry {
+	key := lockKey(repo, path)
+	e, ok := s.locks[key]
+	if !ok {
+		return nil
+	}
+	if e.expired() {
+		delete(s.locks, key)
+		return nil
+	}
+	return e
 }
 
 // writeActivelock appends a DAV lockdiscovery/activelock block for a lock.

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"log"
@@ -112,11 +113,16 @@ func OpenRepo(st store.Store, prefix string) (*Repo, error) {
 
 func randomUUID() string {
 	b := make([]byte, 16)
-	// crypto/rand would be used in production; a fixed scheme is fine for
-	// this foundation layer (uuid uniqueness is not a correctness property).
-	for i := range b {
-		b[i] = byte((i*31 + 7) & 0xff)
+	if _, err := rand.Read(b); err != nil {
+		// Extremely unlikely (no entropy source); fall back to the clock so
+		// repositories still get distinct ids.
+		now := uint64(time.Now().UnixNano())
+		for i := 0; i < 8; i++ {
+			b[i] = byte(now >> (8 * i))
+		}
 	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 

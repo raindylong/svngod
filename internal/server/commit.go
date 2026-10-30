@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/xml"
@@ -278,6 +279,11 @@ func (s *Server) handleProppatch(w http.ResponseWriter, r *http.Request, res res
 			io.WriteString(w, b.String())
 			return
 		}
+		if e := s.getLockLocked(res.repo, res.path); e != nil && !lockTokenMatches(r.Header.Get("If"), e.token) {
+			s.mu.Unlock()
+			http.Error(w, "Locked", http.StatusLocked)
+			return
+		}
 		ch := tx.changeFor(res.path)
 		// A node-property PROPPATCH may be the only change to this path (no
 		// PUT/MKCOL); inherit its kind from the base revision so the commit
@@ -343,6 +349,13 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 	if err != nil {
 		s.mu.Unlock()
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if e := s.getLockLocked(res.repo, res.path); e != nil && !lockTokenMatches(r.Header.Get("If"), e.token) {
+		// mod_dav_svn answers 423 here; the client reports "no lock token
+		// available" instead of silently overwriting a locked file.
+		s.mu.Unlock()
+		http.Error(w, "Locked", http.StatusLocked)
 		return
 	}
 	ch := tx.changeFor(res.path)
@@ -439,6 +452,10 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, res resour
 		http.Error(w, "DELETE only applies to a transaction working resource", http.StatusBadRequest)
 		return
 	}
+	if e := s.getLockLocked(res.repo, res.path); e != nil && !lockTokenMatches(r.Header.Get("If"), e.token) {
+		http.Error(w, "Locked", http.StatusLocked)
+		return
+	}
 	s.mu.Lock()
 	tx, ok := s.txns[res.uuid]
 	if !ok {
@@ -516,6 +533,11 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 			if !az.Authorize(user, res.repo, ch.Path, true) {
 				s.mu.Unlock()
 				http.Error(w, "Access forbidden to "+ch.Path, http.StatusForbidden)
+				return
+			}
+			if e := s.getLockLocked(res.repo, ch.Path); e != nil && !bytes.Contains(body, []byte(e.token)) {
+				s.mu.Unlock()
+				http.Error(w, "Locked: "+ch.Path, http.StatusLocked)
 				return
 			}
 			if ch.Action == fs.ActionCopy && ch.CopyFromPath != "" &&

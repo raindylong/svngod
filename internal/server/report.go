@@ -1464,6 +1464,9 @@ func (s *Server) reportGetLocks(w http.ResponseWriter, repo *fs.Repo, repoName, 
 			}
 		}
 		e := s.locks[key]
+		if e.expired() {
+			continue
+		}
 		b.WriteString("  <S:lock>\n")
 		b.WriteString("    <S:path>" + xmlEscape(p) + "</S:path>\n")
 		b.WriteString("    <S:token>" + xmlEscape(e.token) + "</S:token>\n")

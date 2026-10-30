@@ -176,7 +176,10 @@ func (s *S3Store) ListPrefix(ctx context.Context, prefix, continuation string, m
 	if max <= 0 {
 		max = 1000
 	}
-	opts := minio.ListObjectsOptions{Prefix: s.key(prefix), Recursive: true, MaxKeys: max}
+	// Ask for one extra key so "is there another page?" is decidable; with
+	// MaxKeys=max the slice can never exceed max and `next` stayed empty,
+	// truncating every listing (mirror repair only saw the first page).
+	opts := minio.ListObjectsOptions{Prefix: s.key(prefix), Recursive: true, MaxKeys: max + 1}
 	if continuation != "" {
 		opts.StartAfter = continuation // minio v7 auto-pages internally; StartAfter skips to resume
 	}
