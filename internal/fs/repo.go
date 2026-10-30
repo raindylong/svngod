@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -937,6 +938,59 @@ func (r *Repo) CollectLoose(ctx context.Context) (int, error) {
 		}
 	}
 	return deleted, nil
+}
+
+// CollectTxnData deletes content-addressed commit-session bodies that no
+// activity manifest references any more (aborted or finished commits leave
+// them behind because bodies are shared by hash). Manifests are scanned with
+// a small regexp so this layer does not depend on the server's JSON schema.
+func (r *Repo) CollectTxnData(ctx context.Context) (int, error) {
+	prefix := r.keys.Prefix + "/dav-txns/"
+	refRe := regexp.MustCompile(`"dataRef":"([0-9a-f]+)"`)
+	referenced := map[string]bool{}
+	var dataKeys []string
+	next := ""
+	for {
+		objs, n, err := r.store.ListPrefix(ctx, prefix, next, 500)
+		if err != nil {
+			return 0, err
+		}
+		for _, o := range objs {
+			rel := strings.TrimPrefix(o.Key, prefix)
+			if strings.HasPrefix(rel, "data/") {
+				dataKeys = append(dataKeys, o.Key)
+				continue
+			}
+			if !strings.HasSuffix(rel, ".json") {
+				continue
+			}
+			b, err := r.store.Get(ctx, o.Key, nil)
+			if err != nil {
+				continue
+			}
+			for _, m := range refRe.FindAllSubmatch(b, -1) {
+				referenced[string(m[1])] = true
+			}
+		}
+		if n == "" {
+			break
+		}
+		next = n
+	}
+	var victims []string
+	for _, k := range dataKeys {
+		ref := strings.TrimPrefix(k, prefix+"data/")
+		if !referenced[ref] {
+			victims = append(victims, k)
+		}
+	}
+	if len(victims) == 0 {
+		return 0, nil
+	}
+	if err := r.store.Delete(ctx, victims); err != nil {
+		return 0, err
+	}
+	return len(victims), nil
 }
 
 // GetRevProps returns a revision's properties (loose or packed).

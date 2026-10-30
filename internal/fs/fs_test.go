@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"svngod/internal/fs/store"
@@ -411,5 +412,42 @@ func TestCollectLooseRemovesPackedShards(t *testing.T) {
 		t.Fatalf("resolve loose: %v", err)
 	} else if txt, _ := repo.GetText(nr.Node); string(txt) != "x" {
 		t.Fatalf("loose text = %q", txt)
+	}
+}
+
+// TestCollectTxnData: content-addressed commit bodies referenced by an activity
+// manifest survive; orphaned ones (aborted commits) are removed.
+func TestCollectTxnData(t *testing.T) {
+	st := store.NewMemoryStore()
+	repo, err := CreateRepo(st, "r", 4096, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := repo.Keys().Prefix + "/dav-txns/"
+	ctx := context.Background()
+	keep := strings.Repeat("a", 40)
+	drop := strings.Repeat("b", 40)
+	if err := st.Put(ctx, base+"data/"+keep, []byte("live")); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Put(ctx, base+"data/"+drop, []byte("orphan")); err != nil {
+		t.Fatal(err)
+	}
+	manifest := `{"id":"u-1","txn":{"id":"txn-u-1","changes":[{"path":"/a","dataRef":"` + keep + `"}]}}`
+	if err := st.Put(ctx, base+"activity-u-1.json", []byte(manifest)); err != nil {
+		t.Fatal(err)
+	}
+	n, err := repo.CollectTxnData(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("removed %d, want 1", n)
+	}
+	if _, ok, _ := st.Head(ctx, base+"data/"+keep); !ok {
+		t.Fatal("referenced body was deleted")
+	}
+	if _, ok, _ := st.Head(ctx, base+"data/"+drop); ok {
+		t.Fatal("orphan body was kept")
 	}
 }

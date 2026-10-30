@@ -235,7 +235,11 @@ func doGC(o *options, repoName string) {
 	if err != nil {
 		fatal(err)
 	}
-	fmt.Printf("gc: removed %d loose objects from %q\n", n, repoName)
+	tn, err := repo.CollectTxnData(context.Background())
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Printf("gc: removed %d loose objects and %d orphaned txn bodies from %q\n", n, tn, repoName)
 }
 
 func doVerify(o *options, repoName string) {
