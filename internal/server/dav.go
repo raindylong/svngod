@@ -241,6 +241,10 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request, res reso
 			// When listing, parent href must use the same !svn/bln prefix as its
 			// children, else the client's svn_fspath__skip_ancestor assertion fails.
 			if err := s.propNode(&b, repo, base, res.repo, rev, path, nil, props, propnames, children); err != nil {
+				if errors.Is(err, fs.ErrPathNotFound) {
+					http.Error(w, "Not Found", http.StatusNotFound)
+					return
+				}
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -262,6 +266,10 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request, res reso
 		}
 	default:
 		if err := s.propNode(&b, repo, base, res.repo, rev, path, nil, props, propnames, depth == "1" || depth == "infinity"); err != nil {
+			if errors.Is(err, fs.ErrPathNotFound) {
+				http.Error(w, "Not Found", http.StatusNotFound)
+				return
+			}
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -320,9 +328,22 @@ func (s *Server) propVcc(b *strings.Builder, repo *fs.Repo, base, name string, r
 func (s *Server) basePathHref(base, rel string) string {
 	u, err := url.Parse(strings.TrimSuffix(base, "/"))
 	if err != nil || u.Path == "" {
-		return strings.TrimSuffix(base, "/") + "/" + rel
+		return strings.TrimSuffix(base, "/") + "/" + escapePathSegments(rel)
 	}
-	return strings.TrimSuffix(u.Path, "/") + "/" + strings.TrimPrefix(rel, "/")
+	return strings.TrimSuffix(u.Path, "/") + "/" + strings.TrimPrefix(escapePathSegments(rel), "/")
+}
+
+// escapePathSegments percent-escapes each path segment (URL-decoding-safe) so
+// non-ASCII (e.g. Chinese) file/dir names and spaces survive in href URLs that
+// the svn client round-trips through ra_serf.
+func escapePathSegments(p string) string {
+	segs := strings.Split(p, "/")
+	for i, s := range segs {
+		if s != "" {
+			segs[i] = url.PathEscape(s)
+		}
+	}
+	return strings.Join(segs, "/")
 }
 
 func (s *Server) baselineHrefPath(base string, rev uint64) string {
@@ -353,12 +374,11 @@ func (s *Server) propNode(b *strings.Builder, repo *fs.Repo, base, name string, 
 		rn, err := repo.Resolve(rev, path)
 		if err != nil {
 			if errors.Is(err, fs.ErrPathNotFound) {
-				// resource does not exist at this rev: emit 404 propstat
-				b.WriteString("  <D:response>\n")
-				b.WriteString("    <D:href>" + base + privateHref(rev, path) + "</D:href>\n")
-				b.WriteString("    <D:status>HTTP/1.1 404 Not Found</D:status>\n")
-				b.WriteString("  </D:response>\n")
-				return nil
+				// Resource does not exist at this rev: return the sentinel so the
+				// caller emits a plain HTTP 404. A multistatus-404 propstat here
+				// makes the client treat it as "versioned but missing vcc" and
+				// fail svn import / subdir ops with E175003.
+				return fs.ErrPathNotFound
 			}
 			return err
 		}

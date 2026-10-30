@@ -51,7 +51,7 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request, res resour
 		s.reportList(w, repo, base, res.repo, body)
 	case "file-revs-report", "get-file-revs-report", "get-file-revs":
 		s.reportFileRevs(w, repo, base, res.path, body)
-	case "get-locations", "get-locations-segments":
+	case "get-locations", "get-locations-segments", "get-location-segments":
 		s.reportGetLocations(w, repo, base, res.path, body)
 	default:
 		http.Error(w, "unsupported REPORT: "+root.XMLName.Local, http.StatusBadRequest)
@@ -238,7 +238,7 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 		if c.Kind == fs.KindDir {
 			if _, inBase := baseIdx[cpath]; inBase && !startEmpty {
 				// existing dir in client's WC -> open-directory (update semantics)
-				ver := base + "!svn/ver/" + strconv.FormatUint(rev, 10) + "/" + strings.TrimPrefix(cpath, "/")
+				ver := base + "!svn/ver/" + strconv.FormatUint(rev, 10) + "/" + strings.TrimPrefix(escapePathSegments(cpath), "/")
 				b.WriteString("    <S:open-directory name=\"" + xmlEscape(c.Name) + "\" rev=\"" + strconv.FormatUint(outRev, 10) + "\">\n")
 				b.WriteString("      <D:checked-in><D:href>" + xmlEscape(ver) + "</D:href></D:checked-in>\n")
 				writeEntryProps(b, rp, uuid, rev)
@@ -248,7 +248,7 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 				}
 				b.WriteString("    </S:open-directory>\n")
 			} else {
-				bc := base + "!svn/bc/" + strconv.FormatUint(rev, 10) + "/" + strings.TrimPrefix(cpath, "/")
+				bc := base + "!svn/bc/" + strconv.FormatUint(rev, 10) + "/" + strings.TrimPrefix(escapePathSegments(cpath), "/")
 				b.WriteString("    <S:add-directory name=\"" + xmlEscape(c.Name) + "\" bc-url=\"" + xmlEscape(bc) + "\">\n")
 				b.WriteString("      <D:checked-in><D:href>" + xmlEscape(bc) + "</D:href></D:checked-in>\n")
 				writeEntryProps(b, rp, uuid, rev)
@@ -299,7 +299,7 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 				// existing file in client's WC -> open-file (update semantics).
 				// add-file would make the client's add_file() editor skip the
 				// already-versioned file as an obstructing working copy.
-				ver := base + "!svn/ver/" + strconv.FormatUint(rev, 10) + "/" + strings.TrimPrefix(cpath, "/")
+				ver := base + "!svn/ver/" + strconv.FormatUint(rev, 10) + "/" + strings.TrimPrefix(escapePathSegments(cpath), "/")
 				ss := sha1.Sum(text)
 				// base-checksum validates the client's WC baseline: for an
 				// incremental update it is the baseline text's MD5; when
@@ -317,7 +317,7 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 				b.WriteString("      <S:prop><V:md5-checksum>" + md5hex + "</V:md5-checksum></S:prop>\n")
 				b.WriteString("    </S:open-file>\n")
 			} else {
-				bc := base + "!svn/bc/" + strconv.FormatUint(rev, 10) + "/" + strings.TrimPrefix(cpath, "/")
+				bc := base + "!svn/bc/" + strconv.FormatUint(rev, 10) + "/" + strings.TrimPrefix(escapePathSegments(cpath), "/")
 				b.WriteString("    <S:add-file name=\"" + xmlEscape(c.Name) + "\" sha1-checksum=\"" + sha1Hex(text) + "\">\n")
 				b.WriteString("      <D:checked-in><D:href>" + xmlEscape(bc) + "</D:href></D:checked-in>\n")
 				writeEntryProps(b, rp, uuid, rev)

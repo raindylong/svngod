@@ -699,6 +699,9 @@ func (r *Repo) applyChange(root *tnode, ch *Change) error {
 		cp.dirty = true
 		cp.copyFrom = &src.id
 		cp.copyFromPath = ch.CopyFromPath
+		if err := r.ensureDir(parent); err != nil {
+			return err
+		}
 		parent.children[name] = cp
 		parent.dirty = true
 	}
