@@ -202,6 +202,10 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request, res reso
 	if !ok {
 		return
 	}
+	if lbl := r.Header.Get("Label"); lbl != "" {
+		http.Error(w, "Label (version label) not supported", http.StatusBadRequest)
+		return
+	}
 	// parse requested props (allprop if empty body / no propfind element)
 	props, propnames, err := parsePropfind(r.Body)
 	if err != nil {

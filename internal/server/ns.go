@@ -19,7 +19,7 @@ const (
 // The DAV capabilities advertised in OPTIONS (RFC 3253 DeltaV + SVN extras).
 // svndiff1/svndiff2 advertise that we accept compressed (zlib/lz4) svndiff
 // windows on PUT; the svn client then picks v1/v2 instead of plain v0.
-const davCapabilities = "1, 2, 3, version-control, checkout, working-resource, merge, baseline, activity, version-controlled-collection, http://subversion.tigris.org/xmlns/dav/svn/svndiff1"
+const davCapabilities = "1, 2, 3, version-control, checkout, working-resource, merge, baseline, activity, version-controlled-collection, labeled-version, update, http://subversion.tigris.org/xmlns/dav/svn/svndiff1"
 
 // allowedMethods advertised in OPTIONS Allow.
 const allowedMethods = "OPTIONS, PROPFIND, GET, REPORT, MKACTIVITY, PROPPATCH, PUT, CHECKOUT, MERGE, DELETE, COPY, MOVE, LOCK, UNLOCK"

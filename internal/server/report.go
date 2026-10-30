@@ -30,6 +30,12 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request, res resour
 	if !ok {
 		return
 	}
+	// Respect (reject) the Label request header: svngod has no label/branch
+	// name space, so a Label-identified query cannot be honored.
+	if lbl := r.Header.Get("Label"); lbl != "" {
+		http.Error(w, "Label (version label) not supported", http.StatusBadRequest)
+		return
+	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -53,6 +59,8 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request, res resour
 		s.reportFileRevs(w, repo, base, res.path, body)
 	case "get-locations", "get-locations-segments", "get-location-segments":
 		s.reportGetLocations(w, repo, base, res.path, body)
+	case "get-locks-report", "get-locks":
+		s.reportGetLocks(w, repo, res.repo, res.path, body)
 	default:
 		http.Error(w, "unsupported REPORT: "+root.XMLName.Local, http.StatusBadRequest)
 	}
@@ -812,6 +820,45 @@ func (s *Server) reportGetLocations(w http.ResponseWriter, repo *fs.Repo, base s
 		b.WriteString(`  <S:location path="` + xmlEscape(p) + `" rev="` + strconv.FormatUint(rev, 10) + `"/>` + "\n")
 	}
 	b.WriteString("</S:get-locations-report>\n")
+	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+	fmt.Fprint(w, b.String())
+}
+
+// reportGetLocks answers a get-locks REPORT: the set of active locks for the
+// repository (or, if a <S:path> is given, locks at/under that path).
+func (s *Server) reportGetLocks(w http.ResponseWriter, repo *fs.Repo, repoName, urlPath string, body []byte) {
+	var root xmlEl
+	if err := xml.Unmarshal(body, &root); err != nil {
+		http.Error(w, "bad get-locks", http.StatusBadRequest)
+		return
+	}
+	filter := ""
+	if c, ok := root.child("path"); ok && strings.TrimSpace(c.Content) != "" {
+		filter = "/" + strings.Trim(strings.TrimSpace(c.Content), "/")
+	}
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
+	b.WriteString(`<S:locks xmlns:S="svn:" xmlns:D="` + NS_DAV + `">` + "\n")
+	s.mu.Lock()
+	prefix := repoName + "\x00"
+	for key, e := range s.locks {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		p := key[len(prefix):]
+		if filter != "" && p != filter && !strings.HasPrefix(p, filter+"/") {
+			continue
+		}
+		b.WriteString("  <S:lock path=\"" + xmlEscape(p) + "\">\n")
+		b.WriteString("    <D:locktype><D:write/></D:locktype>\n")
+		b.WriteString("    <D:lockowner>" + xmlEscape(e.owner) + "</D:lockowner>\n")
+		b.WriteString("    <D:depth>" + xmlEscape(e.depth) + "</D:depth>\n")
+		b.WriteString("    <D:timeout>Second-" + strconv.Itoa(e.timeout) + "</D:timeout>\n")
+		b.WriteString("    <D:locktoken><D:href>" + xmlEscape(e.token) + "</D:href></D:locktoken>\n")
+		b.WriteString("  </S:lock>\n")
+	}
+	s.mu.Unlock()
+	b.WriteString("</S:locks>\n")
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 	fmt.Fprint(w, b.String())
 }
