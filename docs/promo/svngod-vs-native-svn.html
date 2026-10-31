@@ -80,7 +80,7 @@ section{box-shadow:none;break-inside:avoid;page-break-inside:avoid}
 </section><section>
 <h2>六项可量化的优势</h2>
 <ul>
-<li><strong>一次请求，一个原子修订</strong>：svngocli 的 bundle 通道把整棵目录树打包成一个请求；30,000 个文件一次提交约 1.2 秒，服务端只产生一个修订，失败则整笔不落库。</li>
+<li><strong>一次请求，一个原子修订</strong>：svngocli 的 bundle 通道把整棵目录树打包成一个请求；30,000 个文件一次提交约 1.2 秒，服务端只产生一个修订，失败则整笔不落库。重复发布先协商 stat，只传变化文件，未变化的大文件零传输。</li>
 <li><strong>大文件分块去重，内存有界</strong>：大文件按内容定义切块（平均 1MiB），1GiB 上传约 10 秒（约 100 MiB/s），读取 648 MiB/s，峰值内存约 20 MiB；随机改写 10MiB 只新增约 12MiB。</li>
 <li><strong>HTTPv2 默认开启</strong>：与现代 svn 客户端自动协商，一次提交从“活动/检出的多轮往返”缩减为 create-txn + PUT + MERGE；<code>SVNGOD_HTTPV2=0</code> 可回退 v1。</li>
 <li><strong>崩溃原子性</strong>：提交租约串行化多副本收尾，token 幂等重试；上传中杀掉服务进程或提交中杀掉客户端，都不会留下半个修订。</li>
