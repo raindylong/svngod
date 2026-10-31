@@ -72,7 +72,9 @@ func parseResource(basePath, reqPath string) resource {
 		if len(priv) >= 2 {
 			return resource{typ: resActivity, repo: repo, uuid: priv[1]}
 		}
-	case "txn":
+	case "txn", "txr":
+		// txn is the transaction working-resource stub, txr its root; both
+		// name the same transaction.
 		if len(priv) >= 2 {
 			return resource{typ: resTxn, repo: repo, uuid: priv[1], path: "/" + strings.Join(priv[2:], "/")}
 		}

@@ -73,7 +73,7 @@ func TestCommitLeaseBusy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.CreateIfAbsent(context.Background(), r.keys.CommitLock(), []byte(fmt.Sprintf("%d other", time.Now().UnixNano()))); err != nil {
+	if err := st.CreateIfAbsent(context.Background(), r.keys.CommitLock(), []byte(fmt.Sprintf("other %d", time.Now().UnixNano()))); err != nil {
 		t.Fatal(err)
 	}
 	oldWait := commitLeaseWait

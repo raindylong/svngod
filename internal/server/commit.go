@@ -193,18 +193,22 @@ func (s *Server) handleCheckout(w http.ResponseWriter, r *http.Request, res reso
 	fmt.Fprintf(w, `<?xml version="1.0" encoding="utf-8"?><D:checkout-response xmlns:D="%s"></D:checkout-response>`, NS_DAV)
 }
 
-// extractActivityID pulls the uuid out of a Destination activity URL.
+// extractActivityID pulls the activity uuid out of a Destination activity URL
+// or, for HTTPv2, a transaction URL (!svn/txn/txn-<uuid> and its txr alias).
 func extractActivityID(dst string) string {
-	i := strings.Index(dst, "/!svn/act/")
-	if i < 0 {
-		return ""
+	markers := []string{"/!svn/act/", "/!svn/txn/", "/!svn/txr/"}
+	for _, marker := range markers {
+		i := strings.Index(dst, marker)
+		if i < 0 {
+			continue
+		}
+		rest := strings.Trim(dst[i+len(marker):], "/")
+		if j := strings.IndexAny(rest, "/?"); j >= 0 {
+			rest = rest[:j]
+		}
+		return strings.TrimPrefix(rest, "txn-")
 	}
-	rest := dst[i+len("/!svn/act/"):]
-	rest = strings.Trim(rest, "/")
-	if j := strings.IndexAny(rest, "/?"); j >= 0 {
-		rest = rest[:j]
-	}
-	return rest
+	return ""
 }
 
 // extractActivityFromBody reads the CHECKOUT request body and returns the

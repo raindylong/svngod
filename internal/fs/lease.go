@@ -39,7 +39,9 @@ func leaseTimestamp(payload string) (time.Time, bool) {
 	if len(fields) == 0 {
 		return time.Time{}, false
 	}
-	ns, err := strconv.ParseInt(fields[0], 10, 64)
+	// Payload is "<token> <unix-nanos>"; the token itself may contain dashes
+	// and digits, so the timestamp is always the last field.
+	ns, err := strconv.ParseInt(fields[len(fields)-1], 10, 64)
 	if err != nil {
 		return time.Time{}, false
 	}
@@ -78,11 +80,18 @@ func (r *Repo) acquireCommitLease(ctx context.Context) (func(), error) {
 }
 
 // breakCommitLease lets exactly one waiter remove a stale lease: the breaker
-// marker is created atomically, then the stale lock is deleted.
+// marker is created atomically, then the stale lock is deleted. A marker left
+// behind by a crashed breaker is itself broken after the same TTL, otherwise
+// one crash would permanently prevent stale leases from being reclaimed.
 func (r *Repo) breakCommitLease(ctx context.Context, key, token string) {
 	marker := key + ".break"
 	payload := []byte(fmt.Sprintf("%s %d", token, time.Now().UnixNano()))
 	if err := r.store.CreateIfAbsent(ctx, marker, payload); err != nil {
+		if cur, gerr := r.store.Get(ctx, marker, nil); gerr == nil {
+			if ts, ok := leaseTimestamp(string(cur)); !ok || time.Since(ts) > commitLeaseTTL {
+				_ = r.store.Delete(ctx, []string{marker})
+			}
+		}
 		return
 	}
 	_ = r.store.Delete(ctx, []string{key})

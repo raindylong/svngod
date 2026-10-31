@@ -123,6 +123,7 @@ func bodyOf(t *testing.T, resp *http.Response) string {
 }
 
 func TestOptionsCapabilities(t *testing.T) {
+	t.Setenv("SVNGOD_HTTPV2", "0")
 	ts, repo, base := testServer(t, "", "")
 	defer ts.Close()
 	resp := doRequest(t, "OPTIONS", base+"/svn/demo/", "", "", "", nil)

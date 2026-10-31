@@ -54,8 +54,17 @@ func (s *Server) handleOptions(w http.ResponseWriter, r *http.Request, res resou
 	h.Set("X-Svngod-Bundle", "1")
 	if httpV2Enabled() {
 		// HTTPv2 negotiation, byte-for-byte as mod_dav_svn 1.14 sends it:
-		// a repository-root path plus the supported POST transaction types.
-		h.Set("SVN-Repository-Root", strings.TrimSuffix(s.cfg.BasePath, "/")+"/"+res.repo)
+		// repository-relative URLs without a trailing slash (ra_serf asserts
+		// that stub values are canonical svn paths), and the supported POST
+		// transaction types. rev/rev-root and txn/txn-root are distinct stubs:
+		// the client joins a revision or txn name onto them.
+		pfx := strings.TrimSuffix(s.cfg.BasePath, "/") + "/" + res.repo
+		h.Set("SVN-Repository-Root", pfx)
+		h.Set("SVN-Me-Resource", pfx+"/!svn/me")
+		h.Set("SVN-Rev-Root-Stub", pfx+"/!svn/rvr")
+		h.Set("SVN-Rev-Stub", pfx+"/!svn/rev")
+		h.Set("SVN-Txn-Root-Stub", pfx+"/!svn/txr")
+		h.Set("SVN-Txn-Stub", pfx+"/!svn/txn")
 		h.Add("SVN-Supported-Posts", "create-txn")
 		h.Add("SVN-Supported-Posts", "create-txn-with-props")
 	}
