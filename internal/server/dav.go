@@ -474,8 +474,11 @@ func (s *Server) propNode(b *strings.Builder, repo *fs.Repo, base, name string, 
 	}
 	b.WriteString("      <D:getetag>" + etagFor(nr) + "</D:getetag>\n")
 	b.WriteString("      <D:version-controlled-configuration><D:href>" + base + "!svn/vcc/default</D:href></D:version-controlled-configuration>\n")
-	b.WriteString("      <D:version-name>" + strconv.FormatUint(rev, 10) + "</D:version-name>\n")
-	b.WriteString("      <D:checked-in><D:href>" + base + "!svn/bln/" + strconv.FormatUint(rev, 10) + "/" + escapePath(strings.TrimPrefix(path, "/")) + "</D:href></D:checked-in>\n")
+	// version-name is the node's last-changed revision, not the revision the
+	// URL pegs (a HEAD-relative PROPFIND on an untouched file must report the
+	// older rev, as mod_dav_svn does; svn info's "Last Changed Rev" reads it).
+	b.WriteString("      <D:version-name>" + strconv.FormatUint(nr.Node.Rev, 10) + "</D:version-name>\n")
+	b.WriteString("      <D:checked-in><D:href>" + base + "!svn/ver/" + strconv.FormatUint(nr.Node.Rev, 10) + "/" + escapePath(strings.TrimPrefix(path, "/")) + "</D:href></D:checked-in>\n")
 	b.WriteString("      <S:baseline-relative-path>" + escapePath(strings.TrimPrefix(path, "/")) + "</S:baseline-relative-path>\n")
 	// Last-changed metadata comes from the revision properties of the node-rev,
 	// not from node properties (svn:author is a revprop). Without this the

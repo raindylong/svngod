@@ -511,7 +511,7 @@ func (s *Server) ensureActivitiesLoaded(repoName string, repo *fs.Repo) {
 		if _, exists := s.activities[pa.ID]; exists {
 			continue
 		}
-		a := &activity{id: pa.ID, revProps: pa.RevProps}
+		a := &activity{id: pa.ID, repo: repoName, created: pa.Created, revProps: pa.RevProps}
 		if a.revProps == nil {
 			a.revProps = map[string]string{}
 		}
@@ -545,4 +545,53 @@ func loadChangeData(repo *fs.Repo, ch *txnChange) {
 	ch.data = data
 }
 
-var _ = time.Now
+// reapExpiredActivities drops commit sessions whose client gave up (or
+// crashed) more than sessionTTL ago. Startup already reaps them; this keeps a
+// long-running server from accumulating in-memory transactions and staged
+// store objects for the lifetime of the process.
+func (s *Server) reapExpiredActivities() {
+	now := time.Now().Unix()
+	var dead []*activity
+	s.mu.Lock()
+	for id, a := range s.activities {
+		if a.created <= 0 || now-a.created <= int64(sessionTTL/time.Second) {
+			continue
+		}
+		delete(s.activities, id)
+		if a.txn != nil {
+			delete(s.txns, a.txn.id)
+		}
+		dead = append(dead, a)
+	}
+	s.mu.Unlock()
+	for _, a := range dead {
+		log.Printf("txn: reaping expired session %s (repo %s)", a.id, a.repo)
+		if a.repo == "" {
+			continue
+		}
+		repo, err := s.cfg.OpenRepo(a.repo)
+		if err != nil {
+			log.Printf("txn: reap %s: open %s: %v", a.id, a.repo, err)
+			continue
+		}
+		s.dropActivityState(repo, a.id)
+	}
+}
+
+// RunMaintenance periodically reaps abandoned commit sessions. Call it once
+// (typically from main) with a process-lifetime context.
+func (s *Server) RunMaintenance(ctx context.Context, every time.Duration) {
+	if every <= 0 {
+		every = 10 * time.Minute
+	}
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.reapExpiredActivities()
+		}
+	}
+}

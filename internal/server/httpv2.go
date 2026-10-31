@@ -163,7 +163,7 @@ func (s *Server) createV2Txn(w http.ResponseWriter, r *http.Request, repo *fs.Re
 	if props == nil {
 		props = map[string]string{}
 	}
-	act := &activity{id: uuid, created: time.Now().Unix(), revProps: props,
+	act := &activity{id: uuid, repo: name, created: time.Now().Unix(), revProps: props,
 		txn: &txn{id: "txn-" + uuid, baseRev: head, changes: map[string]*txnChange{}, changesLoaded: true}}
 	s.mu.Lock()
 	s.activities[uuid] = act

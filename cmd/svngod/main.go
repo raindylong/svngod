@@ -16,14 +16,17 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"syscall"
 	"time"
 
 	"svngod/internal/auth"
@@ -176,6 +179,9 @@ func main() {
 	})
 
 	log.Printf("svngod listening on %s (base %s, repo-root %s)", o.addr, o.basePath, o.repoRoot)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go srv.RunMaintenance(ctx, 10*time.Minute)
 	if o.tlsCert != "" && o.tlsKey != "" {
 		log.Printf("serving HTTPS (cert %s)", o.tlsCert)
 		if err := http.ListenAndServeTLS(o.addr, o.tlsCert, o.tlsKey, srv.Handler()); err != nil {

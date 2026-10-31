@@ -25,6 +25,7 @@ import (
 // activity is a server-side commit session, keyed by the MKACTIVITY uuid.
 type activity struct {
 	id       string
+	repo     string            // repository name, for reaping staged objects
 	created  int64             // unix seconds; bounds abandoned sessions
 	revProps map[string]string // svn:log / svn:author / svn:date (set via PROPPATCH)
 	txn      *txn
@@ -114,7 +115,7 @@ func (s *Server) handleMkactivity(w http.ResponseWriter, r *http.Request, res re
 	}
 	s.mu.Lock()
 	if _, ok := s.activities[res.uuid]; !ok {
-		s.activities[res.uuid] = &activity{id: res.uuid, created: time.Now().Unix(), revProps: map[string]string{}}
+		s.activities[res.uuid] = &activity{id: res.uuid, repo: res.repo, created: time.Now().Unix(), revProps: map[string]string{}}
 	}
 	s.mu.Unlock()
 	s.persistActivity(repo, res.uuid)
