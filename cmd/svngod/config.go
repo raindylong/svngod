@@ -42,12 +42,14 @@ import (
 //	  ]
 //	}
 type fileConfig struct {
-	Addr     string     `json:"addr"`
-	BasePath string     `json:"base-path"`
-	Hooks    string     `json:"hooks"`
-	TLSCert  string     `json:"tls-cert"`
-	TLSKey   string     `json:"tls-key"`
-	Repos    []fileRepo `json:"repos"`
+	Addr     string `json:"addr"`
+	BasePath string `json:"base-path"`
+	Hooks    string `json:"hooks"`
+	TLSCert  string `json:"tls-cert"`
+	TLSKey   string `json:"tls-key"`
+	// MaxUploads bounds concurrent PUT/bundle bodies (0 = server default 16).
+	MaxUploads int        `json:"max-uploads"`
+	Repos      []fileRepo `json:"repos"`
 }
 
 type fileRepo struct {

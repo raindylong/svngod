@@ -54,6 +54,57 @@ func DeletePrefix(ctx context.Context, s Store, prefix string) error {
 	return nil
 }
 
+// ReconstructibleWriter stores state that the client can re-send after a
+// crash (DAV activity/transaction fragments, staged bodies). Such objects do
+// not need the fsync cost of committed revision data: losing them only makes
+// an uncommitted session restart.
+type ReconstructibleWriter interface {
+	PutReconstructible(ctx context.Context, key string, data []byte) error
+}
+
+// ReconstructibleStreamWriter is the streaming form of ReconstructibleWriter.
+type ReconstructibleStreamWriter interface {
+	PutFromReconstructible(ctx context.Context, key string, r io.Reader, size int64) error
+}
+
+// PutReconstructible writes session state, using the fast path when the store
+// offers one.
+func PutReconstructible(ctx context.Context, s Store, key string, data []byte) error {
+	if w, ok := s.(ReconstructibleWriter); ok {
+		return w.PutReconstructible(ctx, key, data)
+	}
+	return s.Put(ctx, key, data)
+}
+
+// PutFromReconstructible is the streaming form of PutReconstructible.
+func PutFromReconstructible(ctx context.Context, s Store, key string, r io.Reader, size int64) error {
+	if w, ok := s.(ReconstructibleStreamWriter); ok {
+		return w.PutFromReconstructible(ctx, key, r, size)
+	}
+	return s.PutFrom(ctx, key, r, size)
+}
+
+// ConditionalDeleter removes an object only if its current content matches
+// etag. Lease release uses it so a stale holder cannot delete a lock that a
+// new owner just acquired.
+type ConditionalDeleter interface {
+	DeleteIfMatch(ctx context.Context, key, etag string) error
+}
+
+// DeleteIfMatch removes key if its content hash equals etag. Stores without a
+// native conditional delete fall back to a CAS-to-tombstone followed by a
+// delete: the tombstone carries no timestamp, so a crashed deleter is treated
+// as stale by the next lease waiter.
+func DeleteIfMatch(ctx context.Context, s Store, key, etag string) error {
+	if cd, ok := s.(ConditionalDeleter); ok {
+		return cd.DeleteIfMatch(ctx, key, etag)
+	}
+	if _, err := s.CAS(ctx, key, etag, []byte("deleted")); err != nil {
+		return err
+	}
+	return s.Delete(ctx, []string{key})
+}
+
 // PrefixDeleter is implemented by stores that can drop a whole key prefix in
 // one operation. Session cleanup after a large commit would otherwise unlink
 // one object per changed file (tens of thousands on a 30k-file commit).
@@ -215,6 +266,18 @@ func (m *MemoryStore) CreateIfAbsent(_ context.Context, key string, data []byte)
 	copy(cp, data)
 	m.data[key] = cp
 	m.etag[key] = ContentETag(data)
+	return nil
+}
+
+func (m *MemoryStore) DeleteIfMatch(_ context.Context, key, etag string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.data[key]
+	if !ok || ContentETag(cur) != etag {
+		return ErrPreconditionFailed
+	}
+	delete(m.data, key)
+	delete(m.etag, key)
 	return nil
 }
 

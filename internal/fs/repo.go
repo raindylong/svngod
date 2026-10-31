@@ -736,11 +736,11 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 	// revision block before the `current` CAS is only safe if no second
 	// replica is doing the same for the same revision number.
 	ctxLease := context.Background()
-	releaseLease, lerr := r.acquireCommitLease(ctxLease)
+	lease, lerr := r.acquireCommitLease(ctxLease)
 	if lerr != nil {
 		return 0, lerr
 	}
-	defer releaseLease()
+	defer lease.Release(r.store)
 
 	if len(changes) == 0 {
 		return 0, errors.New("fs: empty commit")
@@ -991,6 +991,11 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 	rootID := NodeID{Rev: N, ID: root.newID}
 	rb := NewRevBlock(N, cur.Head, rootID, nodes)
 
+	// The lease may have expired during a long finalize; stop before writing
+	// a revision block that another replica could already be publishing.
+	if err := lease.Verify(ctx, r.store); err != nil {
+		return 0, err
+	}
 	sh := r.shard(N)
 	if err := r.store.Put(ctx, r.keys.LooseRev(sh, N), rb.Marshal()); err != nil {
 		return 0, err
@@ -1006,6 +1011,9 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 	nc := &Current{Head: N, Created: cur.Created}
 	if nc.Created == 0 {
 		nc.Created = time.Now().Unix()
+	}
+	if err := lease.Verify(ctx, r.store); err != nil {
+		return 0, err
 	}
 	if _, err := r.store.CAS(ctx, r.keys.Current(), etag, nc.Marshal()); err != nil {
 		return 0, err
@@ -1068,6 +1076,78 @@ func (r *Repo) Verify(headRev uint64) ([]VerifyIssue, error) {
 		}
 	}
 	walk("/", headRev)
+	return issues, nil
+}
+
+// VerifyRange checks every revision block in [from,to], every node-rev it
+// contains, and (texts=true) every file text, including historical revisions
+// that are no longer reachable from HEAD. Nodes shared by several revisions
+// are checked once. With texts=false it still verifies that external text
+// objects exist.
+func (r *Repo) VerifyRange(from, to uint64, texts bool) ([]VerifyIssue, error) {
+	if from == 0 {
+		from = 1
+	}
+	head, err := r.HeadFresh()
+	if err != nil {
+		return nil, err
+	}
+	if to == 0 || to > head {
+		to = head
+	}
+	var issues []VerifyIssue
+	seen := make(map[NodeID]bool)
+	ctx := context.Background()
+	for rev := from; rev <= to; rev++ {
+		rb, berr := r.readBlock(rev)
+		if berr != nil {
+			issues = append(issues, VerifyIssue{Rev: rev, Err: berr})
+			continue
+		}
+		for _, e := range rb.nodeTbl {
+			nid := NodeID{Rev: rb.Rev, ID: e.ID}
+			if seen[nid] {
+				continue
+			}
+			seen[nid] = true
+			nr, nerr := r.GetNodeRev(nid)
+			if nerr != nil {
+				issues = append(issues, VerifyIssue{Rev: rev, Err: nerr})
+				continue
+			}
+			if nr.Kind != KindFile {
+				continue
+			}
+			if nr.TextRep == TextRepExternal {
+				ok, eerr := r.store.Exists(ctx, r.keys.Text(nr.TextRef))
+				if eerr != nil || !ok {
+					issues = append(issues, VerifyIssue{Rev: rev, Err: fmt.Errorf("text object %s missing", nr.TextRef)})
+					continue
+				}
+			}
+			if !texts {
+				continue
+			}
+			data, gerr := r.GetText(nr.Node)
+			if gerr != nil {
+				issues = append(issues, VerifyIssue{
+					Rev: rev, Err: gerr,
+					Rebuildable: nr.TextRep == TextRepDelta && nr.Base != nil,
+				})
+				continue
+			}
+			if nr.TotalSize > 0 && uint64(len(data)) != nr.TotalSize {
+				issues = append(issues, VerifyIssue{Rev: rev, Err: fmt.Errorf("text size %d, want %d", len(data), nr.TotalSize)})
+				continue
+			}
+			if nr.TextMD5 != ([16]byte{}) {
+				sum := md5.Sum(data)
+				if sum != nr.TextMD5 {
+					issues = append(issues, VerifyIssue{Rev: rev, Err: fmt.Errorf("text md5 mismatch")})
+				}
+			}
+		}
+	}
 	return issues, nil
 }
 

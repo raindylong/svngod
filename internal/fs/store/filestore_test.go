@@ -121,3 +121,69 @@ func TestFileStoreRangedGet(t *testing.T) {
 		t.Fatal("expected out-of-bounds error")
 	}
 }
+
+func TestFileStoreSyncsWrites(t *testing.T) {
+	dir := t.TempDir()
+	st, err := NewFileStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	syncHook = func() { calls++ }
+	defer func() { syncHook = nil }()
+
+	ctx := context.Background()
+	if err := st.Put(ctx, "a", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if calls < 2 {
+		t.Fatalf("Put fsync calls=%d, want file+dir", calls)
+	}
+	before := calls
+	if _, err := st.CAS(ctx, "a", ContentETag([]byte("x")), []byte("y")); err != nil {
+		t.Fatal(err)
+	}
+	if calls <= before {
+		t.Fatal("CAS did not fsync")
+	}
+}
+
+func TestFileStoreNoSync(t *testing.T) {
+	dir := t.TempDir()
+	st, err := NewFileStoreWithSync(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	syncHook = func() { calls++ }
+	defer func() { syncHook = nil }()
+	if err := st.Put(context.Background(), "a", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatalf("no-sync store fsynced %d times", calls)
+	}
+}
+
+func TestFileStoreReconstructibleSkipsSync(t *testing.T) {
+	dir := t.TempDir()
+	st, err := NewFileStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	syncHook = func() { calls++ }
+	defer func() { syncHook = nil }()
+	if err := PutReconstructible(context.Background(), st, "txn/frag", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatalf("reconstructible write fsynced %d times", calls)
+	}
+	if err := st.Put(context.Background(), "rev", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if calls == 0 {
+		t.Fatal("durable Put did not fsync")
+	}
+}

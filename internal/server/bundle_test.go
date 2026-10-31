@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"svngod/internal/fs"
 	"svngod/internal/fs/store"
@@ -201,5 +203,54 @@ func TestBundleLargeText(t *testing.T) {
 	}
 	if len(text) != len(big) || string(text) != big {
 		t.Fatalf("text mismatch: got %d bytes", len(text))
+	}
+}
+
+func TestBundleTokenInRevPropsAndRecovery(t *testing.T) {
+	ts, repo := newBundleTestServer(t)
+	defer ts.Close()
+	tok := strings.Repeat("c3", 16)
+	b := &testBundle{Token: tok, Message: "recover"}
+	body := b.body("payload")
+	code, out := postBundle(t, ts, body)
+	if code != http.StatusOK {
+		t.Fatalf("status=%d out=%v", code, out)
+	}
+	rev1 := uint64(out["revision"].(float64))
+	rp, err := repo.GetRevProps(rev1)
+	if err != nil || rp == nil {
+		t.Fatalf("revprops: %v", err)
+	}
+	if rp.Props["svngod:bundle-token"] != tok {
+		t.Fatalf("token revprop=%q", rp.Props["svngod:bundle-token"])
+	}
+
+	// Simulate a crash after CommitTxn but before the token record was stored.
+	ctx := context.Background()
+	if err := repo.Store().Delete(ctx, []string{bundleKey(repo, tok)}); err != nil {
+		t.Fatal(err)
+	}
+	in, _ := json.Marshal(bundleIntent{Token: tok, BaseRev: b.BaseRev, Message: b.Message, User: "alice", Created: time.Now().Unix()})
+	if err := repo.Store().Put(ctx, bundleIntentKey(repo, tok), in); err != nil {
+		t.Fatal(err)
+	}
+
+	code, out = postBundle(t, ts, body)
+	if code != http.StatusOK {
+		t.Fatalf("replay status=%d out=%v", code, out)
+	}
+	rev2 := uint64(out["revision"].(float64))
+	if rev2 != rev1 {
+		t.Fatalf("replay revision=%d, want %d", rev2, rev1)
+	}
+	if replayed, _ := out["replayed"].(bool); !replayed {
+		t.Fatalf("expected replayed=true, out=%v", out)
+	}
+	head, _ := repo.HeadFresh()
+	if head != 1 {
+		t.Fatalf("head=%d, duplicate commit", head)
+	}
+	if _, err := repo.Store().Get(ctx, bundleIntentKey(repo, tok), nil); err == nil {
+		t.Fatal("intent not cleaned up")
 	}
 }

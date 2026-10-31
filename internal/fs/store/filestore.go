@@ -23,14 +23,54 @@ type FileStore struct {
 	// dirs caches directories already created; MkdirAll on an existing deep
 	// path stats every component, which a 30k-file commit paid per fragment.
 	dirs map[string]bool
+	// syncWrites fsyncs files and parent directories before returning, so a
+	// mutation that the caller acknowledged survives a power loss. S3 already
+	// provides this; local deployments should keep it on.
+	syncWrites bool
 }
 
 // NewFileStore builds a FileStore rooted at base (created if missing).
+// Writes are fsynced (file + parent directory) before they return.
 func NewFileStore(base string) (*FileStore, error) {
+	return NewFileStoreWithSync(base, true)
+}
+
+// NewFileStoreWithSync is NewFileStore with an explicit durability mode.
+// sync=false is for tests and disposable caches; acknowledged commits are not
+// guaranteed to survive a host crash without it.
+func NewFileStoreWithSync(base string, syncWrites bool) (*FileStore, error) {
 	if err := os.MkdirAll(base, 0o755); err != nil {
 		return nil, err
 	}
-	return &FileStore{base: base, dirs: make(map[string]bool)}, nil
+	return &FileStore{base: base, dirs: make(map[string]bool), syncWrites: syncWrites}, nil
+}
+
+// syncHook counts fsyncs in tests; nil in production.
+var syncHook func()
+
+func (s *FileStore) syncFile(f *os.File) error {
+	if !s.syncWrites {
+		return nil
+	}
+	if syncHook != nil {
+		syncHook()
+	}
+	return f.Sync()
+}
+
+func (s *FileStore) syncDir(dir string) error {
+	if !s.syncWrites {
+		return nil
+	}
+	if syncHook != nil {
+		syncHook()
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // objPath maps a slash-separated key to an absolute path, rejecting escapes.
@@ -59,7 +99,17 @@ func (s *FileStore) ensureDirLocked(dir string) error {
 	return nil
 }
 
-func (s *FileStore) Put(_ context.Context, key string, data []byte) error {
+func (s *FileStore) Put(ctx context.Context, key string, data []byte) error {
+	return s.put(ctx, key, data, s.syncWrites)
+}
+
+// PutReconstructible skips the fsync: commit-session fragments are re-sent by
+// the client after a crash and must not pay one disk flush per file.
+func (s *FileStore) PutReconstructible(ctx context.Context, key string, data []byte) error {
+	return s.put(ctx, key, data, false)
+}
+
+func (s *FileStore) put(_ context.Context, key string, data []byte, durable bool) error {
 	p, err := s.objPath(key)
 	if err != nil {
 		return err
@@ -82,6 +132,13 @@ func (s *FileStore) Put(_ context.Context, key string, data []byte) error {
 		os.Remove(tmpName)
 		return err
 	}
+	if durable {
+		if err := s.syncFile(tmp); err != nil {
+			tmp.Close()
+			os.Remove(tmpName)
+			return err
+		}
+	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(tmpName)
 		return err
@@ -89,6 +146,9 @@ func (s *FileStore) Put(_ context.Context, key string, data []byte) error {
 	if err := os.Rename(tmpName, p); err != nil {
 		os.Remove(tmpName)
 		return err
+	}
+	if durable {
+		return s.syncDir(dir)
 	}
 	return nil
 }
@@ -151,8 +211,16 @@ func (s *FileStore) PutFile(_ context.Context, key, src string) error {
 	if err := s.ensureDirLocked(filepath.Dir(p)); err != nil {
 		return err
 	}
+	if s.syncWrites {
+		// A linked object shares the source inode; the caller wrote it, so make
+		// sure its bytes reached disk before the link becomes visible.
+		if sf, oerr := os.Open(src); oerr == nil {
+			_ = s.syncFile(sf)
+			sf.Close()
+		}
+	}
 	if err := os.Link(src, p); err == nil {
-		return nil
+		return s.syncDir(filepath.Dir(p))
 	}
 	f, err := os.Open(src)
 	if err != nil {
@@ -166,6 +234,9 @@ func (s *FileStore) PutFile(_ context.Context, key, src string) error {
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 	n, err := io.Copy(tmp, f)
+	if err == nil {
+		err = s.syncFile(tmp)
+	}
 	if cerr := tmp.Close(); err == nil {
 		err = cerr
 	}
@@ -176,12 +247,20 @@ func (s *FileStore) PutFile(_ context.Context, key, src string) error {
 		_ = n
 		return err
 	}
-	return nil
+	return s.syncDir(filepath.Dir(p))
 }
 
 // PutFrom streams into a temp file and renames it into place, so readers never
 // observe a partially written object.
-func (s *FileStore) PutFrom(_ context.Context, key string, r io.Reader, size int64) error {
+func (s *FileStore) PutFrom(ctx context.Context, key string, r io.Reader, size int64) error {
+	return s.putFrom(ctx, key, r, size, s.syncWrites)
+}
+
+func (s *FileStore) PutFromReconstructible(ctx context.Context, key string, r io.Reader, size int64) error {
+	return s.putFrom(ctx, key, r, size, false)
+}
+
+func (s *FileStore) putFrom(_ context.Context, key string, r io.Reader, size int64, durable bool) error {
 	p, err := s.objPath(key)
 	if err != nil {
 		return err
@@ -198,6 +277,9 @@ func (s *FileStore) PutFrom(_ context.Context, key string, r io.Reader, size int
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 	n, err := io.Copy(tmp, io.LimitReader(r, size+1))
+	if err == nil && durable {
+		err = s.syncFile(tmp)
+	}
 	if cerr := tmp.Close(); err == nil {
 		err = cerr
 	}
@@ -207,7 +289,13 @@ func (s *FileStore) PutFrom(_ context.Context, key string, r io.Reader, size int
 	if n != size {
 		return fmt.Errorf("store: short body (%d/%d)", n, size)
 	}
-	return os.Rename(tmpName, p)
+	if err := os.Rename(tmpName, p); err != nil {
+		return err
+	}
+	if durable {
+		return s.syncDir(filepath.Dir(p))
+	}
+	return nil
 }
 
 func (s *FileStore) Exists(_ context.Context, key string) (bool, error) {
@@ -283,11 +371,17 @@ func (s *FileStore) CreateIfAbsent(_ context.Context, key string, data []byte) e
 		return err
 	}
 	_, werr := f.Write(data)
+	if werr == nil {
+		werr = s.syncFile(f)
+	}
 	cerr := f.Close()
 	if werr != nil {
 		return werr
 	}
-	return cerr
+	if cerr != nil {
+		return cerr
+	}
+	return s.syncDir(filepath.Dir(p))
 }
 
 func (s *FileStore) CAS(_ context.Context, key string, expectETag string, data []byte) (string, error) {
@@ -304,11 +398,37 @@ func (s *FileStore) CAS(_ context.Context, key string, expectETag string, data [
 	if !ok || cur != expectETag {
 		return "", ErrPreconditionFailed
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(p, data, 0o644); err != nil {
-		return "", err
+	// Write-then-rename keeps the current pointer readable at all times; a
+	// truncating WriteFile could leave a zero-length pointer after a crash.
+	tmp, terr := os.CreateTemp(dir, ".cas-*")
+	if terr != nil {
+		return "", terr
+	}
+	tmpName := tmp.Name()
+	if _, werr := tmp.Write(data); werr != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return "", werr
+	}
+	if serr := s.syncFile(tmp); serr != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return "", serr
+	}
+	if cerr := tmp.Close(); cerr != nil {
+		os.Remove(tmpName)
+		return "", cerr
+	}
+	if rerr := os.Rename(tmpName, p); rerr != nil {
+		os.Remove(tmpName)
+		return "", rerr
+	}
+	if derr := s.syncDir(dir); derr != nil {
+		return "", derr
 	}
 	return ContentETag(data), nil
 }
@@ -397,6 +517,26 @@ func (s *FileStore) DeletePrefix(_ context.Context, prefix string) error {
 	return nil
 }
 
+func (s *FileStore) DeleteIfMatch(_ context.Context, key, etag string) error {
+	p, err := s.objPath(key)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, ok, err := s.headLocked(p)
+	if err != nil {
+		return err
+	}
+	if !ok || cur != etag {
+		return ErrPreconditionFailed
+	}
+	if err := os.Remove(p); err != nil {
+		return err
+	}
+	return s.syncDir(filepath.Dir(p))
+}
+
 func (s *FileStore) Delete(_ context.Context, keys []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -405,7 +545,9 @@ func (s *FileStore) Delete(_ context.Context, keys []string) error {
 		if err != nil {
 			continue
 		}
-		_ = os.Remove(p)
+		if err := os.Remove(p); err == nil && s.syncWrites {
+			_ = s.syncDir(filepath.Dir(p))
+		}
 	}
 	return nil
 }

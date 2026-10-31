@@ -39,6 +39,10 @@ type options struct {
 	prefix     string
 	useSSL     bool
 	mirrorFile string
+	allRevs    bool
+	texts      bool
+	fromRev    uint64
+	toRev      uint64
 }
 
 // mirrorEntry is one backend in a --mirror-file JSON array (same shape as the
@@ -150,6 +154,12 @@ func main() {
 	fs.BoolVar(&o.useSSL, "ssl", false, "use https for S3")
 	fs.StringVar(&o.mirrorFile, "mirror-file", "", "JSON array of backends to create a mirror store (local-primary + S3-standby etc.)")
 	var output, input string
+	if cmd == "verify" {
+		fs.BoolVar(&o.allRevs, "all-revs", false, "verify every historical revision, not just HEAD")
+		fs.BoolVar(&o.texts, "texts", false, "with --all-revs: read and hash every file text (slow)")
+		fs.Uint64Var(&o.fromRev, "from", 1, "first revision for --all-revs")
+		fs.Uint64Var(&o.toRev, "to", 0, "last revision for --all-revs (0 = HEAD)")
+	}
 	shardSize := uint64(defaultShardSize)
 	maxDelta := uint64(defaultMaxDelta)
 	if cmd == "create" {
@@ -260,15 +270,36 @@ func doVerify(o *options, repoName string) {
 	if err != nil {
 		fatal(err)
 	}
-	issues, err := repo.Verify(head)
-	if err != nil {
-		fatal(err)
+	var issues []fs.VerifyIssue
+	if o.allRevs {
+		from, to := o.fromRev, o.toRev
+		if from == 0 {
+			from = 1
+		}
+		if to == 0 || to > head {
+			to = head
+		}
+		issues, err = repo.VerifyRange(from, to, o.texts)
+		scope := fmt.Sprintf("revs %d..%d (texts=%v)", from, to, o.texts)
+		if err != nil {
+			fatal(err)
+		}
+		if len(issues) == 0 {
+			fmt.Printf("verify: repository %q %s: no integrity issues\n", repoName, scope)
+			return
+		}
+		fmt.Printf("verify: repository %q %s: %d integrity issues\n", repoName, scope, len(issues))
+	} else {
+		issues, err = repo.Verify(head)
+		if err != nil {
+			fatal(err)
+		}
+		if len(issues) == 0 {
+			fmt.Printf("verify: repository %q at rev %d: no integrity issues\n", repoName, head)
+			return
+		}
+		fmt.Printf("verify: repository %q at rev %d: %d integrity issues\n", repoName, head, len(issues))
 	}
-	if len(issues) == 0 {
-		fmt.Printf("verify: repository %q at rev %d: no integrity issues\n", repoName, head)
-		return
-	}
-	fmt.Printf("verify: repository %q at rev %d: %d integrity issues\n", repoName, head, len(issues))
 	for _, is := range issues {
 		fmt.Printf("  rev=%d path=%s err=%v rebuildable=%v\n", is.Rev, is.Path, is.Err, is.Rebuildable)
 	}

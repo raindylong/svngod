@@ -228,6 +228,51 @@ func (m *MirrorStore) Put(ctx context.Context, key string, data []byte) error {
 	return nil
 }
 
+func (m *MirrorStore) PutReconstructible(ctx context.Context, key string, data []byte) error {
+	pi, err := m.writePrimary(func(s Store) error { return PutReconstructible(ctx, s, key, data) })
+	if err != nil {
+		return err
+	}
+	m.mirrorWrites(ctx, pi, func(s Store) error { return PutReconstructible(ctx, s, key, data) })
+	return nil
+}
+
+func (m *MirrorStore) PutFromReconstructible(ctx context.Context, key string, r io.Reader, size int64) error {
+	tmp, err := os.CreateTemp("", fmt.Sprintf("svngod-mirror-fast-%d-", os.Getpid()))
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := io.Copy(tmp, io.LimitReader(r, size)); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	pi, err := m.writePrimary(func(s Store) error {
+		f, oerr := os.Open(tmpName)
+		if oerr != nil {
+			return oerr
+		}
+		defer f.Close()
+		return PutFromReconstructible(ctx, s, key, f, size)
+	})
+	if err != nil {
+		return err
+	}
+	m.mirrorWrites(ctx, pi, func(s Store) error {
+		f, oerr := os.Open(tmpName)
+		if oerr != nil {
+			return oerr
+		}
+		defer f.Close()
+		return PutFromReconstructible(ctx, s, key, f, size)
+	})
+	return nil
+}
+
 func (m *MirrorStore) Get(ctx context.Context, key string, rng *Range) ([]byte, error) {
 	// Read the primary first: it is the only copy guaranteed to have every
 	// object written so far (a standby write is best effort and may still be
@@ -436,6 +481,15 @@ func (m *MirrorStore) ListPrefix(ctx context.Context, prefix, continuation strin
 		return nil, "", err
 	}
 	return objs, next, nil
+}
+
+func (m *MirrorStore) DeleteIfMatch(ctx context.Context, key, etag string) error {
+	pi, err := m.writePrimary(func(s Store) error { return DeleteIfMatch(ctx, s, key, etag) })
+	if err != nil {
+		return err
+	}
+	m.mirrorWrites(ctx, pi, func(s Store) error { return DeleteIfMatch(ctx, s, key, etag) })
+	return nil
 }
 
 func (m *MirrorStore) Delete(ctx context.Context, keys []string) error {

@@ -435,6 +435,11 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 		http.Error(w, "PUT only applies to a transaction working resource", http.StatusBadRequest)
 		return
 	}
+	release, ok := s.acquireUpload(w, r)
+	if !ok {
+		return
+	}
+	defer release()
 	repo, rok := s.repo(w, res)
 	if !rok {
 		return

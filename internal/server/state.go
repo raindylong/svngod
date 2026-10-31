@@ -170,7 +170,7 @@ func (s *Server) persistActivity(repo *fs.Repo, actID string) {
 	if err != nil {
 		return
 	}
-	if err := repo.Store().Put(context.Background(), activityStateKey(repo, actID), data); err != nil {
+	if err := store.PutReconstructible(context.Background(), repo.Store(), activityStateKey(repo, actID), data); err != nil {
 		log.Printf("txn: persist %s: %v", actID, err)
 	}
 }
@@ -249,7 +249,7 @@ func (s *Server) persistChange(repo *fs.Repo, actID, path string) {
 	}
 	if body != nil {
 		ref := hex.EncodeToString(sha1Sum(body))
-		if err := repo.Store().Put(ctx, activityDataKey(repo, ref), body); err != nil {
+		if err := store.PutReconstructible(ctx, repo.Store(), activityDataKey(repo, ref), body); err != nil {
 			log.Printf("txn: persist data %s: %v", ref, err)
 			return
 		}
@@ -262,7 +262,7 @@ func (s *Server) persistChange(repo *fs.Repo, actID, path string) {
 	}
 	if delta != nil {
 		ref := hex.EncodeToString(sha1Sum(delta))
-		if err := repo.Store().Put(ctx, activityDataKey(repo, ref), delta); err != nil {
+		if err := store.PutReconstructible(ctx, repo.Store(), activityDataKey(repo, ref), delta); err != nil {
 			log.Printf("txn: persist delta %s: %v", ref, err)
 			return
 		}
@@ -277,7 +277,7 @@ func (s *Server) persistChange(repo *fs.Repo, actID, path string) {
 	if err != nil {
 		return
 	}
-	if err := repo.Store().Put(ctx, activityChangeKey(repo, actID, path), data); err != nil {
+	if err := store.PutReconstructible(ctx, repo.Store(), activityChangeKey(repo, actID, path), data); err != nil {
 		log.Printf("txn: persist change %s: %v", path, err)
 	}
 }
@@ -316,7 +316,7 @@ func putTxnFile(ctx context.Context, repo *fs.Repo, path string) (string, error)
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return "", err
 	}
-	if err := repo.Store().PutFrom(ctx, key, f, n); err != nil {
+	if err := store.PutFromReconstructible(ctx, repo.Store(), key, f, n); err != nil {
 		return "", err
 	}
 	return ref, nil

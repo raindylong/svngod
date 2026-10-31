@@ -67,6 +67,22 @@ func bundleKey(repo *fs.Repo, token string) string {
 	return repo.Keys().Prefix + "/bundles/" + token
 }
 
+func bundleIntentKey(repo *fs.Repo, token string) string {
+	return repo.Keys().Prefix + "/bundles/intent-" + token
+}
+
+// bundleIntent is written before the commit and kept until the token record
+// is stored. It closes the crash window between publishing the revision and
+// remembering its token: on a retry the token is found in the revision's
+// revprops, so the upload is never committed twice.
+type bundleIntent struct {
+	Token   string `json:"token"`
+	BaseRev uint64 `json:"baseRev"`
+	Message string `json:"message"`
+	User    string `json:"user"`
+	Created int64  `json:"created"`
+}
+
 // validBundleToken keeps tokens filesystem/object-key safe.
 func validBundleToken(tok string) bool {
 	if len(tok) < 16 || len(tok) > 128 {
@@ -107,6 +123,11 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 		s.unauthorized(w)
 		return
 	}
+	release, ok := s.acquireUpload(w, r)
+	if !ok {
+		return
+	}
+	defer release()
 
 	hdr, err := readBundleHeader(r.Body)
 	if err != nil {
@@ -124,6 +145,7 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 
 	ctx := context.Background()
 	key := bundleKey(repo, hdr.Token)
+	intentKey := bundleIntentKey(repo, hdr.Token)
 
 	// Replay after a retry: the body is drained so the client can finish
 	// sending, then the recorded revision is returned.
@@ -133,8 +155,32 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "token belongs to another user", http.StatusConflict)
 			return
 		}
+		repo.Store().Delete(ctx, []string{intentKey})
 		writeBundleResult(w, rec.Rev, true)
 		return
+	}
+	// A previous attempt may have crashed after CommitTxn succeeded but
+	// before the token record was stored. The token is part of the revision
+	// properties (written atomically with the commit), so a bounded scan
+	// recovers the revision instead of committing a duplicate.
+	if in, ok := loadBundleIntent(ctx, repo, intentKey); ok {
+		if rev, found := findCommittedToken(ctx, repo, hdr.Token, in.Created); found {
+			saveBundleRecord(ctx, repo, key, hdr.Token, user, rev)
+			repo.Store().Delete(ctx, []string{intentKey})
+			io.Copy(io.Discard, io.LimitReader(r.Body, maxBundleTotal))
+			writeBundleResult(w, rev, true)
+			return
+		}
+	}
+	// Persist the intent before claiming/committing so the recovery path above
+	// knows which token to look for.
+	if b, merr := json.Marshal(bundleIntent{
+		Token: hdr.Token, BaseRev: hdr.BaseRev, Message: hdr.Message,
+		User: user, Created: time.Now().Unix(),
+	}); merr == nil {
+		if perr := repo.Store().Put(ctx, intentKey, b); perr != nil {
+			fmt.Fprintf(os.Stderr, "bundle: intent %s: %v", hdr.Token, perr)
+		}
 	}
 
 	// Serialise concurrent uploads of the same token so only one commit can
@@ -170,7 +216,7 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 	committed := false
 	defer func() {
 		if !committed {
-			repo.Store().Delete(context.Background(), []string{claimKey})
+			repo.Store().Delete(context.Background(), []string{claimKey, intentKey})
 		}
 	}()
 
@@ -255,6 +301,9 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 		"svn:log":    hdr.Message,
 		"svn:author": user,
 		"svn:date":   time.Now().UTC().Format("2006-01-02T15:04:05.000000Z"),
+		// Part of the atomic commit: a retry that lost the token record can
+		// still prove this revision is its own.
+		"svngod:bundle-token": hdr.Token,
 	}
 	rev, cerr := repo.CommitTxn(base, changes, revProps)
 	if cerr != nil {
@@ -327,6 +376,52 @@ func loadBundleRecord(ctx context.Context, repo *fs.Repo, key string) (bundleRec
 		return rec, false
 	}
 	return rec, true
+}
+
+func loadBundleIntent(ctx context.Context, repo *fs.Repo, key string) (bundleIntent, bool) {
+	var in bundleIntent
+	b, err := repo.Store().Get(ctx, key, nil)
+	if err != nil {
+		return in, false
+	}
+	if json.Unmarshal(b, &in) != nil || in.Token == "" {
+		return in, false
+	}
+	return in, true
+}
+
+func saveBundleRecord(ctx context.Context, repo *fs.Repo, key, token, user string, rev uint64) {
+	rec, _ := json.Marshal(bundleRecord{Rev: rev, User: user, Created: time.Now().Unix()})
+	if err := repo.Store().Put(ctx, key, rec); err != nil {
+		fmt.Fprintf(os.Stderr, "bundle: record %s: %v", token, err)
+	}
+}
+
+// findCommittedToken looks for a revision carrying this bundle token. It is a
+// crash-recovery path only, bounded to recent revisions.
+func findCommittedToken(ctx context.Context, repo *fs.Repo, token string, since int64) (uint64, bool) {
+	head, err := repo.HeadFresh()
+	if err != nil {
+		return 0, false
+	}
+	const maxScan = 512
+	for i := uint64(0); i < maxScan && head > i; i++ {
+		rev := head - i
+		rp, rerr := repo.GetRevProps(rev)
+		if rerr != nil || rp == nil {
+			continue
+		}
+		if rp.Props["svngod:bundle-token"] == token {
+			return rev, true
+		}
+		// Stop once revisions clearly predate the intent.
+		if d := rp.Props["svn:date"]; d != "" {
+			if t, perr := time.Parse("2006-01-02T15:04:05.000000Z", d); perr == nil && t.Unix()+120 < since {
+				return 0, false
+			}
+		}
+	}
+	return 0, false
 }
 
 func staleClaim(ctx context.Context, repo *fs.Repo, key string, ttl time.Duration) (bool, bool) {

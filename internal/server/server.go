@@ -41,6 +41,10 @@ type Config struct {
 	// environment; a non-zero pre-commit exit rejects the commit.
 	HooksDir string
 
+	// MaxConcurrentUploads bounds simultaneous PUT/bundle bodies so a few
+	// multi-gigabyte uploads cannot exhaust disk or memory. Zero = unlimited.
+	MaxConcurrentUploads int
+
 	// Logger for request logging; nil disables.
 	Logger *log.Logger
 }
@@ -96,11 +100,12 @@ type Server struct {
 	stateLoaded map[string]bool       // repositories whose persisted activities were restored
 	repoMapMu   sync.Mutex
 	repoCache   map[string]*fs.Repo // per-name repo singletons (shared r.mu)
+	uploads     chan struct{}       // nil when uploads are unlimited
 }
 
 // New builds a Server.
 func New(cfg Config) *Server {
-	return &Server{
+	s := &Server{
 		cfg:         cfg,
 		activities:  map[string]*activity{},
 		txns:        map[string]*txn{},
@@ -108,6 +113,28 @@ func New(cfg Config) *Server {
 		locksLoaded: map[string]bool{},
 		stateLoaded: map[string]bool{},
 		repoCache:   map[string]*fs.Repo{},
+	}
+	if cfg.MaxConcurrentUploads > 0 {
+		s.uploads = make(chan struct{}, cfg.MaxConcurrentUploads)
+	}
+	return s
+}
+
+// acquireUpload reserves one upload slot, waiting briefly for a busy server.
+// The returned release must be called by the handler.
+func (s *Server) acquireUpload(w http.ResponseWriter, r *http.Request) (func(), bool) {
+	if s.uploads == nil {
+		return func() {}, true
+	}
+	select {
+	case s.uploads <- struct{}{}:
+		return func() { <-s.uploads }, true
+	case <-r.Context().Done():
+		return nil, false
+	case <-time.After(30 * time.Second):
+		w.Header().Set("Retry-After", "30")
+		http.Error(w, "server busy: too many concurrent uploads", http.StatusServiceUnavailable)
+		return nil, false
 	}
 }
 

@@ -138,6 +138,7 @@ func TestHTTPv2Disabled(t *testing.T) {
 }
 
 var _ = fs.KindFile
+
 // TestCrossReplicaTransactionRestore covers a load-balanced commit: replica B
 // had already loaded its activity list before replica A created the
 // transaction, so the later PUT/MERGE on B must restore the session on demand

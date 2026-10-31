@@ -58,9 +58,10 @@ type options struct {
 	prefix    string
 	useSSL    bool
 
-	hooksDir string
-	tlsCert  string
-	tlsKey   string
+	hooksDir   string
+	tlsCert    string
+	tlsKey     string
+	maxUploads int
 }
 
 func (o *options) makeStore() (store.Store, error) {
@@ -113,6 +114,7 @@ func main() {
 	var o options
 	fl := flag.NewFlagSet("svngod", flag.ExitOnError)
 	fl.StringVar(&o.addr, "addr", ":8080", "listen address")
+	fl.IntVar(&o.maxUploads, "max-uploads", 16, "maximum concurrent PUT/bundle uploads (0 = unlimited)")
 	fl.StringVar(&o.basePath, "base-path", "/svn", "URL prefix for repositories")
 	fl.StringVar(&o.repoRoot, "repo-root", "./repos", "local directory holding repositories")
 	fl.StringVar(&o.passwd, "passwd", "", "local password file (plain/{SHA}/{CRYPT})")
@@ -174,23 +176,38 @@ func main() {
 			}
 			return r, nil
 		},
-		HooksDir: o.hooksDir,
-		Logger:   log.New(os.Stderr, "svngod ", log.LstdFlags),
+		HooksDir:             o.hooksDir,
+		MaxConcurrentUploads: o.maxUploads,
+		Logger:               log.New(os.Stderr, "svngod ", log.LstdFlags),
 	})
 
 	log.Printf("svngod listening on %s (base %s, repo-root %s)", o.addr, o.basePath, o.repoRoot)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go srv.RunMaintenance(ctx, 10*time.Minute)
+	hs := newHTTPServer(o.addr, srv.Handler())
 	if o.tlsCert != "" && o.tlsKey != "" {
 		log.Printf("serving HTTPS (cert %s)", o.tlsCert)
-		if err := http.ListenAndServeTLS(o.addr, o.tlsCert, o.tlsKey, srv.Handler()); err != nil {
+		if err := hs.ListenAndServeTLS(o.tlsCert, o.tlsKey); err != nil {
 			log.Fatal(err)
 		}
 		return
 	}
-	if err := http.ListenAndServe(o.addr, srv.Handler()); err != nil {
+	if err := hs.ListenAndServe(); err != nil {
 		log.Fatal(err)
+	}
+}
+
+// newHTTPServer applies the timeouts that keep a stalled client from pinning
+// a connection forever. WriteTimeout is deliberately absent: multi-gigabyte
+// uploads and downloads are expected to take minutes.
+func newHTTPServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 }
 
@@ -209,21 +226,27 @@ func runMultiRepo(configPath string) {
 	if addr == "" {
 		addr = ":8080"
 	}
+	maxUploads := cfg.MaxUploads
+	if maxUploads == 0 {
+		maxUploads = 16
+	}
 	srv := server.New(server.Config{
-		BasePath: cfg.BasePath,
-		Repos:    repos,
-		HooksDir: cfg.Hooks,
-		Logger:   log.New(os.Stderr, "svngod ", log.LstdFlags),
+		BasePath:             cfg.BasePath,
+		Repos:                repos,
+		HooksDir:             cfg.Hooks,
+		MaxConcurrentUploads: maxUploads,
+		Logger:               log.New(os.Stderr, "svngod ", log.LstdFlags),
 	})
 	log.Printf("svngod listening on %s (base %s, %d repos)", addr, cfg.BasePath, len(repos))
+	hs := newHTTPServer(addr, srv.Handler())
 	if cfg.TLSCert != "" && cfg.TLSKey != "" {
 		log.Printf("serving HTTPS (cert %s)", cfg.TLSCert)
-		if err := http.ListenAndServeTLS(addr, cfg.TLSCert, cfg.TLSKey, srv.Handler()); err != nil {
+		if err := hs.ListenAndServeTLS(cfg.TLSCert, cfg.TLSKey); err != nil {
 			log.Fatal(err)
 		}
 		return
 	}
-	if err := http.ListenAndServe(addr, srv.Handler()); err != nil {
+	if err := hs.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }

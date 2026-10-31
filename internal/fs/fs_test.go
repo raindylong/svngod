@@ -738,3 +738,46 @@ func TestCommitClientDelta(t *testing.T) {
 		t.Fatalf("stale delta base: err=%v, want out of date", err)
 	}
 }
+
+func TestVerifyRangeCoversHistory(t *testing.T) {
+	st := store.NewMemoryStore()
+	r, err := CreateRepo(st, "vr", 4096, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	big := make([]byte, 300<<10)
+	for i := range big {
+		big[i] = byte(i)
+	}
+	if _, err := r.CommitTxn(0, []Change{{Path: "/big.bin", Action: ActionAdd, Kind: KindFile, Data: big}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.CommitTxn(0, []Change{
+		{Path: "/big.bin", Action: ActionModify, Kind: KindFile, Data: append(big, 'x')},
+		{Path: "/small.txt", Action: ActionAdd, Kind: KindFile, Data: []byte("s")},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	issues, err := r.VerifyRange(1, 2, true)
+	if err != nil || len(issues) != 0 {
+		t.Fatalf("clean verify: err=%v issues=%v", err, issues)
+	}
+	// Remove the external text object of the historical revision; both the
+	// existence check and the text-hash mode must report it.
+	nr, err := r.Resolve(1, "/big.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Delete(context.Background(), []string{r.keys.Text(nr.TextRef)}); err != nil {
+		t.Fatal(err)
+	}
+	for _, texts := range []bool{false, true} {
+		issues, err = r.VerifyRange(1, 2, texts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(issues) == 0 {
+			t.Fatalf("texts=%v: missing text object not detected", texts)
+		}
+	}
+}

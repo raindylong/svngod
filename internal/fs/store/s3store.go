@@ -454,6 +454,16 @@ func (s *S3Store) listPrefixOnce(ctx context.Context, prefix, continuation strin
 	return out, next, nil
 }
 
+// DeleteIfMatch uses a conditional put (If-Match) to claim the object, then
+// deletes it. The claimed payload has no timestamp, so a crash between the two
+// steps looks stale to the next lease waiter.
+func (s *S3Store) DeleteIfMatch(ctx context.Context, key, etag string) error {
+	if _, err := s.CAS(ctx, key, etag, []byte("deleted")); err != nil {
+		return err
+	}
+	return s.Delete(ctx, []string{key})
+}
+
 func (s *S3Store) Delete(ctx context.Context, keys []string) error {
 	if len(keys) == 0 {
 		return nil
