@@ -69,8 +69,12 @@ type NodeRev struct {
 	// the object key suffix and its length.
 	TextRef  string
 	TextSize uint64
-	Base     *NodeID // delta base, when TextRep==TextRepDelta
-	Children []Child // dir only
+	// TotalSize is the file's full text length, independent of the stored
+	// representation (inline full text, delta bytes or external object). It
+	// is written as an optional trailing field so old blocks still decode.
+	TotalSize uint64
+	Base      *NodeID // delta base, when TextRep==TextRepDelta
+	Children  []Child // dir only
 	// ByName is a runtime-only name->Child index for directories, built on
 	// decode/cache; it is NOT persisted (Marshal ignores it) and lets Resolve
 	// find a child in O(1) instead of scanning Children (O(n) on a big dir).
@@ -127,6 +131,11 @@ func (nr *NodeRev) Marshal() []byte {
 			wire.WriteUvarint(&b, c.ID.Rev)
 			wire.WriteUvarint(&b, c.ID.ID)
 		}
+	}
+	// Optional trailing field: full text size for files. Older node-revs end
+	// here, so absence simply means "unknown".
+	if nr.TotalSize > 0 {
+		wire.WriteUvarint(&b, nr.TotalSize)
 	}
 	body := b.Bytes()
 	out := make([]byte, 0, len(body)+4)
@@ -282,6 +291,11 @@ func UnmarshalNodeRev(b []byte) (*NodeRev, error) {
 			}
 			p += n
 			nr.Children = append(nr.Children, c)
+		}
+	}
+	if p < len(body) {
+		if nr.TotalSize, _, err = wire.ReadUvarint(body[p:]); err != nil {
+			return nil, err
 		}
 	}
 	return nr, nil

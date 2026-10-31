@@ -559,3 +559,80 @@ func TestSmallTextStaysInline(t *testing.T) {
 		t.Fatalf("small text: rep=%d len=%d", nr.TextRep, len(nr.Text))
 	}
 }
+
+// TestStreamDeltaAndTotalSize: a delta node's total size is stored, so
+// Content-Length is O(1) and StreamText decodes window-by-window.
+func TestStreamDeltaAndTotalSize(t *testing.T) {
+	st := store.NewMemoryStore()
+	repo, _ := CreateRepo(st, "r", 4096, 64)
+	base := bytes.Repeat([]byte("abcdefgh"), (2<<20)/8) // 2 MiB, external on r1
+	r1, err := repo.CommitTxn(0, []Change{
+		{Path: "/f.bin", Action: ActionAdd, Kind: KindFile, Data: base},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mod := append([]byte(nil), base...)
+	copy(mod[5000:5010], []byte("0123456789"))
+	r2, err := repo.CommitTxn(r1, []Change{
+		{Path: "/f.bin", Action: ActionModify, Kind: KindFile, Data: mod},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nr, err := repo.Resolve(r2, "/f.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nr.TextRep != TextRepDelta {
+		t.Fatalf("rep = %d, want delta", nr.TextRep)
+	}
+	if nr.TotalSize != uint64(len(mod)) {
+		t.Fatalf("TotalSize = %d, want %d", nr.TotalSize, len(mod))
+	}
+	if size, err := repo.TextSizeOf(nr); err != nil || size != int64(len(mod)) {
+		t.Fatalf("TextSizeOf = %d err=%v", size, err)
+	}
+	var buf bytes.Buffer
+	if n, err := repo.StreamText(nr.Node, &buf); err != nil || n != uint64(len(mod)) || !bytes.Equal(buf.Bytes(), mod) {
+		t.Fatalf("StreamText: n=%d err=%v", n, err)
+	}
+}
+
+// TestCollectTexts keeps texts referenced by any revision and removes orphans.
+func TestCollectTexts(t *testing.T) {
+	st := store.NewMemoryStore()
+	repo, _ := CreateRepo(st, "r", 4096, 64)
+	a := bytes.Repeat([]byte("a"), (1<<20)+1)
+	b := bytes.Repeat([]byte("b"), (1<<20)+1)
+	if _, err := repo.CommitTxn(0, []Change{
+		{Path: "/a.bin", Action: ActionAdd, Kind: KindFile, Data: a},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.CommitTxn(1, []Change{
+		{Path: "/b.bin", Action: ActionAdd, Kind: KindFile, Data: b},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	orphan := strings.Repeat("f", 40)
+	if err := st.Put(context.Background(), repo.Keys().Text(orphan), []byte("orphan")); err != nil {
+		t.Fatal(err)
+	}
+	n, err := repo.CollectTexts(context.Background())
+	if err != nil || n != 1 {
+		t.Fatalf("CollectTexts = %d, %v; want 1", n, err)
+	}
+	if _, ok, _ := st.Head(context.Background(), repo.Keys().Text(orphan)); ok {
+		t.Fatal("orphan text kept")
+	}
+	for rev, want := range map[uint64][]byte{1: a, 2: b} {
+		nr, err := repo.Resolve(rev, map[uint64]string{1: "/a.bin", 2: "/b.bin"}[rev])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err := repo.GetText(nr.Node); err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("rev %d text wrong: len=%d err=%v", rev, len(got), err)
+		}
+	}
+}

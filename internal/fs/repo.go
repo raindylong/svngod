@@ -338,28 +338,58 @@ func (r *Repo) StreamText(id NodeID, w io.Writer) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if nr.TextRep == TextRepExternal {
+	switch nr.TextRep {
+	case TextRepExternal:
 		n, serr := r.store.GetTo(context.Background(), r.keys.Text(nr.TextRef), w)
 		return uint64(n), serr
+	case TextRepDelta:
+		if nr.Base == nil {
+			return 0, errors.New("fs: delta node missing base")
+		}
+		base, berr := r.GetText(*nr.Base)
+		if berr != nil {
+			return 0, berr
+		}
+		cw := &countWriter{w: w}
+		if aerr := svndiff.ApplyTo(base, bytes.NewReader(nr.Text), cw); aerr != nil {
+			return cw.n, aerr
+		}
+		return cw.n, nil
+	default:
+		n, werr := w.Write(nr.Text)
+		return uint64(n), werr
 	}
-	text, err := r.GetText(id)
-	if err != nil {
-		return 0, err
-	}
-	n, err := w.Write(text)
-	return uint64(n), err
+}
+
+// countWriter counts bytes written through it.
+type countWriter struct {
+	w io.Writer
+	n uint64
+}
+
+func (c *countWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += uint64(n)
+	return n, err
 }
 
 // TextSizeOf returns a file node's text length without loading external texts.
 func (r *Repo) TextSizeOf(nr *NodeRev) (int64, error) {
-	if nr.TextRep == TextRepExternal {
+	if nr.TotalSize > 0 {
+		return int64(nr.TotalSize), nil
+	}
+	switch nr.TextRep {
+	case TextRepExternal:
 		return int64(nr.TextSize), nil
+	case TextRepFull:
+		return int64(len(nr.Text)), nil
+	case TextRepDelta:
+		// Old node-revs predate TotalSize: decode to count without keeping
+		// the target in memory.
+		n, err := r.StreamText(nr.Node, io.Discard)
+		return int64(n), err
 	}
-	text, err := r.GetText(nr.Node)
-	if err != nil {
-		return 0, err
-	}
-	return int64(len(text)), nil
+	return 0, errors.New("fs: bad text rep")
 }
 
 // ReadTextRange returns up to length bytes at off. External texts are read
@@ -628,6 +658,7 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 				nr.TextRep = TextRepExternal
 				nr.TextRef = ref
 				nr.TextSize = size
+				nr.TotalSize = size
 				nr.DeltaDepth = 0
 				nodes = append(nodes, nr)
 				continue
@@ -665,6 +696,7 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 				nr.Base = &base
 				nr.DeltaDepth = t.deltaDepth + 1
 			}
+			nr.TotalSize = uint64(len(t.data))
 		} else {
 			if err := r.ensureDir(t); err != nil {
 				return 0, err
@@ -1131,6 +1163,59 @@ func (r *Repo) CollectTxnData(ctx context.Context) (int, error) {
 		if !referenced[ref] {
 			victims = append(victims, k)
 		}
+	}
+	if len(victims) == 0 {
+		return 0, nil
+	}
+	if err := r.store.Delete(ctx, victims); err != nil {
+		return 0, err
+	}
+	return len(victims), nil
+}
+
+// CollectTexts deletes external text objects that no node-rev references.
+// Every historical revision is scanned (a text removed from HEAD but present
+// in older revisions must be kept), so this is an offline maintenance pass:
+// run it while the repository is idle.
+func (r *Repo) CollectTexts(ctx context.Context) (int, error) {
+	head, err := r.Head()
+	if err != nil {
+		return 0, err
+	}
+	refs := map[string]bool{}
+	for rev := uint64(0); rev <= head; rev++ {
+		rb, err := r.readBlock(rev)
+		if err != nil {
+			return 0, err
+		}
+		for _, id := range rb.NodeIDs() {
+			nr, err := rb.GetNode(id)
+			if err != nil {
+				return 0, err
+			}
+			if nr.TextRep == TextRepExternal && nr.TextRef != "" {
+				refs[nr.TextRef] = true
+			}
+		}
+	}
+	prefix := r.keys.Prefix + "/texts/"
+	next := ""
+	var victims []string
+	for {
+		objs, n, err := r.store.ListPrefix(ctx, prefix, next, 500)
+		if err != nil {
+			return 0, err
+		}
+		for _, o := range objs {
+			ref := strings.TrimPrefix(o.Key, prefix)
+			if !refs[ref] {
+				victims = append(victims, o.Key)
+			}
+		}
+		if n == "" {
+			break
+		}
+		next = n
 	}
 	if len(victims) == 0 {
 		return 0, nil

@@ -209,7 +209,7 @@ func (m *MirrorStore) Get(ctx context.Context, key string, rng *Range) ([]byte, 
 // reader is buffered through a temp file because a standby needs the bytes a
 // second time.
 func (m *MirrorStore) PutFrom(ctx context.Context, key string, r io.Reader, size int64) error {
-	tmp, err := os.CreateTemp("", "svngod-mirror-*")
+	tmp, err := os.CreateTemp("", fmt.Sprintf("svngod-mirror-%d-", os.Getpid()))
 	if err != nil {
 		return err
 	}

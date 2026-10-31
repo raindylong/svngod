@@ -542,7 +542,7 @@ func readBody(r io.Reader, threshold, limit int64) ([]byte, string, error) {
 	if int64(n) <= threshold {
 		return head[:n], "", nil
 	}
-	f, cerr := os.CreateTemp("", "svngod-body-*")
+	f, cerr := createTemp("body")
 	if cerr != nil {
 		return nil, "", cerr
 	}
@@ -582,7 +582,7 @@ func decodeDeltaToFile(base []byte, deltaPath string) (string, error) {
 		return "", err
 	}
 	defer in.Close()
-	out, err := os.CreateTemp("", "svngod-text-*")
+	out, err := createTemp("text")
 	if err != nil {
 		return "", err
 	}
@@ -833,7 +833,7 @@ func collectChanges(repo *fs.Repo, tx *txn) []fs.Change {
 		ch := tx.changes[p]
 		if ch.dataRef != "" && len(ch.data) == 0 && ch.dataFile == "" {
 			if ch.streamed {
-				if tmp, terr := os.CreateTemp("", "svngod-txn-*"); terr == nil {
+				if tmp, terr := createTemp("txn"); terr == nil {
 					if _, gerr := repo.Store().GetTo(context.Background(), activityDataKey(repo, ch.dataRef), tmp); gerr == nil {
 						ch.dataFile = tmp.Name()
 					} else {

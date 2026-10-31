@@ -17,9 +17,13 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"time"
 
 	"svngod/internal/auth"
@@ -102,6 +106,7 @@ func (o *options) buildChain() *auth.Chain {
 }
 
 func main() {
+	cleanupStaleTempFiles()
 	var o options
 	fl := flag.NewFlagSet("svngod", flag.ExitOnError)
 	fl.StringVar(&o.addr, "addr", ":8080", "listen address")
@@ -214,5 +219,39 @@ func runMultiRepo(configPath string) {
 	}
 	if err := http.ListenAndServe(addr, srv.Handler()); err != nil {
 		log.Fatal(err)
+	}
+}
+
+// staleTempRe matches temp files created by server/mirror transfers, which
+// embed the owning process id: svngod-<kind>-<pid>-<random>.
+var staleTempRe = regexp.MustCompile(`^svngod-(?:body|delta|text|txn|put|mirror)-(\d+)-`)
+
+// cleanupStaleTempFiles removes transfer temp files left behind by processes
+// that no longer exist (a crash or kill during an upload). The running
+// process's own files and those of live processes are kept.
+func cleanupStaleTempFiles() {
+	cleanupStaleTempFilesIn(os.TempDir(), func(pid int) bool {
+		_, err := os.Stat(fmt.Sprintf("/proc/%d", pid))
+		return err == nil
+	})
+}
+
+func cleanupStaleTempFilesIn(dir string, alive func(int) bool) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		m := staleTempRe.FindStringSubmatch(e.Name())
+		if m == nil {
+			continue
+		}
+		pid, err := strconv.Atoi(m[1])
+		if err != nil || pid == os.Getpid() || alive(pid) {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+			log.Printf("cleanup temp %s: %v", e.Name(), err)
+		}
 	}
 }

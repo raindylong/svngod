@@ -41,7 +41,6 @@ func commitRequest(t *testing.T, base, repo, uuid string) {
 	resp.Body.Close()
 	txnRoot := strings.TrimSuffix(loc, "/")
 
-
 	// 4. PUT a modified file (returns 204; the path exists at the base rev)
 	resp = doRequest(t, "PUT", txnRoot+"/trunk/README.txt", "hello svn v2\n", "", "", nil)
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
@@ -119,7 +118,6 @@ func TestCommitFlow(t *testing.T) {
 		t.Fatal("GET new.txt content mismatch")
 	}
 }
-
 
 // copyMoveSetup drives MKACTIVITY→PROPPATCH→CHECKOUT and returns the txn root URL.
 func copyMoveSetup(t *testing.T, base, repo, uuid string) string {

@@ -9,26 +9,26 @@ import (
 type resourceType int
 
 const (
-	resRoot       resourceType = iota // /repo/        (the version-controlled collection root)
-	resPublic                         // /repo/trunk/x  (a path in the repo as of HEAD)
-	resVcc                            // /repo/!svn/vcc/default
-	resBaselineColl                   // /repo/!svn/bc/<rev>/<path>
-	resBaseline                       // /repo/!svn/bln/<rev>
-	resActivity                       // /repo/!svn/act/<uuid>
-	resMe                             // /repo/!svn/me  (REPORT endpoint)
-	resTxn                            // /repo/!svn/txn/<uuid>
-	resRev                            // /repo/!svn/rev/<rev>/<path>
-	resVersion                        // /repo/!svn/ver/<rev>/<path>
-	resWorking                        // /repo/!svn/wc/<uuid>/<path>
+	resRoot         resourceType = iota // /repo/        (the version-controlled collection root)
+	resPublic                           // /repo/trunk/x  (a path in the repo as of HEAD)
+	resVcc                              // /repo/!svn/vcc/default
+	resBaselineColl                     // /repo/!svn/bc/<rev>/<path>
+	resBaseline                         // /repo/!svn/bln/<rev>
+	resActivity                         // /repo/!svn/act/<uuid>
+	resMe                               // /repo/!svn/me  (REPORT endpoint)
+	resTxn                              // /repo/!svn/txn/<uuid>
+	resRev                              // /repo/!svn/rev/<rev>/<path>
+	resVersion                          // /repo/!svn/ver/<rev>/<path>
+	resWorking                          // /repo/!svn/wc/<uuid>/<path>
 )
 
 // resource is a parsed svngod request URL.
 type resource struct {
 	typ  resourceType
-	repo string   // repository name ("" if not determined)
-	rev  uint64   // revision for bc/bln/rev/ver
-	path string   // absolute svn path ("/…", "" = root) for public/bc/rev/ver/wc
-	uuid string   // activity / transaction / working-copy id
+	repo string // repository name ("" if not determined)
+	rev  uint64 // revision for bc/bln/rev/ver
+	path string // absolute svn path ("/…", "" = root) for public/bc/rev/ver/wc
+	uuid string // activity / transaction / working-copy id
 }
 
 // parseResource splits a request path (already URL-decoded) into a resource.

@@ -197,7 +197,7 @@ usage:
   svnadmin dump   [--output FILE] [s3 flags] <repo>
   svnadmin load   [--input FILE] [s3 flags] <repo>
   svnadmin verify [s3 flags] <repo>   # integrity walk; prints corrupted nodes
-  svnadmin gc     [s3 flags] <repo>   # delete loose objects of packed shards
+  svnadmin gc     [s3 flags] <repo>   # loose objects, txn bodies, unused texts
 
 s3 flags: --endpoint H:PORT --access-key K --secret-key S --bucket B [--prefix P] [--ssl]
 `)
@@ -239,7 +239,12 @@ func doGC(o *options, repoName string) {
 	if err != nil {
 		fatal(err)
 	}
-	fmt.Printf("gc: removed %d loose objects and %d orphaned txn bodies from %q\n", n, tn, repoName)
+	tx, err := repo.CollectTexts(context.Background())
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Printf("gc: removed %d loose objects, %d orphaned txn bodies and %d unreferenced texts from %q\n",
+		n, tn, tx, repoName)
 }
 
 func doVerify(o *options, repoName string) {
