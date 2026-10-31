@@ -98,25 +98,45 @@ func (s *FileStore) Get(_ context.Context, key string, rng *Range) ([]byte, erro
 	if err != nil {
 		return nil, err
 	}
-	data, err := os.ReadFile(p)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, ErrNotFound
-		}
-		return nil, err
-	}
 	if rng == nil {
+		data, rerr := os.ReadFile(p)
+		if rerr != nil {
+			if os.IsNotExist(rerr) {
+				return nil, ErrNotFound
+			}
+			return nil, rerr
+		}
 		return data, nil
 	}
-	off := rng.Offset
-	if off < 0 || off > int64(len(data)) {
-		return nil, fmt.Errorf("store: range offset %d out of bounds (len %d)", off, len(data))
+	// Ranged reads are used to apply svndiff windows against multi-gigabyte
+	// base texts: reading the whole object and slicing it would allocate the
+	// full file for every window.
+	f, oerr := os.Open(p)
+	if oerr != nil {
+		if os.IsNotExist(oerr) {
+			return nil, ErrNotFound
+		}
+		return nil, oerr
 	}
-	end := int64(len(data))
+	defer f.Close()
+	st, serr := f.Stat()
+	if serr != nil {
+		return nil, serr
+	}
+	size := st.Size()
+	off := rng.Offset
+	if off < 0 || off > size {
+		return nil, fmt.Errorf("store: range offset %d out of bounds (len %d)", off, size)
+	}
+	end := size
 	if rng.Length > 0 && off+rng.Length < end {
 		end = off + rng.Length
 	}
-	return data[off:end], nil
+	buf := make([]byte, end-off)
+	if _, rerr := io.ReadFull(io.NewSectionReader(f, off, end-off), buf); rerr != nil {
+		return nil, rerr
+	}
+	return buf, nil
 }
 
 // PutFile links (or copies) a local file into the object at key. Callers use

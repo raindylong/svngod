@@ -41,10 +41,12 @@ import (
 var errOutOfDate = errors.New("target changed on the server")
 
 const (
-	version        = "0.1.0"
-	bundleMagic    = "SVNGB1\n"
-	maxFileSize    = 16 << 20
-	maxUploadTotal = 512 << 20
+	version     = "0.2.0"
+	bundleMagic = "SVNGB1\n"
+	// The bundle body is spooled to a temp file and streamed, so file size is
+	// bounded by disk, not memory. Keep only a runaway guard for the whole
+	// upload; per-file size is intentionally unlimited.
+	maxUploadTotal = 1 << 40 // 1 TiB per upload
 )
 
 func main() {
@@ -438,12 +440,9 @@ func cmdUpload(args []string) int {
 		if ferr != nil {
 			return ferr
 		}
-		if fi.Size() > maxFileSize {
-			return fmt.Errorf("%s is %d bytes (limit %d); use svn commit for large files", p, fi.Size(), maxFileSize)
-		}
 		total += fi.Size()
 		if total > maxUploadTotal {
-			return fmt.Errorf("upload exceeds %d bytes; split it or use svn commit", maxUploadTotal)
+			return fmt.Errorf("upload exceeds %d bytes; split it", maxUploadTotal)
 		}
 		rel, rerr := filepath.Rel(localDir, p)
 		if rerr != nil {

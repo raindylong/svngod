@@ -1,9 +1,14 @@
 package server
 
 import (
+	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
+
+	"svngod/internal/fs"
+	"svngod/internal/svndiff"
 )
 
 func commitRequest(t *testing.T, base, repo, uuid string) {
@@ -227,5 +232,87 @@ func TestCommitMoveWithinTxn(t *testing.T) {
 	}
 	if _, err := repo.Resolve(head, "/trunk/moved.txt"); err == nil {
 		t.Fatal("moved.txt should be gone after MOVE")
+	}
+}
+
+// TestLargeBaseSmallDeltaIsStoredAsDelta covers the case that used to store a
+// full copy: a small svndiff against a base larger than the stream threshold
+// must be decoded window-by-window and kept as a delta, and a second edit must
+// chain (depth 2) rather than falling back to a full text.
+func TestLargeBaseSmallDeltaIsStoredAsDelta(t *testing.T) {
+	ts, repo, _ := testServer(t, "", "")
+	defer ts.Close()
+	repoURL := ts.URL + "/svn/demo"
+
+	base := make([]byte, 3<<20)
+	for i := range base {
+		base[i] = byte(i * 7)
+	}
+	// r2: the large full text.
+	if _, err := repo.CommitTxn(0, []fs.Change{{
+		Path: "/big.bin", Action: fs.ActionAdd, Kind: fs.KindFile, Data: base,
+	}}, map[string]string{"svn:log": "base", "svn:author": "u", "svn:date": "2026-01-01T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var txn string
+	cur := base
+	put := func(baseRev uint64, text []byte) {
+		t.Helper()
+		delta, err := svndiff.Encode(cur, text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp := doRequest(t, "PUT", repoURL+"/!svn/txr/"+txn+"/big.bin", string(delta), "", "",
+			map[string]string{"Content-Type": "application/vnd.svn-svndiff",
+				"X-SVN-Version-Name": strconv.FormatUint(baseRev, 10)})
+		if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			t.Fatalf("PUT status %d: %s", resp.StatusCode, b)
+		}
+		resp.Body.Close()
+		merge := `<?xml version="1.0"?><D:merge xmlns:D="DAV:"><D:source><D:href>` +
+			repoURL + `/!svn/txn/` + txn + `</D:href></D:source></D:merge>`
+		mr := doRequest(t, "MERGE", repoURL, merge, "", "", map[string]string{"Content-Type": "text/xml"})
+		mr.Body.Close()
+		if mr.StatusCode != http.StatusOK {
+			t.Fatalf("MERGE status %d", mr.StatusCode)
+		}
+		cur = text
+	}
+
+	// r3, r4: small edits of the 3 MiB base; each needs a new transaction.
+	newTxn := func() {
+		t.Helper()
+		resp := doRequest(t, "POST", repoURL+"/!svn/me", "(create-txn)", "", "",
+			map[string]string{"Content-Type": "application/vnd.svn-skel"})
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("create-txn status %d", resp.StatusCode)
+		}
+		txn = resp.Header.Get("SVN-Txn-Name")
+	}
+
+	newTxn()
+	edit1 := append(append([]byte(nil), base...), []byte(strings.Repeat("first edit\n", 64))...)
+	put(2, edit1)
+	newTxn()
+	edit2 := append(append([]byte(nil), edit1...), []byte(strings.Repeat("second edit\n", 64))...)
+	put(3, edit2)
+
+	nr, err := repo.Resolve(4, "/big.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nr.DeltaDepth != 2 || nr.TextRep != fs.TextRepDelta {
+		t.Fatalf("store=%v depth=%d, want delta depth 2", nr.TextRep, nr.DeltaDepth)
+	}
+	got, err := repo.GetText(nr.Node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(edit2) || string(got) != string(edit2) {
+		t.Fatalf("text mismatch: got %d want %d", len(got), len(edit2))
 	}
 }

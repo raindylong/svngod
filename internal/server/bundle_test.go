@@ -174,3 +174,32 @@ func TestBundleDeleteAndAuthz(t *testing.T) {
 }
 
 var _ = io.Discard
+
+// TestBundleLargeText ensures the bulk channel carries files above the old
+// 16 MiB client limit: the body is spooled to disk on both sides, so a large
+// text must commit and read back byte-identically.
+func TestBundleLargeText(t *testing.T) {
+	ts, repo := newBundleTestServer(t)
+	defer ts.Close()
+	big := strings.Repeat("0123456789abcdef", (17<<20)/16) // 17 MiB
+	b := &testBundle{Token: strings.Repeat("a1", 16), Message: "large"}
+	code, out := postBundle(t, ts, b.body(big))
+	if code != http.StatusOK {
+		t.Fatalf("status=%d out=%v", code, out)
+	}
+	head, _ := repo.HeadFresh()
+	if head != 1 {
+		t.Fatalf("head=%d", head)
+	}
+	nr, err := repo.Resolve(1, "/f0.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text, err := repo.GetText(nr.Node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(text) != len(big) || string(text) != big {
+		t.Fatalf("text mismatch: got %d bytes", len(text))
+	}
+}

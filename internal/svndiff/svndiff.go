@@ -527,7 +527,24 @@ const maxSectionLen = 128 << 20
 // ApplyTo decodes a delta stream from r and writes the target to w without
 // materializing it. src may be nil for a delta against the empty stream (new
 // files). Memory use is bounded by the window size (the ins/data sections).
+// SourceFunc returns bytes [off, off+length) of a delta's source text.
+type SourceFunc func(off, length int64) ([]byte, error)
+
+// ApplyTo applies a delta whose source is src, writing the target to w.
 func ApplyTo(src []byte, r io.Reader, w io.Writer) error {
+	return ApplyToSource(int64(len(src)), func(off, length int64) ([]byte, error) {
+		if off < 0 || length < 0 || off+length > int64(len(src)) {
+			return nil, errors.New("svndiff: source range out of bounds")
+		}
+		return src[off : off+length], nil
+	}, r, w)
+}
+
+// ApplyToSource decodes a delta stream, reading source windows through src.
+// src may be backed by ranged object reads, so a multi-gigabyte base text is
+// never materialized in memory: only one source window and one target window
+// (both bounded by maxSectionLen) are held at a time.
+func ApplyToSource(srcLen int64, src SourceFunc, r io.Reader, w io.Writer) error {
 	br := bufio.NewReaderSize(r, 1<<16)
 	hdr := make([]byte, 4)
 	if _, err := io.ReadFull(br, hdr); err != nil {
@@ -574,10 +591,19 @@ func ApplyTo(src []byte, r io.Reader, w io.Writer) error {
 		if err != nil {
 			return err
 		}
-		if sviewOffset > uint64(len(src)) || sviewLen > uint64(len(src))-sviewOffset {
+		if sviewLen > maxSectionLen || tviewLen > maxSectionLen {
+			return errors.New("svndiff: window too large")
+		}
+		if sviewOffset > uint64(srcLen) || sviewLen > uint64(srcLen)-sviewOffset {
 			return errors.New("svndiff: source window out of bounds")
 		}
-		sview := src[sviewOffset : sviewOffset+sviewLen]
+		sview, serr := src(int64(sviewOffset), int64(sviewLen))
+		if serr != nil {
+			return serr
+		}
+		if uint64(len(sview)) != sviewLen {
+			return errors.New("svndiff: short source window")
+		}
 		ins, err := readSection(insLen)
 		if err != nil {
 			return fmt.Errorf("svndiff: bad instruction section: %w", err)
@@ -586,7 +612,7 @@ func ApplyTo(src []byte, r io.Reader, w io.Writer) error {
 		if err != nil {
 			return fmt.Errorf("svndiff: bad data section: %w", err)
 		}
-		var written uint64
+		tview := make([]byte, 0, tviewLen)
 		ip, dp := 0, 0
 		for ip < len(ins) {
 			c := ins[ip]
@@ -616,23 +642,33 @@ func ApplyTo(src []byte, r io.Reader, w io.Writer) error {
 				if v > uint64(len(sview)) || length > uint64(len(sview))-v {
 					return errors.New("svndiff: source copy out of bounds")
 				}
-				if _, werr := w.Write(sview[v : v+length]); werr != nil {
-					return werr
+				tview = append(tview, sview[v:v+length]...)
+			case actionTarget:
+				v, n, uerr := readUint(ins[ip:])
+				if uerr != nil {
+					return uerr
 				}
-				written += length
+				ip += n
+				cur := uint64(len(tview))
+				if v >= cur {
+					return errors.New("svndiff: target copy out of bounds")
+				}
+				for k := uint64(0); k < length; k++ {
+					tview = append(tview, tview[v+k])
+				}
 			case actionNew:
 				if dp+int(length) > len(data) {
 					return errors.New("svndiff: new data out of bounds")
 				}
-				if _, werr := w.Write(data[dp : dp+int(length)]); werr != nil {
-					return werr
-				}
+				tview = append(tview, data[dp:dp+int(length)]...)
 				dp += int(length)
-				written += length
 			}
 		}
-		if written != tviewLen {
+		if uint64(len(tview)) != tviewLen {
 			return errors.New("svndiff: window length mismatch")
+		}
+		if _, werr := w.Write(tview); werr != nil {
+			return werr
 		}
 	}
 }

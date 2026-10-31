@@ -30,8 +30,12 @@ import (
 const bundleMagic = "SVNGB1\n"
 
 const (
-	maxBundleHeader  = 32 << 20
-	maxBundleText    = 512 << 20
+	maxBundleHeader = 32 << 20
+	// Per-text and whole-bundle caps are policy guards, not memory bounds:
+	// texts above 1 MiB are streamed into a temp file. A single bundle may
+	// carry multi-gigabyte binaries (1 TiB total, 64 GiB per file).
+	maxBundleText    = 64 << 30
+	maxBundleTotal   = 1 << 40
 	maxBundleChanges = 500000
 	bundleClaimTTL   = 5 * time.Minute
 )
@@ -124,7 +128,7 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 	// Replay after a retry: the body is drained so the client can finish
 	// sending, then the recorded revision is returned.
 	if rec, ok := loadBundleRecord(ctx, repo, key); ok {
-		io.Copy(io.Discard, io.LimitReader(r.Body, maxBundleText))
+		io.Copy(io.Discard, io.LimitReader(r.Body, maxBundleTotal))
 		if rec.User != "" && rec.User != user {
 			http.Error(w, "token belongs to another user", http.StatusConflict)
 			return
@@ -151,7 +155,7 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 	}
 	if claimErr != nil {
 		// Another upload is in flight: wait for its result briefly.
-		io.Copy(io.Discard, io.LimitReader(r.Body, maxBundleText))
+		io.Copy(io.Discard, io.LimitReader(r.Body, maxBundleTotal))
 		deadline := time.Now().Add(30 * time.Second)
 		for time.Now().Before(deadline) {
 			if rec, ok := loadBundleRecord(ctx, repo, key); ok {
@@ -197,7 +201,7 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, perr.Error(), http.StatusBadRequest)
 			return
 		}
-		if bc.TextLen < 0 || bc.TextLen > maxBundleText || total+bc.TextLen > maxBundleText {
+		if bc.TextLen < 0 || bc.TextLen > maxBundleText || total+bc.TextLen > maxBundleTotal {
 			http.Error(w, "bundle text too large", http.StatusRequestEntityTooLarge)
 			return
 		}

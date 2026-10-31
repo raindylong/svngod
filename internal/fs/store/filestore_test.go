@@ -83,3 +83,41 @@ func TestFileStoreDeletePrefix(t *testing.T) {
 		t.Fatal("expected escape rejection")
 	}
 }
+
+func TestFileStoreRangedGet(t *testing.T) {
+	dir := t.TempDir()
+	st, err := NewFileStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	data := make([]byte, 3<<20)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	if err := st.Put(ctx, "obj", data); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct{ off, length int64 }{
+		{0, 1 << 20},
+		{1<<20 + 123, 4096},
+		{int64(len(data)) - 10, 10},
+		{int64(len(data)) - 10, 100}, // clamped to the end
+	}
+	for _, c := range cases {
+		got, gerr := st.Get(ctx, "obj", &Range{Offset: c.off, Length: c.length})
+		if gerr != nil {
+			t.Fatalf("range %d+%d: %v", c.off, c.length, gerr)
+		}
+		end := c.off + c.length
+		if end > int64(len(data)) {
+			end = int64(len(data))
+		}
+		if want := data[c.off:end]; len(got) != len(want) || string(got) != string(want) {
+			t.Fatalf("range %d+%d: got %d bytes, want %d", c.off, c.length, len(got), len(want))
+		}
+	}
+	if _, gerr := st.Get(ctx, "obj", &Range{Offset: int64(len(data)) + 1}); gerr == nil {
+		t.Fatal("expected out-of-bounds error")
+	}
+}
