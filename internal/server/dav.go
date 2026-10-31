@@ -52,6 +52,13 @@ func (s *Server) handleOptions(w http.ResponseWriter, r *http.Request, res resou
 	h.Set("Allow", allowedMethods)
 	// svngocli negotiates the bulk commit channel through this capability.
 	h.Set("X-Svngod-Bundle", "1")
+	if httpV2Enabled() {
+		// HTTPv2 negotiation, byte-for-byte as mod_dav_svn 1.14 sends it:
+		// a repository-root path plus the supported POST transaction types.
+		h.Set("SVN-Repository-Root", strings.TrimSuffix(s.cfg.BasePath, "/")+"/"+res.repo)
+		h.Add("SVN-Supported-Posts", "create-txn")
+		h.Add("SVN-Supported-Posts", "create-txn-with-props")
+	}
 	h.Set("Content-Type", "text/xml; charset=utf-8")
 	// ra_serf always parses the OPTIONS response body as XML
 	// (options_response_handler -> expat parsing of S:options-response), so

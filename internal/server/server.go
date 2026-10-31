@@ -169,6 +169,10 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 			s.cfg.Logger.Printf("HTTP %d %s %s user=%q %v", sw.code, r.Method, r.URL.Path, user, time.Since(start).Round(time.Microsecond))
 		}
 	}()
+	if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/!svn/me") {
+		s.handlePostMe(w, r)
+		return
+	}
 	// Negotiated bulk commit channel (svngocli): one request, one atomic
 	// revision; no DAV resources are involved, so it bypasses routing.
 	if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/!svngod/bundle") {
