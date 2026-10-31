@@ -449,8 +449,8 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 		}
 		href := rvrHref(base, path, nodeRev)
 		b.WriteString("      <D:checked-in><D:href>" + xmlEscape(href) + "</D:href></D:checked-in>\n")
+		writeEntryProps(b, rp, uuid, rev)
 	}
-	writeEntryProps(b, rp, uuid, rev)
 	children, err := repo.ListDir(rev, path)
 	if err != nil {
 		return err
@@ -490,25 +490,45 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 					dirRev = copyFloor
 				}
 				ver := rvrHref(base, cpath, dirRev)
-				b.WriteString("    <S:open-directory name=\"" + xmlEscape(c.Name) + "\" rev=\"" + strconv.FormatUint(outRev, 10) + "\">\n")
-				b.WriteString("      <D:checked-in><D:href>" + xmlEscape(ver) + "</D:href></D:checked-in>\n")
-				writeEntryProps(b, rp, uuid, rev)
-				writeNodeProps(b, c.Props)
 				cl := limit
 				if !explicitDepth {
 					if l, ok := wb.entryDepthLevel(cpath); ok {
 						cl = minLimit(limit, l)
 					}
 				}
+				emitDir := func(body string) {
+					b.WriteString("    <S:open-directory name=\"" + xmlEscape(c.Name) + "\" rev=\"" + strconv.FormatUint(outRev, 10) + "\">\n")
+					b.WriteString("      <D:checked-in><D:href>" + xmlEscape(ver) + "</D:href></D:checked-in>\n")
+					writeEntryProps(b, rp, uuid, rev)
+					writeNodeProps(b, c.Props)
+					b.WriteString(body)
+					b.WriteString("    </S:open-directory>\n")
+				}
 				if cl >= 0 && childLevel+1 > cl {
 					// Depth stops here: emit the directory, no children.
-					b.WriteString("    </S:open-directory>\n")
+					emitDir("")
 					continue
 				}
-				if err := s.updateWalkDir(b, repo, base, rev, cpath, "open-directory", false, rp, uuid, wb, childLevel, cl, false, explicitDepth, copyFloor, "", cwcPath, sendAll); err != nil {
+				// mod_dav_svn only reports a subtree that actually changed: a
+				// no-op update carries just the root directory. Render the
+				// children first and drop the whole element when nothing came
+				// out and the directory's own node and props are unchanged.
+				var sub strings.Builder
+				if err := s.updateWalkDir(&sub, repo, base, rev, cpath, "open-directory", false, rp, uuid, wb, childLevel, cl, false, explicitDepth, copyFloor, "", cwcPath, sendAll); err != nil {
 					return err
 				}
-				b.WriteString("    </S:open-directory>\n")
+				needsEmit := sub.Len() > 0 || dirRev > baseRev
+				if !needsEmit {
+					if bnr, berr := repo.Resolve(baseRev, cwcPath); berr == nil {
+						needsEmit = !sameProps(bnr.Props, c.Props)
+					} else {
+						needsEmit = true
+					}
+				}
+				if !needsEmit {
+					continue
+				}
+				emitDir(sub.String())
 			} else {
 				bc := base + "!svn/bc/" + strconv.FormatUint(rev, 10) + "/" + strings.TrimPrefix(escapePathSegments(cpath), "/")
 				dirRev := c.Rev
@@ -551,7 +571,8 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 		// load every file (and its delta chain) just to compare revisions.
 		var baseNode *fs.NodeRev
 		if inBase {
-			if bn, berr := repo.Resolve(baseRev, cwcPath); berr == nil && bn.Kind == fs.KindFile {
+			bn, berr := repo.Resolve(baseRev, cwcPath)
+			if berr == nil && bn.Kind == fs.KindFile {
 				baseNode = bn
 			}
 		}

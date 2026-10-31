@@ -55,6 +55,42 @@ type Repo struct {
 	// []byte-only, so this is a dedicated pointer map with its own mutex.
 	nodeCacheMu sync.Mutex
 	nodeCache   map[cache.Key]*NodeRev
+	// blockCache keeps decoded rev blocks. A block is immutable and its nodes
+	// are decoded on demand, so sharing it is safe; without this every Resolve
+	// and ListDir copied the whole block and re-parsed its node table, which
+	// dominates walks over large revisions (a 1 MiB inline text makes the
+	// block 1 MiB, and a 200-file report did that hundreds of times).
+	blockCacheMu sync.Mutex
+	blockCache   map[uint64]*RevBlock
+	blockBytes   int
+}
+
+// blockCacheBudget bounds decoded rev blocks held per repository.
+const blockCacheBudget = 64 << 20
+
+// cachedBlock returns a decoded block, if present.
+func (r *Repo) cachedBlock(rev uint64) (*RevBlock, bool) {
+	r.blockCacheMu.Lock()
+	defer r.blockCacheMu.Unlock()
+	rb, ok := r.blockCache[rev]
+	return rb, ok
+}
+
+// storeBlock inserts a decoded block, dropping the whole set when over budget.
+func (r *Repo) storeBlock(rev uint64, rb *RevBlock, size int) {
+	r.blockCacheMu.Lock()
+	defer r.blockCacheMu.Unlock()
+	if r.blockCache == nil {
+		r.blockCache = map[uint64]*RevBlock{}
+	}
+	if r.blockBytes+size > blockCacheBudget {
+		r.blockCache = map[uint64]*RevBlock{}
+		r.blockBytes = 0
+	}
+	if _, ok := r.blockCache[rev]; !ok {
+		r.blockBytes += size
+	}
+	r.blockCache[rev] = rb
 }
 
 // CreateRepo writes a fresh repository (format/uuid/current) and returns it.
@@ -231,9 +267,16 @@ func (r *Repo) readShardIdx(shard uint64) (*ShardIdx, error) {
 
 // readBlock reads the rev block for a revision from loose or packed storage.
 func (r *Repo) readBlock(rev uint64) (*RevBlock, error) {
+	if rb, ok := r.cachedBlock(rev); ok {
+		return rb, nil
+	}
 	k := cache.Key(fmt.Sprintf("blk/%d", rev))
 	if b, ok := r.cache.Get(k); ok {
-		return UnmarshalRevBlock(b)
+		rb, err := UnmarshalRevBlock(b)
+		if err == nil {
+			r.storeBlock(rev, rb, len(b))
+		}
+		return rb, err
 	}
 	ctx := context.Background()
 	sh := r.shard(rev)
@@ -264,6 +307,7 @@ func (r *Repo) readBlock(rev uint64) (*RevBlock, error) {
 		return nil, err
 	}
 	cachePut(r.cache, k, data)
+	r.storeBlock(rev, rb, len(data))
 	return rb, nil
 }
 
@@ -1139,7 +1183,7 @@ func (r *Repo) PackShard(shard uint64) error {
 // separate content-addressed objects (texts/<md5>). Rev blocks then stay small,
 // object stores serve the data directly, and GET can stream it. Deltas stay
 // inline (they are small after the encoder work).
-const externalTextThreshold = 1 << 20
+const externalTextThreshold = 256 << 10
 
 // maxCachedObject bounds what the LRU keeps. Full texts of large files are
 // built in memory for delta application anyway, but caching them would keep
