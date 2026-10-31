@@ -50,6 +50,8 @@ func (s *Server) handleOptions(w http.ResponseWriter, r *http.Request, res resou
 	h.Set("SVN-Youngest-Rev", strconv.FormatUint(head, 10))
 	h.Set("SVN-repos-Version", "1")
 	h.Set("Allow", allowedMethods)
+	// svngocli negotiates the bulk commit channel through this capability.
+	h.Set("X-Svngod-Bundle", "1")
 	h.Set("Content-Type", "text/xml; charset=utf-8")
 	// ra_serf always parses the OPTIONS response body as XML
 	// (options_response_handler -> expat parsing of S:options-response), so

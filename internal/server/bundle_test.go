@@ -1,0 +1,176 @@
+package server
+
+import (
+	"bytes"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"svngod/internal/fs"
+	"svngod/internal/fs/store"
+)
+
+type testBundleChange struct {
+	Path    string            `json:"path"`
+	Action  string            `json:"action"`
+	Kind    string            `json:"kind"`
+	BaseRev uint64            `json:"baseRev,omitempty"`
+	Props   map[string]string `json:"props,omitempty"`
+	TextLen int64             `json:"textLen,omitempty"`
+}
+
+type testBundle struct {
+	Token   string             `json:"token"`
+	BaseRev uint64             `json:"baseRev"`
+	Message string             `json:"message"`
+	Changes []testBundleChange `json:"changes"`
+}
+
+func (b *testBundle) body(texts ...string) []byte {
+	b.Changes = b.Changes[:0]
+	for i, txt := range texts {
+		b.Changes = append(b.Changes, testBundleChange{
+			Path: fmt.Sprintf("/f%d.txt", i), Action: "put", Kind: "file",
+			BaseRev: b.BaseRev, TextLen: int64(len(txt)),
+		})
+	}
+	hdr, _ := json.Marshal(b)
+	var buf bytes.Buffer
+	buf.WriteString(bundleMagic)
+	var sz [8]byte
+	binary.BigEndian.PutUint64(sz[:], uint64(len(hdr)))
+	buf.Write(sz[:])
+	buf.Write(hdr)
+	for _, txt := range texts {
+		buf.WriteString(txt)
+	}
+	return buf.Bytes()
+}
+
+func newBundleTestServer(t *testing.T) (*httptest.Server, *fs.Repo) {
+	t.Helper()
+	st := store.NewMemoryStore()
+	repo, err := fs.CreateRepo(st, "bun", 4096, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := New(Config{
+		BasePath: "/svn",
+		OpenRepo: func(name string) (*fs.Repo, error) {
+			if name != "bun" {
+				return nil, fs.ErrRepoNotFound
+			}
+			return repo, nil
+		},
+	})
+	return httptest.NewServer(srv.Handler()), repo
+}
+
+func postBundle(t *testing.T, ts *httptest.Server, body []byte) (int, map[string]interface{}) {
+	t.Helper()
+	req, err := http.NewRequest("POST", ts.URL+"/svn/bun/!svngod/bundle", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/x-svngod-bundle")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	out := map[string]interface{}{}
+	json.NewDecoder(resp.Body).Decode(&out)
+	return resp.StatusCode, out
+}
+
+func TestBundleCommitAndReplay(t *testing.T) {
+	ts, repo := newBundleTestServer(t)
+	defer ts.Close()
+
+	b := &testBundle{Token: strings.Repeat("a1", 16), Message: "bulk"}
+	code, out := postBundle(t, ts, b.body("hello", "world"))
+	if code != 200 || out["revision"].(float64) != 1 {
+		t.Fatalf("bundle commit status=%d out=%v", code, out)
+	}
+	nr, err := repo.Resolve(1, "/f0.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if txt, _ := repo.GetText(nr.Node); string(txt) != "hello" {
+		t.Fatalf("content=%q", txt)
+	}
+
+	// Same token -> same revision, no second commit.
+	b2 := &testBundle{Token: b.Token, Message: "bulk"}
+	code, out = postBundle(t, ts, b2.body("hello", "world"))
+	if code != 200 || out["revision"].(float64) != 1 || out["replayed"] != true {
+		t.Fatalf("replay status=%d out=%v", code, out)
+	}
+	if head, _ := repo.Head(); head != 1 {
+		t.Fatalf("replay created a revision: head=%d", head)
+	}
+
+	// A new token with a modify and a delete lands as one revision.
+	mod := &testBundle{Token: strings.Repeat("b2", 16), BaseRev: 1, Message: "edit"}
+	mod.Changes = []testBundleChange{
+		{Path: "/f0.txt", Action: "put", Kind: "file", BaseRev: 1, TextLen: 5},
+		{Path: "/f1.txt", Action: "delete", Kind: "file", BaseRev: 1},
+	}
+	hdr, _ := json.Marshal(mod)
+	var buf bytes.Buffer
+	buf.WriteString(bundleMagic)
+	var sz [8]byte
+	binary.BigEndian.PutUint64(sz[:], uint64(len(hdr)))
+	buf.Write(sz[:])
+	buf.Write(hdr)
+	buf.WriteString("HELLO")
+	code, out = postBundle(t, ts, buf.Bytes())
+	if code != 200 || out["revision"].(float64) != 2 {
+		t.Fatalf("modify bundle status=%d out=%v", code, out)
+	}
+	nr, _ = repo.Resolve(2, "/f0.txt")
+	if txt, _ := repo.GetText(nr.Node); string(txt) != "HELLO" {
+		t.Fatalf("modified content=%q", txt)
+	}
+	if _, err := repo.Resolve(2, "/f1.txt"); err == nil {
+		t.Fatal("deleted file still present")
+	}
+}
+
+func TestBundleDeleteAndAuthz(t *testing.T) {
+	ts, repo := newBundleTestServer(t)
+	defer ts.Close()
+	if _, err := repo.CommitTxn(0, []fs.Change{{Path: "/gone.txt", Action: fs.ActionAdd, Kind: fs.KindFile, Data: []byte("x")}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	b := &testBundle{Token: strings.Repeat("c3", 16), BaseRev: 1, Message: "rm"}
+	b.Changes = []testBundleChange{{Path: "/gone.txt", Action: "delete", Kind: "file", BaseRev: 1}}
+	hdr, _ := json.Marshal(b)
+	var buf bytes.Buffer
+	buf.WriteString(bundleMagic)
+	var sz [8]byte
+	binary.BigEndian.PutUint64(sz[:], uint64(len(hdr)))
+	buf.Write(sz[:])
+	buf.Write(hdr)
+	code, out := postBundle(t, ts, buf.Bytes())
+	if code != 200 || out["revision"].(float64) != 2 {
+		t.Fatalf("delete bundle status=%d out=%v", code, out)
+	}
+	if _, err := repo.Resolve(2, "/gone.txt"); err == nil {
+		t.Fatal("file still present after bundle delete")
+	}
+
+	// A malformed token is rejected.
+	bad := &testBundle{Token: "short", Message: "x"}
+	code, _ = postBundle(t, ts, bad.body("x"))
+	if code != 400 {
+		t.Fatalf("short token status=%d, want 400", code)
+	}
+}
+
+var _ = io.Discard

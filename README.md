@@ -16,6 +16,7 @@
 ```bash
 go build -o svngod ./cmd/svngod
 go build -o svnadmin ./cmd/svnadmin
+go build -o svngocli ./cmd/svngocli   # 客户端（需要本机 svn 命令）
 
 # 本地单库（flag 模式）
 svnadmin create /srv/svn/demo
@@ -27,6 +28,25 @@ svngod --config svngod.json
 ```
 
 配置示例见 `docs/Go-SVN服务器架构设计方案.md` §9.4（多库）、§9.5（主备 S3 镜像）。
+
+### svngocli（客户端）
+
+`svngocli` 默认把所有子命令透传给本机 `svn`（功能与原生一致），并额外提供：
+
+```bash
+# 只读命令自动重试瞬时连接错误；commit 失败时先核对修订是否已落库再重试
+svngocli update
+svngocli commit -m "msg"
+
+# 单请求、原子提交整棵目录树（协商 svngod 批量提交通道；内容哈希幂等）
+svngocli upload ./dist https://host/svn/repo/releases/v1 -m "release" \
+  --username alice --password secret [--delete-missing]
+```
+
+`upload` 通过 `OPTIONS` 的 `X-Svngod-Bundle: 1` 协商：整个目录树打包为一个请求、
+服务端用一次 `CommitTxn` 提交为一个修订；请求携带内容派生的 token，重试/重复上传
+不会产生重复修订；服务端按路径做 authz、锁与 out-of-date 检查（他人先提交时整包
+失败、不产生部分结果）。服务端不支持该通道时，自动退回 `svn import`。
 
 ### 启动（S3 后端，当前环境示例）
 
@@ -96,6 +116,7 @@ internal/
 cmd/
   svngod/    服务器 CLI（flag 单库 + --config 多库/镜像）
   svnadmin/  create / dump / load 迁移工具
+  svngocli/  客户端：透传 svn + 安全重试 + 批量原子提交（!svngod/bundle）
   perf/      修订生成压测（自动分片打包验证）
 ```
 
