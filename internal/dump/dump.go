@@ -8,12 +8,12 @@ package dump
 
 import (
 	"bytes"
-	"strings"
 	"crypto/md5"
 	"errors"
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 
 	"svngod/internal/fs"
 )
@@ -183,7 +183,11 @@ func writeNode(w io.Writer, repo *fs.Repo, rev uint64, path string, action chang
 	// copyfrom (the fs keeps it for lineage) must not repeat it, or loaders
 	// treat the modification as a fresh copy.
 	if nr.CopyFrom != nil && (action == chAdded || action == chReplaced) {
-		fmt.Fprintf(w, "Node-copyfrom-rev: %d\n", nr.CopyFrom.Rev)
+		cfRev := nr.CopyFrom.Rev
+		if nr.CopyFromRev > 0 {
+			cfRev = nr.CopyFromRev
+		}
+		fmt.Fprintf(w, "Node-copyfrom-rev: %d\n", cfRev)
 		fmt.Fprintf(w, "Node-copyfrom-path: %s\n", nr.CopyFromPath)
 	}
 	fmt.Fprintf(w, "Prop-content-length: %d\n", len(propText))

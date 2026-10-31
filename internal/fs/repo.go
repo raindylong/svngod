@@ -855,6 +855,7 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 			cf := *t.copyFrom
 			nr.CopyFrom = &cf
 			nr.CopyFromPath = t.copyFromPath
+			nr.CopyFromRev = t.copyFromRev
 		}
 		if t.kind == KindFile {
 			if t.deltaRep {
@@ -1188,6 +1189,7 @@ func (r *Repo) applyChange(root *tnode, ch *Change) error {
 			cp.copyFrom = &src.id
 		}
 		cp.copyFromPath = ch.CopyFromPath
+		cp.copyFromRev = ch.CopyFromRev
 		if err := r.ensureDir(parent); err != nil {
 			return err
 		}

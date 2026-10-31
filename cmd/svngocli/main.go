@@ -97,9 +97,19 @@ var readOnlyCmds = map[string]bool{
 
 func isReadOnly(cmd string) bool { return readOnlyCmds[cmd] }
 
+// svnBin is the native svn binary; SVNGOCLI_NATIVE_SVN lets a wrapper (or a
+// test harness) point it at a specific install without recursing through a
+// shim named "svn" on PATH.
+func svnBin() string {
+	if v := os.Getenv("SVNGOCLI_NATIVE_SVN"); v != "" {
+		return v
+	}
+	return "svn"
+}
+
 func runSvn(args []string, retry bool) int {
 	if !retry {
-		cmd := exec.Command("svn", args...)
+		cmd := exec.Command(svnBin(), args...)
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 		if err := cmd.Run(); err != nil {
 			return exitCode(err)
@@ -109,7 +119,7 @@ func runSvn(args []string, retry bool) int {
 	backoff := time.Second
 	for attempt := 0; attempt < 3; attempt++ {
 		var out bytes.Buffer
-		cmd := exec.Command("svn", args...)
+		cmd := exec.Command(svnBin(), args...)
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = &out
 		cmd.Stderr = &out
@@ -162,7 +172,7 @@ func cmdCommit(args []string) int {
 	wcURL, head := svnURLAndHead(".")
 	for attempt := 0; attempt < 3; attempt++ {
 		var out bytes.Buffer
-		cmd := exec.Command("svn", args...)
+		cmd := exec.Command(svnBin(), args...)
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = &out
 		cmd.Stderr = &out
@@ -286,7 +296,7 @@ func authFlags() []string {
 
 func runSvnOutput(args []string) ([]byte, error) {
 	args = append(args, authFlags()...)
-	cmd := exec.Command("svn", args...)
+	cmd := exec.Command(svnBin(), args...)
 	var errb bytes.Buffer
 	cmd.Stderr = &errb
 	out, err := cmd.Output()

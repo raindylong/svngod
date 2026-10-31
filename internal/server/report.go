@@ -343,6 +343,12 @@ func (w *wcBaseline) rootRev() uint64 {
 // writeEntryProps emits svn:entry properties for a node. svn's update editor
 // derives the working-copy changed_rev/date/author/uuid from these; without
 // svn:entry:committed-rev the client aborts with an invalid-revision assert.
+// revPropsFor returns a revision's properties (nil on error).
+func revPropsFor(repo *fs.Repo, rev uint64) *fs.RevProps {
+	rp, _ := repo.GetRevProps(rev)
+	return rp
+}
+
 func writeEntryProps(b *strings.Builder, rp *fs.RevProps, uuid string, rev uint64) {
 	if rp != nil {
 		if date := rp.Props["svn:date"]; date != "" {
@@ -449,7 +455,13 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 		}
 		href := rvrHref(base, path, nodeRev)
 		b.WriteString("      <D:checked-in><D:href>" + xmlEscape(href) + "</D:href></D:checked-in>\n")
-		writeEntryProps(b, rp, uuid, rev)
+		lastRev := rev
+		if nr, err := repo.Resolve(rev, path); err == nil {
+			lastRev = nr.Node.Rev
+			writeEntryProps(b, nodeRevProps(repo, nr), uuid, lastRev)
+		} else {
+			writeEntryProps(b, rp, uuid, lastRev)
+		}
 	}
 	children, err := repo.ListDir(rev, path)
 	if err != nil {
@@ -499,7 +511,7 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 				emitDir := func(body string) {
 					b.WriteString("    <S:open-directory name=\"" + xmlEscape(c.Name) + "\" rev=\"" + strconv.FormatUint(outRev, 10) + "\">\n")
 					b.WriteString("      <D:checked-in><D:href>" + xmlEscape(ver) + "</D:href></D:checked-in>\n")
-					writeEntryProps(b, rp, uuid, rev)
+					writeEntryProps(b, revPropsFor(repo, c.ID.Rev), uuid, c.ID.Rev)
 					writeNodeProps(b, c.Props)
 					b.WriteString(body)
 					b.WriteString("    </S:open-directory>\n")
@@ -543,7 +555,7 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 				ver := rvrHref(base, cpath, dirRev)
 				b.WriteString("    <S:add-directory name=\"" + xmlEscape(c.Name) + "\" bc-url=\"" + xmlEscape(bc) + "\">\n")
 				b.WriteString("      <D:checked-in><D:href>" + xmlEscape(ver) + "</D:href></D:checked-in>\n")
-				writeEntryProps(b, rp, uuid, rev)
+				writeEntryProps(b, revPropsFor(repo, c.ID.Rev), uuid, c.ID.Rev)
 				writeNodeProps(b, c.Props)
 				cl := limit
 				if !explicitDepth {
@@ -594,7 +606,7 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 				ver := rvrHref(base, cpath, fileRev)
 				b.WriteString("    <S:open-file name=\"" + xmlEscape(c.Name) + "\" rev=\"" + strconv.FormatUint(outRev, 10) + "\">\n")
 				b.WriteString("      <D:checked-in><D:href>" + xmlEscape(ver) + "</D:href></D:checked-in>\n")
-				writeEntryProps(b, rp, uuid, rev)
+				writeEntryProps(b, nodeRevProps(repo, nr), uuid, nr.Node.Rev)
 				writeNodeProps(b, nr.Props)
 				b.WriteString("    </S:open-file>\n")
 				continue
@@ -637,7 +649,7 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 			bs := baseNode.TextMD5
 			b.WriteString("    <S:open-file name=\"" + xmlEscape(c.Name) + "\" rev=\"" + strconv.FormatUint(outRev, 10) + "\">\n")
 			b.WriteString("      <D:checked-in><D:href>" + xmlEscape(ver) + "</D:href></D:checked-in>\n")
-			writeEntryProps(b, rp, uuid, rev)
+			writeEntryProps(b, nodeRevProps(repo, nr), uuid, nr.Node.Rev)
 			writeNodeProps(b, nr.Props)
 			b.WriteString("      <S:fetch-file base-checksum=\"" + hex.EncodeToString(bs[:]) + "\" sha1-checksum=\"" + hex.EncodeToString(ss[:]) + "\"/>\n")
 			b.WriteString("    </S:open-file>\n")
@@ -667,7 +679,7 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 		}
 		b.WriteString("    <S:add-file name=\"" + xmlEscape(c.Name) + "\" sha1-checksum=\"" + hex.EncodeToString(ss[:]) + "\">\n")
 		b.WriteString("      <D:checked-in><D:href>" + xmlEscape(ver) + "</D:href></D:checked-in>\n")
-		writeEntryProps(b, rp, uuid, rev)
+		writeEntryProps(b, nodeRevProps(repo, nr), uuid, nr.Node.Rev)
 		writeNodeProps(b, nr.Props)
 		if sendAll {
 			delta, derr := svndiff.Encode(nil, text)
@@ -968,7 +980,7 @@ func (s *Server) logChangedPaths(b *strings.Builder, repo *fs.Repo, rev uint64, 
 			continue
 		}
 		if nr, err := repo.Resolve(rev, p); err == nil && nr.CopyFrom != nil && nr.CopyFromPath != "" {
-			roots = append(roots, copyRoot{path: p, src: nr.CopyFromPath, srcRev: nr.CopyFrom.Rev})
+			roots = append(roots, copyRoot{path: p, src: nr.CopyFromPath, srcRev: copyFromRevOf(nr)})
 		}
 	}
 	for _, cr := range roots {
@@ -983,10 +995,7 @@ func (s *Server) logChangedPaths(b *strings.Builder, repo *fs.Repo, rev uint64, 
 			}
 			// Redundant copy node (the client re-copies every child) or the
 			// very same object as the source: not a distinct change.
-			if nr.CopyFrom != nil && nr.CopyFromPath == cr.src+suffix && nr.CopyFrom.Rev == cr.srcRev {
-				delete(changes, p)
-				continue
-			}
+
 			src, serr := repo.Resolve(cr.srcRev, cr.src+suffix)
 			if serr == nil && src.Node == nr.Node {
 				delete(changes, p)
@@ -1001,8 +1010,8 @@ func (s *Server) logChangedPaths(b *strings.Builder, repo *fs.Repo, rev uint64, 
 			// with the child's own copy source (the source path with this
 			// suffix, as of the revision the child came from).
 			cfRev := nr.Node.Rev
-			if nr.CopyFrom != nil && nr.CopyFrom.Rev > 0 {
-				cfRev = nr.CopyFrom.Rev
+			if cf := copyFromRevOf(nr); cf > 0 {
+				cfRev = cf
 			}
 			changes[p] = change{action: chReplaced, kind: nr.Kind,
 				textMods: nr.Kind == fs.KindFile, propMods: false,
@@ -1030,7 +1039,7 @@ func (s *Server) logChangedPaths(b *strings.Builder, repo *fs.Repo, rev uint64, 
 		case chAdded:
 			if nr, err := repo.Resolve(rev, p); err == nil && nr.CopyFrom != nil {
 				b.WriteString("    <S:added-path copyfrom-path=\"" + xmlEscape(nr.CopyFromPath) + "\" copyfrom-rev=\"" +
-					strconv.FormatUint(nr.CopyFrom.Rev, 10) + "\"" + attrs + ">" + xmlEscape(p) + "</S:added-path>\n")
+					strconv.FormatUint(copyFromRevOf(nr), 10) + "\"" + attrs + ">" + xmlEscape(p) + "</S:added-path>\n")
 				continue
 			}
 			b.WriteString("    <S:added-path" + attrs + ">" + xmlEscape(p) + "</S:added-path>\n")
@@ -1397,19 +1406,29 @@ func (s *Server) reportFileRevs(w http.ResponseWriter, repo *fs.Repo, base, urlP
 // older than the node currently resolved) plus its source path. copyFrom.Rev
 // alone is NOT the copy point — it is the source revision, which made
 // get-location-segments report the wrong ranges for a copied branch.
+func copyFromRevOf(nr *fs.NodeRev) uint64 {
+	if nr == nil || nr.CopyFrom == nil {
+		return 0
+	}
+	if nr.CopyFromRev > 0 {
+		return nr.CopyFromRev
+	}
+	return nr.CopyFrom.Rev
+}
+
 func copyOrigin(repo *fs.Repo, nr *fs.NodeRev) (copyRev uint64, srcPath string, srcRev uint64, ok bool) {
 	if nr == nil || nr.CopyFrom == nil || nr.CopyFromPath == "" {
 		return 0, "", 0, false
 	}
 	srcPath = nr.CopyFromPath
-	srcRev = nr.CopyFrom.Rev
+	srcRev = copyFromRevOf(nr)
 	cur := nr
 	for !cur.Pred.IsZero() {
 		p, err := repo.GetNodeRev(cur.Pred)
 		if err != nil {
 			break
 		}
-		if p.CopyFrom == nil || p.CopyFromPath != srcPath || p.CopyFrom.Rev != srcRev {
+		if p.CopyFrom == nil || p.CopyFromPath != srcPath || p.CopyFrom.Rev != nr.CopyFrom.Rev {
 			break
 		}
 		cur = p

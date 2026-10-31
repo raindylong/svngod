@@ -71,6 +71,7 @@ type tnode struct {
 	children     map[string]*tnode
 	copyFrom     *NodeID
 	copyFromPath string
+	copyFromRev  uint64
 
 	// identity / representation of the current node-rev (as of HEAD)
 	id         NodeID // zero = new this commit

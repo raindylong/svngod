@@ -77,8 +77,13 @@ type NodeRev struct {
 	// upload). Update reports use it instead of reading the text again. Zero
 	// means unknown; it is a second optional trailing field.
 	TextSHA1 [20]byte
-	Base     *NodeID // delta base, when TextRep==TextRepDelta
-	Children []Child // dir only
+	// CopyFromRev is the revision the client copied the source from (the COPY
+	// URL's peg), stored separately from CopyFrom (the exact source node id).
+	// svn log -v reports this revision; deriving it from the source node id
+	// gives the source's creation revision and breaks history traversal.
+	CopyFromRev uint64
+	Base        *NodeID // delta base, when TextRep==TextRepDelta
+	Children    []Child // dir only
 	// ByName is a runtime-only name->Child index for directories, built on
 	// decode/cache; it is NOT persisted (Marshal ignores it) and lets Resolve
 	// find a child in O(1) instead of scanning Children (O(n) on a big dir).
@@ -137,11 +142,16 @@ func (nr *NodeRev) Marshal() []byte {
 		}
 	}
 	// Optional trailing fields: full text size, then the text SHA-1 when
-	// known. Older node-revs end here, so absence simply means "unknown".
-	if nr.TotalSize > 0 || nr.TextSHA1 != ([20]byte{}) {
+	// known, then the copy source revision. Older node-revs end earlier, so
+	// absence simply means "unknown". A uvarint is at most 10 bytes, so a
+	// trailing CopyFromRev never looks like a 20-byte SHA-1.
+	if nr.TotalSize > 0 || nr.TextSHA1 != ([20]byte{}) || nr.CopyFromRev > 0 {
 		wire.WriteUvarint(&b, nr.TotalSize)
 		if nr.TextSHA1 != ([20]byte{}) {
 			b.Write(nr.TextSHA1[:])
+		}
+		if nr.CopyFromRev > 0 {
+			wire.WriteUvarint(&b, nr.CopyFromRev)
 		}
 	}
 	body := b.Bytes()
@@ -307,6 +317,12 @@ func UnmarshalNodeRev(b []byte) (*NodeRev, error) {
 		p += n
 		if len(body)-p >= 20 {
 			copy(nr.TextSHA1[:], body[p:p+20])
+			p += 20
+		}
+		if len(body)-p > 0 {
+			if nr.CopyFromRev, _, err = wire.ReadUvarint(body[p:]); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return nr, nil
