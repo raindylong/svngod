@@ -149,21 +149,36 @@ func (s *Server) persistActivity(repo *fs.Repo, actID string) {
 				pc.Streamed = true
 				files = append(files, fileBody{index: len(pt.Changes), path: ch.dataFile})
 			case len(ch.data) > 0:
-				sum := sha1.Sum(ch.data)
-				pc.DataRef = hex.EncodeToString(sum[:])
+				if ch.dataRef != "" {
+					pc.DataRef = ch.dataRef // already uploaded by an earlier PUT
+				} else {
+					sum := sha1.Sum(ch.data)
+					pc.DataRef = hex.EncodeToString(sum[:])
+				}
 			}
 			pt.Changes = append(pt.Changes, pc)
 		}
 		pa.Txn = pt
 	}
-	// Copy payloads while holding the lock so a concurrent PUT cannot mutate
-	// the slice under us.
-	payloads := map[string][]byte{}
+	// Copy only payloads that have not been stored yet, and remember the
+	// generation they came from so a concurrent PUT that replaces the body
+	// does not get a stale reference. Without this every PUT re-hashed and
+	// re-uploaded every pending body (O(n^2) for a many-file commit).
+	type pendingBody struct {
+		ch   *txnChange
+		gen  uint64
+		ref  string
+		data []byte
+	}
+	var pending []pendingBody
 	if a.txn != nil {
 		for _, ch := range a.txn.changes {
-			if len(ch.data) > 0 {
+			if len(ch.data) > 0 && ch.dataRef == "" {
 				sum := sha1.Sum(ch.data)
-				payloads[hex.EncodeToString(sum[:])] = append([]byte(nil), ch.data...)
+				pending = append(pending, pendingBody{
+					ch: ch, gen: ch.gen, ref: hex.EncodeToString(sum[:]),
+					data: append([]byte(nil), ch.data...),
+				})
 			}
 		}
 	}
@@ -180,13 +195,18 @@ func (s *Server) persistActivity(repo *fs.Repo, actID string) {
 		}
 		pa.Txn.Changes[fb.index].DataRef = ref
 	}
-	for ref, data := range payloads {
-		if _, exists, err := repo.Store().Head(ctx, activityDataKey(repo, ref)); err == nil && exists {
-			continue
+	for _, pb := range pending {
+		if _, exists, err := repo.Store().Head(ctx, activityDataKey(repo, pb.ref)); err != nil || !exists {
+			if err := repo.Store().Put(ctx, activityDataKey(repo, pb.ref), pb.data); err != nil {
+				log.Printf("txn: persist data %s: %v", pb.ref, err)
+				continue
+			}
 		}
-		if err := repo.Store().Put(ctx, activityDataKey(repo, ref), data); err != nil {
-			log.Printf("txn: persist data %s: %v", ref, err)
+		s.mu.Lock()
+		if pb.ch.gen == pb.gen {
+			pb.ch.dataRef = pb.ref
 		}
+		s.mu.Unlock()
 	}
 	if data, err := json.Marshal(pa); err == nil {
 		if err := repo.Store().Put(ctx, activityStateKey(repo, actID), data); err != nil {

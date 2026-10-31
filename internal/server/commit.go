@@ -64,6 +64,9 @@ type txnChange struct {
 	// in the node so update reports need not read the text back.
 	dataSHA1 [20]byte
 	hasSHA1  bool
+	// gen bumps whenever the body reference changes, so a concurrent
+	// persistActivity cannot attach a reference to newer bytes.
+	gen uint64
 }
 
 // txn is a checked-out working resource bound to an activity.
@@ -555,6 +558,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 		os.Remove(old)
 	}
 	ch.kind = fs.KindFile
+	ch.gen++
 	ch.data = data
 	ch.dataFile = ""
 	ch.dataSize = dataSize
