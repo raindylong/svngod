@@ -580,131 +580,157 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 	// text in memory and storing a full copy.
 	if isSvndiff && (r.ContentLength < 0 || r.ContentLength > putStreamThreshold ||
 		baseLen > putStreamThreshold) {
-		// Keep the raw delta when it is tiny: an edit of a large binary file
-		// often sends a few KiB against a 30 MiB base, and storing that delta
-		// instead of a fresh full copy is the difference between 5 KiB and
-		// 30 MiB on disk (Helix Core's +S binary delta storage).
-		var deltaBuf bytes.Buffer
-		sink := &capWriter{w: &deltaBuf, left: deltaInlineCap}
-		var bodyReader io.Reader = r.Body
-		if !isNew {
-			// Only an edit can reuse the client delta; teeing a new file's
-			// full text would allocate up to deltaInlineCap for nothing.
-			bodyReader = io.TeeReader(r.Body, sink)
-		}
-		outPath, sum, sha, derr := decodeDeltaToFileSource(baseLen, baseSrc, bodyReader, maxPutBody)
-		if os.Getenv("SVNGOD_DEBUG_PUT") == "1" {
-			log.Printf("put-debug path=%s baseRev=%d baseLen=%d contentLen=%d isNew=%v decodedMD5=%x want=%q deltaBuf=%d", res.path, clientRev, baseLen, r.ContentLength, isNew, sum, r.Header.Get("X-SVN-Result-Fulltext-MD5"), deltaBuf.Len())
-		}
-		if derr == nil {
+		if baseLen > fs.ChunkThreshold || r.ContentLength > fs.ChunkThreshold {
+			// Large target: decode straight into chunk storage. This removes
+			// the 1 GiB temp file (and its re-read) from a large edit.
+			manifest, total, csum, csha, cerr := decodeDeltaToChunks(repo, baseLen, baseSrc, r.Body, maxPutBody)
+			if cerr != nil {
+				switch {
+				case errors.Is(cerr, errBodyTooLarge):
+					http.Error(w, cerr.Error(), http.StatusRequestEntityTooLarge)
+				case errors.Is(cerr, errChunkStore):
+					http.Error(w, cerr.Error(), http.StatusInternalServerError)
+				default:
+					http.Error(w, "svndiff decode: "+cerr.Error(), http.StatusBadRequest)
+				}
+				return
+			}
 			if want := r.Header.Get("X-SVN-Result-Fulltext-MD5"); want != "" &&
-				!strings.EqualFold(hex.EncodeToString(sum[:]), want) {
-				os.Remove(outPath)
+				!strings.EqualFold(hex.EncodeToString(csum[:]), want) {
 				http.Error(w, "result checksum mismatch: decoded text differs from the client's", http.StatusBadRequest)
 				return
 			}
-		}
-		if derr != nil {
-			if errors.Is(derr, errBodyTooLarge) {
-				http.Error(w, derr.Error(), http.StatusRequestEntityTooLarge)
-			} else {
-				http.Error(w, "svndiff decode: "+derr.Error(), http.StatusBadRequest)
+			chunkManifest, chunkTotal = manifest, uint64(total)
+			dataMD5, hasMD5 = csum, true
+			dataSHA1 = csha
+			dataSize = total
+		} else {
+			// Keep the raw delta when it is tiny: an edit of a large binary file
+			// often sends a few KiB against a 30 MiB base, and storing that delta
+			// instead of a fresh full copy is the difference between 5 KiB and
+			// 30 MiB on disk (Helix Core's +S binary delta storage).
+			var deltaBuf bytes.Buffer
+			sink := &capWriter{w: &deltaBuf, left: deltaInlineCap}
+			var bodyReader io.Reader = r.Body
+			if !isNew {
+				// Only an edit can reuse the client delta; teeing a new file's
+				// full text would allocate up to deltaInlineCap for nothing.
+				bodyReader = io.TeeReader(r.Body, sink)
 			}
-			return
-		}
-		st, serr := os.Stat(outPath)
-		if serr != nil {
-			os.Remove(outPath)
-			http.Error(w, serr.Error(), http.StatusInternalServerError)
-			return
-		}
-		// Large text, small delta: store the delta instead of a fresh copy.
-		// The target is always a full-text node, so a read stays one apply
-		// (a chain would make reads and later uploads progressively slower).
-		size := st.Size()
-		useDelta := false
-		if size > putStreamThreshold && size <= fs.ChunkThreshold && !isNew && baseNode != nil {
-			clientOK := deltaBuf.Len() > 0 && sink.ok() &&
-				deltaBuf.Len() <= deltaInlineCap && int64(deltaBuf.Len()) < size/2
-			// A chain (base is itself a delta) is fine up to the repository's
-			// limit: an edit of a 1 GiB binary should stay a small delta even
-			// after previous edits, not degrade to a full copy each time.
-			// Reconstructing a chain costs one pass per level, so large texts
-			// are compacted to a full text after a short chain instead of
-			// paying dozens of gigabytes of temp I/O on every later edit.
-			depthCap := repo.MaxDeltaDepth()
-			if size > reencodeCap && depthCap > 8 {
-				depthCap = 8
+			outPath, sum, sha, derr := decodeDeltaToFileSource(baseLen, baseSrc, bodyReader, maxPutBody)
+			if os.Getenv("SVNGOD_DEBUG_PUT") == "1" {
+				log.Printf("put-debug path=%s baseRev=%d baseLen=%d contentLen=%d isNew=%v decodedMD5=%x want=%q deltaBuf=%d", res.path, clientRev, baseLen, r.ContentLength, isNew, sum, r.Header.Get("X-SVN-Result-Fulltext-MD5"), deltaBuf.Len())
 			}
-			if clientOK && baseNode.DeltaDepth < depthCap {
-				// The client diffed against a full text: reuse its stream.
-				deltaBytes = append([]byte(nil), deltaBuf.Bytes()...)
-				deltaBase = baseNode.Node
-				useDelta = true
-			} else if size <= reencodeCap {
-				// Otherwise re-encode against the last full revision (one
-				// ancestor lookup) so future reads and edits stay at depth 1.
-				if anc, aerr := repo.FullTextBase(baseNode); aerr == nil && anc.Node != baseNode.Node {
-					if newText, rerr := os.ReadFile(outPath); rerr == nil {
-						if ancText, gerr := repo.GetText(anc.Node); gerr == nil {
-							if d, eerr := svndiff.Encode(ancText, newText); eerr == nil &&
-								len(d) <= deltaInlineCap && len(d) < len(newText)/2 {
-								deltaBytes = d
-								deltaBase = anc.Node
-								useDelta = true
+			if derr == nil {
+				if want := r.Header.Get("X-SVN-Result-Fulltext-MD5"); want != "" &&
+					!strings.EqualFold(hex.EncodeToString(sum[:]), want) {
+					os.Remove(outPath)
+					http.Error(w, "result checksum mismatch: decoded text differs from the client's", http.StatusBadRequest)
+					return
+				}
+			}
+			if derr != nil {
+				if errors.Is(derr, errBodyTooLarge) {
+					http.Error(w, derr.Error(), http.StatusRequestEntityTooLarge)
+				} else {
+					http.Error(w, "svndiff decode: "+derr.Error(), http.StatusBadRequest)
+				}
+				return
+			}
+			st, serr := os.Stat(outPath)
+			if serr != nil {
+				os.Remove(outPath)
+				http.Error(w, serr.Error(), http.StatusInternalServerError)
+				return
+			}
+			// Large text, small delta: store the delta instead of a fresh copy.
+			// The target is always a full-text node, so a read stays one apply
+			// (a chain would make reads and later uploads progressively slower).
+			size := st.Size()
+			useDelta := false
+			if size > putStreamThreshold && size <= fs.ChunkThreshold && !isNew && baseNode != nil {
+				clientOK := deltaBuf.Len() > 0 && sink.ok() &&
+					deltaBuf.Len() <= deltaInlineCap && int64(deltaBuf.Len()) < size/2
+				// A chain (base is itself a delta) is fine up to the repository's
+				// limit: an edit of a 1 GiB binary should stay a small delta even
+				// after previous edits, not degrade to a full copy each time.
+				// Reconstructing a chain costs one pass per level, so large texts
+				// are compacted to a full text after a short chain instead of
+				// paying dozens of gigabytes of temp I/O on every later edit.
+				depthCap := repo.MaxDeltaDepth()
+				if size > reencodeCap && depthCap > 8 {
+					depthCap = 8
+				}
+				if clientOK && baseNode.DeltaDepth < depthCap {
+					// The client diffed against a full text: reuse its stream.
+					deltaBytes = append([]byte(nil), deltaBuf.Bytes()...)
+					deltaBase = baseNode.Node
+					useDelta = true
+				} else if size <= reencodeCap {
+					// Otherwise re-encode against the last full revision (one
+					// ancestor lookup) so future reads and edits stay at depth 1.
+					if anc, aerr := repo.FullTextBase(baseNode); aerr == nil && anc.Node != baseNode.Node {
+						if newText, rerr := os.ReadFile(outPath); rerr == nil {
+							if ancText, gerr := repo.GetText(anc.Node); gerr == nil {
+								if d, eerr := svndiff.Encode(ancText, newText); eerr == nil &&
+									len(d) <= deltaInlineCap && len(d) < len(newText)/2 {
+									deltaBytes = d
+									deltaBase = anc.Node
+									useDelta = true
+								}
 							}
 						}
 					}
 				}
-			}
-			if useDelta {
-				deltaTotal = uint64(size)
-				dataMD5, hasMD5 = sum, true
-				dataSHA1 = sha
-				os.Remove(outPath)
-			}
-		}
-		if !useDelta {
-			if size > putStreamThreshold {
-				if size > fs.ChunkThreshold {
-					f, oerr := os.Open(outPath)
-					if oerr != nil {
-						http.Error(w, oerr.Error(), http.StatusInternalServerError)
-						return
-					}
-					hCheck := md5.New()
-					manifest, total, cerr := repo.StoreChunkedReader(io.TeeReader(f, hCheck))
-					f.Close()
-					os.Remove(outPath)
-					if cerr != nil {
-						http.Error(w, cerr.Error(), http.StatusInternalServerError)
-						return
-					}
-					if !bytes.Equal(hCheck.Sum(nil), sum[:]) {
-						http.Error(w, "chunked text checksum mismatch", http.StatusInternalServerError)
-						return
-					}
-					chunkManifest, chunkTotal = manifest, uint64(total)
+				if useDelta {
+					deltaTotal = uint64(size)
 					dataMD5, hasMD5 = sum, true
 					dataSHA1 = sha
-					dataSize = size
+					os.Remove(outPath)
+				}
+			}
+			if !useDelta {
+				if size > putStreamThreshold {
+					if size > fs.ChunkThreshold {
+						f, oerr := os.Open(outPath)
+						if oerr != nil {
+							http.Error(w, oerr.Error(), http.StatusInternalServerError)
+							return
+						}
+						hCheck := md5.New()
+						manifest, total, cerr := repo.StoreChunkedReader(io.TeeReader(f, hCheck))
+						f.Close()
+						os.Remove(outPath)
+						if cerr != nil {
+							http.Error(w, cerr.Error(), http.StatusInternalServerError)
+							return
+						}
+						if !bytes.Equal(hCheck.Sum(nil), sum[:]) {
+							http.Error(w, "chunked text checksum mismatch", http.StatusInternalServerError)
+							return
+						}
+						chunkManifest, chunkTotal = manifest, uint64(total)
+						dataMD5, hasMD5 = sum, true
+						dataSHA1 = sha
+						dataSize = size
+					} else {
+						ref, refSize, xerr := storeText(outPath, sum)
+						if xerr != nil {
+							http.Error(w, xerr.Error(), http.StatusInternalServerError)
+							return
+						}
+						dataTextRef, dataTextSize, dataSize = ref, uint64(refSize), refSize
+						dataSHA1 = sha
+					}
 				} else {
-					ref, refSize, xerr := storeText(outPath, sum)
-					if xerr != nil {
-						http.Error(w, xerr.Error(), http.StatusInternalServerError)
+					b, rerr := os.ReadFile(outPath)
+					os.Remove(outPath)
+					if rerr != nil {
+						http.Error(w, rerr.Error(), http.StatusInternalServerError)
 						return
 					}
-					dataTextRef, dataTextSize, dataSize = ref, uint64(refSize), refSize
-					dataSHA1 = sha
+					data, dataSize = b, int64(len(b))
 				}
-			} else {
-				b, rerr := os.ReadFile(outPath)
-				os.Remove(outPath)
-				if rerr != nil {
-					http.Error(w, rerr.Error(), http.StatusInternalServerError)
-					return
-				}
-				data, dataSize = b, int64(len(b))
 			}
 		}
 	} else if body, bodyFile, bodyMD5, bodySHA1, berr := readBody(r.Body, putStreamThreshold, maxPutBody); berr != nil {
@@ -1014,6 +1040,53 @@ func hashSource(src svndiff.SourceFunc, size int64) ([16]byte, error) {
 	}
 	copy(sum[:], h.Sum(nil))
 	return sum, nil
+}
+
+// errChunkStore marks a failure while storing chunks (as opposed to a bad
+// client delta), so the handler can answer 500 instead of 400.
+var errChunkStore = errors.New("chunk store")
+
+// decodeDeltaToChunks applies a svndiff stream and feeds the decoded text
+// directly into the chunker through a pipe. Nothing is written to a temp file
+// and the text is hashed once, as it is read.
+func decodeDeltaToChunks(repo *fs.Repo, baseLen int64, baseSrc svndiff.SourceFunc, delta io.Reader, limit int64) ([]byte, int64, [16]byte, [20]byte, error) {
+	var sum [16]byte
+	var sha [20]byte
+	type result struct {
+		manifest []byte
+		total    int64
+		sum      [16]byte
+		sha      [20]byte
+		err      error
+	}
+	pr, pw := io.Pipe()
+	done := make(chan result, 1)
+	go func() {
+		h := md5.New()
+		hs := sha1.New()
+		m, n, cerr := repo.StoreChunkedReader(io.TeeReader(pr, io.MultiWriter(h, hs)))
+		r := result{manifest: m, total: n, err: cerr}
+		if cerr == nil {
+			copy(r.sum[:], h.Sum(nil))
+			copy(r.sha[:], hs.Sum(nil))
+		}
+		done <- r
+	}()
+	derr := svndiff.ApplyToSource(baseLen, baseSrc, delta, &strictCapWriter{w: pw, left: limit})
+	if derr != nil {
+		pw.CloseWithError(derr)
+		r := <-done
+		if r.err != nil {
+			return nil, 0, sum, sha, fmt.Errorf("%w: %v", errChunkStore, r.err)
+		}
+		return nil, 0, sum, sha, derr
+	}
+	pw.Close()
+	r := <-done
+	if r.err != nil {
+		return nil, 0, sum, sha, fmt.Errorf("%w: %v", errChunkStore, r.err)
+	}
+	return r.manifest, r.total, r.sum, r.sha, nil
 }
 
 // decodeDeltaToFileSource streams a svndiff delta into a text temp file,

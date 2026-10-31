@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"io"
 	"net/http"
 	"strconv"
@@ -314,5 +315,68 @@ func TestLargeBaseSmallDeltaIsStoredAsDelta(t *testing.T) {
 	}
 	if len(got) != len(edit2) || string(got) != string(edit2) {
 		t.Fatalf("text mismatch: got %d want %d", len(got), len(edit2))
+	}
+}
+
+// TestChunkedDeltaPUT covers the direct decode-to-chunks path: a small delta
+// against a multi-megabyte chunked base must be committed as a chunked node
+// with exactly the client's text.
+func TestChunkedDeltaPUT(t *testing.T) {
+	ts, repo, _ := testServer(t, "", "")
+	defer ts.Close()
+	repoURL := ts.URL + "/svn/demo"
+
+	base := make([]byte, 6<<20)
+	for i := range base {
+		base[i] = byte(i * 13)
+	}
+	if _, err := repo.CommitTxn(0, []fs.Change{{
+		Path: "/big.bin", Action: fs.ActionAdd, Kind: fs.KindFile, Data: base,
+	}}, map[string]string{"svn:log": "base", "svn:author": "u", "svn:date": "2026-01-01T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	edited := append([]byte(nil), base...)
+	for i := 2 << 20; i < 3<<20; i++ {
+		edited[i] = byte(i * 7)
+	}
+	delta, err := svndiff.Encode(base, edited)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := doRequest(t, "POST", repoURL+"/!svn/me", "(create-txn)", "", "",
+		map[string]string{"Content-Type": "application/vnd.svn-skel"})
+	resp.Body.Close()
+	txn := resp.Header.Get("SVN-Txn-Name")
+	if txn == "" {
+		t.Fatalf("create-txn status %d", resp.StatusCode)
+	}
+	resp = doRequest(t, "PUT", repoURL+"/!svn/txr/"+txn+"/big.bin", string(delta), "", "",
+		map[string]string{"Content-Type": "application/vnd.svn-svndiff", "X-SVN-Version-Name": "2"})
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("PUT status %d: %s", resp.StatusCode, b)
+	}
+	resp.Body.Close()
+	merge := `<?xml version="1.0"?><D:merge xmlns:D="DAV:"><D:source><D:href>` +
+		repoURL + `/!svn/txn/` + txn + `</D:href></D:source></D:merge>`
+	resp = doRequest(t, "MERGE", repoURL, merge, "", "", map[string]string{"Content-Type": "text/xml"})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("MERGE status %d", resp.StatusCode)
+	}
+	nr, err := repo.Resolve(3, "/big.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nr.TextRep != fs.TextRepChunked {
+		t.Fatalf("TextRep=%d, want chunked", nr.TextRep)
+	}
+	got, err := repo.GetText(nr.Node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, edited) {
+		t.Fatalf("committed text differs from client (len %d vs %d)", len(got), len(edited))
 	}
 }
