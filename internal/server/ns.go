@@ -20,8 +20,10 @@ const (
 // DAV capabilities advertised in OPTIONS. mod_dav_svn sends them as several
 // DAV: header lines and clients gate features on them (mergeinfo, for one,
 // is refused client-side with E200007 when the capability is absent). Only
-// capabilities this server actually implements are listed; svdfiff1 tells the
-// client it may send compressed svndiff windows on PUT.
+// capabilities this server actually implements are listed. svndiff1 is
+// deliberately absent, matching mod_dav_svn: advertising it makes clients
+// zlib-compress every PUT window, which burns client CPU without shrinking
+// already-compressed or random payloads. The decoder still accepts svndiff1.
 var davCapabilityHeaders = []string{
 	"1,2",
 	"version-control,checkout,working-resource",
@@ -30,7 +32,6 @@ var davCapabilityHeaders = []string{
 	"http://subversion.tigris.org/xmlns/dav/svn/inline-props",
 	"http://subversion.tigris.org/xmlns/dav/svn/list",
 	"http://subversion.tigris.org/xmlns/dav/svn/mergeinfo",
-	"http://subversion.tigris.org/xmlns/dav/svn/svndiff1",
 }
 
 // writeDAVCapabilities emits one DAV header per capability group.

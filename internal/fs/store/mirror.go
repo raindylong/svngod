@@ -249,6 +249,27 @@ func (m *MirrorStore) PutFrom(ctx context.Context, key string, r io.Reader, size
 	return nil
 }
 
+// Exists asks the primary (control objects) or any healthy mirror.
+func (m *MirrorStore) Exists(ctx context.Context, key string) (bool, error) {
+	if isControlKey(key) {
+		p, _ := m.primary()
+		return p.Exists(ctx, key)
+	}
+	_, pi := m.primary()
+	n := len(m.mirrors)
+	for step := 0; step < n; step++ {
+		idx := (pi + 1 + step) % n
+		if !m.isHealthy(idx) {
+			continue
+		}
+		if ok, err := m.mirrors[idx].Exists(ctx, key); err == nil && ok {
+			return true, nil
+		}
+	}
+	p, _ := m.primary()
+	return p.Exists(ctx, key)
+}
+
 // GetTo streams an object, preferring the same mirror Get would read from.
 func (m *MirrorStore) GetTo(ctx context.Context, key string, w io.Writer) (int64, error) {
 	if isControlKey(key) {

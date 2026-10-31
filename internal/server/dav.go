@@ -487,11 +487,16 @@ func (s *Server) propNode(b *strings.Builder, repo *fs.Repo, base, name string, 
 		b.WriteString("      " + davPropElement(k, nr.Props[k]) + "\n")
 	}
 	if nr.Kind == fs.KindFile {
-		text, err := repo.GetText(nr.Node)
-		if err != nil {
-			return err
+		// Children listed by propChildren carry only Node/Kind/Props; fetch the
+		// full node-rev (cached) so the size comes from TotalSize/TextSize
+		// instead of materializing a possibly huge text just for PROPFIND.
+		fnr := nr
+		if real, err := repo.GetNodeRev(nr.Node); err == nil {
+			fnr = real
 		}
-		b.WriteString("      <D:getcontentlength>" + strconv.Itoa(len(text)) + "</D:getcontentlength>\n")
+		if size, serr := repo.TextSizeOf(fnr); serr == nil {
+			b.WriteString("      <D:getcontentlength>" + strconv.FormatInt(size, 10) + "</D:getcontentlength>\n")
+		}
 		mime := propVal(nr.Props, "svn:mime-type")
 		if mime == "" {
 			mime = "text/plain"

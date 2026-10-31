@@ -48,6 +48,10 @@ type Store interface {
 	// texts stored as separate objects (large files).
 	GetTo(ctx context.Context, key string, w io.Writer) (int64, error)
 
+	// Exists reports whether key is present. Unlike Head it must not read the
+	// object body (FileStore's Head hashes the file to build its ETag).
+	Exists(ctx context.Context, key string) (bool, error)
+
 	// Head returns the object's ETag and existence.
 	Head(ctx context.Context, key string) (etag string, exists bool, err error)
 
@@ -67,6 +71,12 @@ type Store interface {
 }
 
 // ---------------------------------------------------------------------------
+
+// FilePutter is implemented by stores that can move a local file into place
+// without an extra copy (same-filesystem link), used for large uploads.
+type FilePutter interface {
+	PutFile(ctx context.Context, key, path string) error
+}
 
 // MemoryStore is an in-memory Store used for unit tests.
 type MemoryStore struct {
@@ -129,6 +139,13 @@ func (m *MemoryStore) PutFrom(_ context.Context, key string, r io.Reader, size i
 		return fmt.Errorf("store: short body (%d/%d)", len(data), size)
 	}
 	return m.Put(context.Background(), key, data)
+}
+
+func (m *MemoryStore) Exists(_ context.Context, key string) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.data[key]
+	return ok, nil
 }
 
 func (m *MemoryStore) GetTo(_ context.Context, key string, w io.Writer) (int64, error) {

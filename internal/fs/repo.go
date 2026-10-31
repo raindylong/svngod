@@ -298,28 +298,64 @@ func (r *Repo) GetNodeRev(id NodeID) (*NodeRev, error) {
 	return nr, nil
 }
 
+// PutTextFile stores a local file as a content-addressed text object and
+// returns its reference. Stores that support PutFile move (link) the file
+// instead of copying it.
+func (r *Repo) PutTextFile(ctx context.Context, path, ref string) error {
+	key := r.keys.Text(ref)
+	if ok, err := r.store.Exists(ctx, key); err == nil && ok {
+		return nil
+	}
+	if fp, ok := r.store.(store.FilePutter); ok {
+		if err := fp.PutFile(ctx, key, path); err == nil {
+			return nil
+		}
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	return r.store.PutFrom(ctx, key, f, st.Size())
+}
+
 // externalizeFile streams a file body into a content-addressed text object and
 // returns its md5, size and reference. The body is hashed and uploaded in two
 // passes, so memory use stays constant for arbitrarily large uploads.
-func (r *Repo) externalizeFile(ctx context.Context, path string) ([16]byte, uint64, string, error) {
+func (r *Repo) externalizeFile(ctx context.Context, path string, known *[16]byte) ([16]byte, uint64, string, error) {
 	var sum [16]byte
-	f, err := os.Open(path)
-	if err != nil {
-		return sum, 0, "", err
+	var n int64
+	if known != nil {
+		// The upload path already hashed the body while streaming it.
+		sum = *known
+		st, serr := os.Stat(path)
+		if serr != nil {
+			return sum, 0, "", serr
+		}
+		n = st.Size()
+	} else {
+		f, err := os.Open(path)
+		if err != nil {
+			return sum, 0, "", err
+		}
+		h := md5.New()
+		n, err = io.Copy(h, f)
+		f.Close()
+		if err != nil {
+			return sum, 0, "", err
+		}
+		copy(sum[:], h.Sum(nil))
 	}
-	h := md5.New()
-	n, err := io.Copy(h, f)
-	f.Close()
-	if err != nil {
-		return sum, 0, "", err
-	}
-	copy(sum[:], h.Sum(nil))
 	ref := hex.EncodeToString(sum[:])
 	key := r.keys.Text(ref)
-	if _, ok, herr := r.store.Head(ctx, key); herr == nil && ok {
+	if ok, herr := r.store.Exists(ctx, key); herr == nil && ok {
 		return sum, uint64(n), ref, nil
 	}
-	f, err = os.Open(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return sum, 0, "", err
 	}
@@ -649,8 +685,29 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 			nr.CopyFromPath = t.copyFromPath
 		}
 		if t.kind == KindFile {
+			if t.textRef != "" {
+				sum, herr := hex.DecodeString(t.textRef)
+				if herr != nil || len(sum) != 16 {
+					return 0, errors.New("fs: bad text ref")
+				}
+				if ok, eerr := r.store.Exists(ctx, r.keys.Text(t.textRef)); eerr != nil || !ok {
+					return 0, errors.New("fs: uploaded text object missing")
+				}
+				copy(nr.TextMD5[:], sum)
+				nr.TextRep = TextRepExternal
+				nr.TextRef = t.textRef
+				nr.TextSize = t.textSize
+				nr.TotalSize = t.textSize
+				nr.DeltaDepth = 0
+				nodes = append(nodes, nr)
+				continue
+			}
 			if t.dataFile != "" {
-				sum, size, ref, xerr := r.externalizeFile(ctx, t.dataFile)
+				var known *[16]byte
+				if t.hasMD5 {
+					known = &t.dataMD5
+				}
+				sum, size, ref, xerr := r.externalizeFile(ctx, t.dataFile, known)
 				if xerr != nil {
 					return 0, xerr
 				}
@@ -673,7 +730,7 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 				if len(t.data) > externalTextThreshold {
 					ref := hex.EncodeToString(nr.TextMD5[:])
 					key := r.keys.Text(ref)
-					if _, ok, herr := r.store.Head(ctx, key); herr != nil || !ok {
+					if ok, herr := r.store.Exists(ctx, key); herr != nil || !ok {
 						if perr := r.store.Put(ctx, key, t.data); perr != nil {
 							return 0, perr
 						}
@@ -830,7 +887,9 @@ func (r *Repo) applyChange(root *tnode, ch *Change) error {
 			return err
 		}
 		if ch.Kind == KindFile {
-			t := &tnode{kind: KindFile, props: copyProps(ch.Props), data: append([]byte(nil), ch.Data...), dataFile: ch.DataFile, dirty: true}
+			t := &tnode{kind: KindFile, props: copyProps(ch.Props), data: append([]byte(nil), ch.Data...),
+				dataFile: ch.DataFile, dataMD5: ch.DataMD5, hasMD5: ch.HasMD5,
+				textRef: ch.TextRef, textSize: ch.TextSize, dirty: true}
 			if old, ok := parent.children[name]; ok && old.kind == KindFile {
 				// A streamed body becomes an external full text; no base text
 				// is needed, so do not load the old file into memory.

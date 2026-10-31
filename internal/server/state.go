@@ -36,6 +36,8 @@ type persistedChange struct {
 	CopyFromPath string            `json:"copyFromPath,omitempty"`
 	CopyFromRev  uint64            `json:"copyFromRev,omitempty"`
 	BaseRev      uint64            `json:"baseRev,omitempty"`
+	DataTextRef  string            `json:"dataTextRef,omitempty"`
+	DataTextSize uint64            `json:"dataTextSize,omitempty"`
 }
 
 type persistedTxn struct {
@@ -134,6 +136,11 @@ func (s *Server) persistActivity(repo *fs.Repo, actID string) {
 				CopyFromRev: ch.copyFromRev, BaseRev: ch.baseRev,
 			}
 			switch {
+			case ch.dataTextRef != "":
+				// The body is already a durable text object; only the reference
+				// needs to be persisted.
+				pc.DataTextRef = ch.dataTextRef
+				pc.DataTextSize = ch.dataTextSize
 			case ch.dataFile != "":
 				pc.Streamed = true
 				files = append(files, fileBody{index: len(pt.Changes), path: ch.dataFile})
@@ -263,6 +270,10 @@ func (s *Server) ensureActivitiesLoaded(repoName string, repo *fs.Repo) {
 		if n == "" {
 			break
 		}
+		if n == next {
+			log.Printf("txn: list %q: cursor did not advance, stopping", repoName)
+			break
+		}
 		next = n
 	}
 
@@ -283,7 +294,7 @@ func (s *Server) ensureActivitiesLoaded(repoName string, repo *fs.Repo) {
 					action: actionByName(pc.Action), kind: kindByName(pc.Kind),
 					props: copyMap(pc.Props), copyFromPath: pc.CopyFromPath,
 					copyFromRev: pc.CopyFromRev, baseRev: pc.BaseRev, dataRef: pc.DataRef,
-					streamed: pc.Streamed,
+					streamed: pc.Streamed, dataTextRef: pc.DataTextRef, dataTextSize: pc.DataTextSize,
 				}
 			}
 			a.txn = tx

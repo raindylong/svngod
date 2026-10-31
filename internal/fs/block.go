@@ -19,11 +19,11 @@ type nodeTableEntry struct {
 // RevBlock is the immutable unit holding all node-revs of one revision.
 // It is the format of both a loose object and one block inside a packed shard.
 type RevBlock struct {
-	Rev      uint64
-	PrevRev  uint64
-	Root     NodeID // root directory node-rev valid at this revision
-	nodeTbl  []nodeTableEntry
-	payload  []byte
+	Rev     uint64
+	PrevRev uint64
+	Root    NodeID // root directory node-rev valid at this revision
+	nodeTbl []nodeTableEntry
+	payload []byte
 }
 
 // NewRevBlock builds a rev block from nodes (any order).

@@ -29,6 +29,14 @@ type Change struct {
 	// DataFile, when set, holds the file body on disk (a streamed PUT). The
 	// commit stores it as an external text without loading it into memory.
 	DataFile string
+	// DataMD5 is the body's md5 when the caller already computed it while
+	// streaming (lets the commit skip a full hash pass).
+	DataMD5 [16]byte
+	HasMD5  bool
+	// TextRef/TextSize point at an already-stored external text object (the
+	// upload path stores it before commit so the commit only records it).
+	TextRef  string
+	TextSize uint64
 }
 
 // tnode is an in-memory working-copy node during a commit.
@@ -37,6 +45,10 @@ type tnode struct {
 	props        map[string]string
 	data         []byte // file full text (as of HEAD when loaded)
 	dataFile     string // streamed body on disk (large PUT)
+	dataMD5      [16]byte
+	hasMD5       bool
+	textRef      string
+	textSize     uint64
 	baseText     []byte // previous file text captured during this commit (delta base)
 	children     map[string]*tnode
 	copyFrom     *NodeID

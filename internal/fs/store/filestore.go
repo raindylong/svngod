@@ -81,6 +81,46 @@ func (s *FileStore) Get(_ context.Context, key string, rng *Range) ([]byte, erro
 	return data[off:end], nil
 }
 
+// PutFile links (or copies) a local file into the object at key. Callers use
+// content-addressed keys, so an existing object is already the right bytes.
+func (s *FileStore) PutFile(_ context.Context, key, src string) error {
+	p, err := s.objPath(key)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return err
+	}
+	if err := os.Link(src, p); err == nil {
+		return nil
+	}
+	f, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	tmp, err := os.CreateTemp(filepath.Dir(p), ".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	n, err := io.Copy(tmp, f)
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, p); err != nil {
+		_ = n
+		return err
+	}
+	return nil
+}
+
 // PutFrom streams into a temp file and renames it into place, so readers never
 // observe a partially written object.
 func (s *FileStore) PutFrom(_ context.Context, key string, r io.Reader, size int64) error {
@@ -110,6 +150,21 @@ func (s *FileStore) PutFrom(_ context.Context, key string, r io.Reader, size int
 		return fmt.Errorf("store: short body (%d/%d)", n, size)
 	}
 	return os.Rename(tmpName, p)
+}
+
+func (s *FileStore) Exists(_ context.Context, key string) (bool, error) {
+	p, err := s.objPath(key)
+	if err != nil {
+		return false, err
+	}
+	fi, err := os.Stat(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return !fi.IsDir(), nil
 }
 
 func (s *FileStore) GetTo(_ context.Context, key string, w io.Writer) (int64, error) {
@@ -227,7 +282,7 @@ func ContentETag(data []byte) string {
 	return hex.EncodeToString(h[:])
 }
 
-func (s *FileStore) ListPrefix(_ context.Context, prefix, _ string, max int) ([]ListedObj, string, error) {
+func (s *FileStore) ListPrefix(_ context.Context, prefix, continuation string, max int) ([]ListedObj, string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	root := filepath.Join(s.base, filepath.FromSlash(prefix))
@@ -253,9 +308,14 @@ func (s *FileStore) ListPrefix(_ context.Context, prefix, _ string, max int) ([]
 	if err != nil {
 		return nil, "", err
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	// continuation is the last key of the previous page (S3 StartAfter
+	// semantics): resume strictly after it.
+	if continuation != "" {
+		i := sort.Search(len(out), func(i int) bool { return out[i].Key > continuation })
+		out = out[i:]
+	}
 	if max > 0 && len(out) > max {
-		return out[:max], out[max].Key, nil
+		return out[:max], out[max-1].Key, nil
 	}
 	return out, "", nil
 }

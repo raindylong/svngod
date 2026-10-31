@@ -538,33 +538,20 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 		if err != nil {
 			return err
 		}
-		text, err := repo.GetText(nr.Node)
-		if err != nil {
-			return err
-		}
+		// Resolve the client's baseline node first. Unchanged files are
+		// skipped without ever reading their text: a no-op update used to
+		// load every file (and its delta chain) just to compare revisions.
 		var baseNode *fs.NodeRev
-		var baseText []byte
 		if inBase {
 			if bn, berr := repo.Resolve(baseRev, cwcPath); berr == nil && bn.Kind == fs.KindFile {
 				baseNode = bn
-				if bt, gerr := repo.GetText(bn.Node); gerr == nil {
-					baseText = bt
-				}
 			}
 		}
 		if inBase && baseNode != nil {
 			propsChanged := !sameProps(baseNode.Props, nr.Props)
-			// A switch compares different paths: node revisions do not tell us
-			// whether the content changed (the target node can share a
-			// revision with the baseline while the text differs), so compare
-			// the text itself.
 			samePath := normalizeWCPath(path) == normalizeWCPath(wcPath)
-			textChanged := !bytes.Equal(baseText, text)
 			if samePath && c.ID.Rev <= baseRev && !propsChanged {
 				continue // unchanged since the client's baseline
-			}
-			if !samePath && !textChanged && !propsChanged {
-				continue
 			}
 			if samePath && c.ID.Rev <= baseRev && propsChanged {
 				// Property-only change: open the file solely to set props.
@@ -581,6 +568,19 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 				writeEntryProps(b, rp, uuid, rev)
 				writeNodeProps(b, nr.Props)
 				b.WriteString("    </S:open-file>\n")
+				continue
+			}
+			text, terr := repo.GetText(nr.Node)
+			if terr != nil {
+				return terr
+			}
+			var baseText []byte
+			if bt, gerr := repo.GetText(baseNode.Node); gerr == nil {
+				baseText = bt
+			}
+			// A switch compares different paths: revisions do not tell us
+			// whether the content changed, so compare the text itself.
+			if !samePath && bytes.Equal(baseText, text) && !propsChanged {
 				continue
 			}
 			fileRev := pathCreatedRev(repo, nr)
@@ -604,6 +604,10 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 			b.WriteString("    </S:open-file>\n")
 			continue
 		}
+		text, err := repo.GetText(nr.Node)
+		if err != nil {
+			return err
+		}
 		// New file in this working copy.
 		fileRev := pathCreatedRev(repo, nr)
 		if fileRev < copyFloor {
@@ -613,7 +617,7 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 			fileRev = rev
 		}
 		ver := rvrHref(base, cpath, fileRev)
-		delta, derr := svndiff.Encode(baseText, text)
+		delta, derr := svndiff.Encode(nil, text)
 		if derr != nil {
 			return derr
 		}

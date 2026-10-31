@@ -134,6 +134,18 @@ func (s *S3Store) PutFrom(ctx context.Context, key string, r io.Reader, size int
 	return err
 }
 
+func (s *S3Store) Exists(ctx context.Context, key string) (bool, error) {
+	_, err := s.client.StatObject(ctx, s.bucket, s.key(key), minio.StatObjectOptions{})
+	if err != nil {
+		resp := minio.ToErrorResponse(err)
+		if resp.StatusCode == http.StatusNotFound || resp.Code == "NoSuchKey" {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *S3Store) GetTo(ctx context.Context, key string, w io.Writer) (int64, error) {
 	obj, err := s.client.GetObject(ctx, s.bucket, s.key(key), minio.GetObjectOptions{})
 	if err != nil {

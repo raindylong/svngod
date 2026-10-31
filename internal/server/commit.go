@@ -50,6 +50,15 @@ type txnChange struct {
 	streamed bool
 	// dataSize is the streamed body's length.
 	dataSize int64
+	// dataMD5 is computed while the body is streamed/decoded, so the commit
+	// does not need a second hash pass over the file.
+	dataMD5 [16]byte
+	hasMD5  bool
+	// dataTextRef points at an already stored external text object (large or
+	// svndiff bodies are written to texts/ during the upload, so the commit
+	// only records the reference and persistence needs no body copy).
+	dataTextRef  string
+	dataTextSize uint64
 }
 
 // txn is a checked-out working resource bound to an activity.
@@ -443,32 +452,78 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 
 	isSvndiff := strings.Contains(r.Header.Get("Content-Type"), "svndiff")
 	var data []byte
-	var dataFile string
 	var dataSize int64
+	var dataTextRef string
+	var dataTextSize uint64
 
 	const maxPutBody = 512 << 20
-	// Bodies are buffered in memory when small (typical svndiff deltas are a
-	// few KB) and spilled to disk above the threshold, whether or not the
-	// client sent a Content-Length (serf streams PUTs chunked).
-	body, bodyFile, berr := readBody(r.Body, putStreamThreshold, maxPutBody)
+	storeText := func(path string, sum [16]byte) (string, int64, error) {
+		st, serr := os.Stat(path)
+		if serr != nil {
+			os.Remove(path)
+			return "", 0, serr
+		}
+		ref := hex.EncodeToString(sum[:])
+		if err := repo.PutTextFile(context.Background(), path, ref); err != nil {
+			os.Remove(path)
+			return "", 0, err
+		}
+		os.Remove(path) // PutFile may have linked instead of moved
+		return ref, st.Size(), nil
+	}
+
+	body, bodyFile, bodyMD5, berr := readBody(r.Body, putStreamThreshold, maxPutBody)
 	if berr != nil {
 		http.Error(w, berr.Error(), statusForSpool(berr))
 		return
 	}
 	if bodyFile != "" {
+		// Large body: decode (svndiff) straight into a text temp, then keep it
+		// as an external text object. Small bodies (the common delta case) stay
+		// inline so edits of small files do not create per-revision objects.
 		if isSvndiff {
-			outPath, derr := decodeDeltaToFile(baseText, bodyFile)
+			in, oerr := os.Open(bodyFile)
+			if oerr != nil {
+				os.Remove(bodyFile)
+				http.Error(w, oerr.Error(), http.StatusInternalServerError)
+				return
+			}
+			outPath, sum, derr := decodeDeltaToFile(baseText, in)
+			in.Close()
 			os.Remove(bodyFile)
 			if derr != nil {
 				http.Error(w, "svndiff decode: "+derr.Error(), http.StatusBadRequest)
 				return
 			}
-			dataFile = outPath
+			st, serr := os.Stat(outPath)
+			if serr != nil || st.Size() > maxPutBody {
+				os.Remove(outPath)
+				http.Error(w, "file too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			if st.Size() > putStreamThreshold {
+				ref, size, xerr := storeText(outPath, sum)
+				if xerr != nil {
+					http.Error(w, xerr.Error(), http.StatusInternalServerError)
+					return
+				}
+				dataTextRef, dataTextSize, dataSize = ref, uint64(size), size
+			} else {
+				b, rerr := os.ReadFile(outPath)
+				os.Remove(outPath)
+				if rerr != nil {
+					http.Error(w, rerr.Error(), http.StatusInternalServerError)
+					return
+				}
+				data, dataSize = b, int64(len(b))
+			}
 		} else {
-			dataFile = bodyFile
-		}
-		if st, serr := os.Stat(dataFile); serr == nil {
-			dataSize = st.Size()
+			ref, size, xerr := storeText(bodyFile, bodyMD5)
+			if xerr != nil {
+				http.Error(w, xerr.Error(), http.StatusInternalServerError)
+				return
+			}
+			dataTextRef, dataTextSize, dataSize = ref, uint64(size), size
 		}
 	} else {
 		if isSvndiff {
@@ -479,8 +534,6 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 				body, derr = svndiff.Apply(baseText, body)
 			}
 			if derr != nil {
-				// Never persist a decode failure: storing raw delta bytes would
-				// silently corrupt repository contents.
 				http.Error(w, "svndiff decode: "+derr.Error(), http.StatusBadRequest)
 				return
 			}
@@ -493,21 +546,20 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 	tx, ok = s.txns[res.uuid]
 	if !ok {
 		s.mu.Unlock()
-		if dataFile != "" {
-			os.Remove(dataFile)
-		}
 		http.Error(w, "transaction does not exist", http.StatusConflict)
 		return
 	}
 	ch := tx.changeFor(res.path)
-	if old := ch.dataFile; old != "" && old != dataFile {
+	if old := ch.dataFile; old != "" {
 		os.Remove(old)
 	}
 	ch.kind = fs.KindFile
 	ch.data = data
-	ch.dataFile = dataFile
+	ch.dataFile = ""
 	ch.dataSize = dataSize
-	ch.streamed = dataFile != ""
+	ch.streamed = false
+	ch.dataTextRef = dataTextRef
+	ch.dataTextSize = dataTextSize
 	ch.baseRev = clientRev
 	ch.dataRef = ""
 	if ch.props == nil {
@@ -533,39 +585,43 @@ var errBodyTooLarge = errors.New("file too large")
 
 // readBody reads a PUT body, keeping at most threshold bytes in memory. Larger
 // bodies are spilled to a temp file and returned by path.
-func readBody(r io.Reader, threshold, limit int64) ([]byte, string, error) {
+func readBody(r io.Reader, threshold, limit int64) ([]byte, string, [16]byte, error) {
+	var sum [16]byte
 	head := make([]byte, threshold+1)
 	n, err := io.ReadFull(r, head)
 	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
-		return nil, "", err
+		return nil, "", sum, err
 	}
 	if int64(n) <= threshold {
-		return head[:n], "", nil
+		return head[:n], "", sum, nil
 	}
 	f, cerr := createTemp("body")
 	if cerr != nil {
-		return nil, "", cerr
+		return nil, "", sum, cerr
 	}
 	path := f.Name()
-	if _, werr := f.Write(head[:n]); werr != nil {
+	h := md5.New()
+	dst := io.MultiWriter(f, h)
+	if _, werr := dst.Write(head[:n]); werr != nil {
 		f.Close()
 		os.Remove(path)
-		return nil, "", werr
+		return nil, "", sum, werr
 	}
-	rest, cerr2 := io.Copy(f, io.LimitReader(r, limit-int64(n)+1))
+	rest, cerr2 := io.Copy(dst, io.LimitReader(r, limit-int64(n)+1))
 	cerr3 := f.Close()
 	if cerr2 == nil {
 		cerr2 = cerr3
 	}
 	if cerr2 != nil {
 		os.Remove(path)
-		return nil, "", cerr2
+		return nil, "", sum, cerr2
 	}
 	if int64(n)+rest > limit {
 		os.Remove(path)
-		return nil, "", errBodyTooLarge
+		return nil, "", sum, errBodyTooLarge
 	}
-	return nil, path, nil
+	copy(sum[:], h.Sum(nil))
+	return nil, path, sum, nil
 }
 
 func statusForSpool(err error) int {
@@ -576,27 +632,25 @@ func statusForSpool(err error) int {
 }
 
 // decodeDeltaToFile streams a spooled svndiff delta into a text temp file.
-func decodeDeltaToFile(base []byte, deltaPath string) (string, error) {
-	in, err := os.Open(deltaPath)
-	if err != nil {
-		return "", err
-	}
-	defer in.Close()
+func decodeDeltaToFile(base []byte, delta io.Reader) (string, [16]byte, error) {
+	var sum [16]byte
 	out, err := createTemp("text")
 	if err != nil {
-		return "", err
+		return "", sum, err
 	}
 	outPath := out.Name()
-	if err := svndiff.ApplyTo(base, in, out); err != nil {
+	h := md5.New()
+	if err := svndiff.ApplyTo(base, delta, io.MultiWriter(out, h)); err != nil {
 		out.Close()
 		os.Remove(outPath)
-		return "", err
+		return "", sum, err
 	}
 	if err := out.Close(); err != nil {
 		os.Remove(outPath)
-		return "", err
+		return "", sum, err
 	}
-	return outPath, nil
+	copy(sum[:], h.Sum(nil))
+	return outPath, sum, nil
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, res resource) {
@@ -831,7 +885,7 @@ func collectChanges(repo *fs.Repo, tx *txn) []fs.Change {
 	out := make([]fs.Change, 0, len(paths))
 	for _, p := range paths {
 		ch := tx.changes[p]
-		if ch.dataRef != "" && len(ch.data) == 0 && ch.dataFile == "" {
+		if ch.dataTextRef == "" && ch.dataRef != "" && len(ch.data) == 0 && ch.dataFile == "" {
 			if ch.streamed {
 				if tmp, terr := createTemp("txn"); terr == nil {
 					if _, gerr := repo.Store().GetTo(context.Background(), activityDataKey(repo, ch.dataRef), tmp); gerr == nil {
@@ -865,6 +919,10 @@ func collectChanges(repo *fs.Repo, tx *txn) []fs.Change {
 			CopyFromRev:  ch.copyFromRev,
 			BaseRev:      ch.baseRev,
 			DataFile:     ch.dataFile,
+			DataMD5:      ch.dataMD5,
+			HasMD5:       ch.hasMD5,
+			TextRef:      ch.dataTextRef,
+			TextSize:     ch.dataTextSize,
 		})
 	}
 	return out
