@@ -59,6 +59,9 @@ func (k *Keys) TxnPrefix(txid string) string { return k.p("txn", txid) + "/" }
 // Text returns the external file-text object key for a content reference.
 func (k *Keys) Text(ref string) string { return k.p("texts", ref) }
 
+// Chunk returns the key of one content-defined chunk (hex sha256).
+func (k *Keys) Chunk(hash string) string { return k.p("chunks", hash) }
+
 // CommitLock returns the commit-lock object key.
 func (k *Keys) CommitLock() string { return k.p("locks", "commit") }
 

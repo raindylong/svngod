@@ -72,6 +72,10 @@ type txnChange struct {
 	deltaRef   string
 	deltaBase  fs.NodeID
 	deltaTotal uint64
+	// chunkManifest/chunkTotal describe a large text already split into
+	// content-defined chunks; the commit only records the manifest.
+	chunkManifest []byte
+	chunkTotal    uint64
 	// gen bumps whenever the body reference changes, so a concurrent
 	// persistActivity cannot attach a reference to newer bytes.
 	gen uint64
@@ -547,6 +551,8 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 	var deltaBytes []byte
 	var deltaBase fs.NodeID
 	var deltaTotal uint64
+	var chunkManifest []byte
+	var chunkTotal uint64
 
 	const maxPutBody = 64 << 30
 	storeText := func(path string, sum [16]byte) (string, int64, error) {
@@ -587,6 +593,17 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 			bodyReader = io.TeeReader(r.Body, sink)
 		}
 		outPath, sum, sha, derr := decodeDeltaToFileSource(baseLen, baseSrc, bodyReader, maxPutBody)
+		if os.Getenv("SVNGOD_DEBUG_PUT") == "1" {
+			log.Printf("put-debug path=%s baseRev=%d baseLen=%d contentLen=%d isNew=%v decodedMD5=%x want=%q deltaBuf=%d", res.path, clientRev, baseLen, r.ContentLength, isNew, sum, r.Header.Get("X-SVN-Result-Fulltext-MD5"), deltaBuf.Len())
+		}
+		if derr == nil {
+			if want := r.Header.Get("X-SVN-Result-Fulltext-MD5"); want != "" &&
+				!strings.EqualFold(hex.EncodeToString(sum[:]), want) {
+				os.Remove(outPath)
+				http.Error(w, "result checksum mismatch: decoded text differs from the client's", http.StatusBadRequest)
+				return
+			}
+		}
 		if derr != nil {
 			if errors.Is(derr, errBodyTooLarge) {
 				http.Error(w, derr.Error(), http.StatusRequestEntityTooLarge)
@@ -606,7 +623,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 		// (a chain would make reads and later uploads progressively slower).
 		size := st.Size()
 		useDelta := false
-		if size > putStreamThreshold && !isNew && baseNode != nil {
+		if size > putStreamThreshold && size <= fs.ChunkThreshold && !isNew && baseNode != nil {
 			clientOK := deltaBuf.Len() > 0 && sink.ok() &&
 				deltaBuf.Len() <= deltaInlineCap && int64(deltaBuf.Len()) < size/2
 			// A chain (base is itself a delta) is fine up to the repository's
@@ -649,13 +666,37 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 		}
 		if !useDelta {
 			if size > putStreamThreshold {
-				ref, refSize, xerr := storeText(outPath, sum)
-				if xerr != nil {
-					http.Error(w, xerr.Error(), http.StatusInternalServerError)
-					return
+				if size > fs.ChunkThreshold {
+					f, oerr := os.Open(outPath)
+					if oerr != nil {
+						http.Error(w, oerr.Error(), http.StatusInternalServerError)
+						return
+					}
+					hCheck := md5.New()
+					manifest, total, cerr := repo.StoreChunkedReader(io.TeeReader(f, hCheck))
+					f.Close()
+					os.Remove(outPath)
+					if cerr != nil {
+						http.Error(w, cerr.Error(), http.StatusInternalServerError)
+						return
+					}
+					if !bytes.Equal(hCheck.Sum(nil), sum[:]) {
+						http.Error(w, "chunked text checksum mismatch", http.StatusInternalServerError)
+						return
+					}
+					chunkManifest, chunkTotal = manifest, uint64(total)
+					dataMD5, hasMD5 = sum, true
+					dataSHA1 = sha
+					dataSize = size
+				} else {
+					ref, refSize, xerr := storeText(outPath, sum)
+					if xerr != nil {
+						http.Error(w, xerr.Error(), http.StatusInternalServerError)
+						return
+					}
+					dataTextRef, dataTextSize, dataSize = ref, uint64(refSize), refSize
+					dataSHA1 = sha
 				}
-				dataTextRef, dataTextSize, dataSize = ref, uint64(refSize), refSize
-				dataSHA1 = sha
 			} else {
 				b, rerr := os.ReadFile(outPath)
 				os.Remove(outPath)
@@ -670,13 +711,39 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 		http.Error(w, berr.Error(), statusForSpool(berr))
 		return
 	} else if bodyFile != "" {
-		ref, size, xerr := storeText(bodyFile, bodyMD5)
-		if xerr != nil {
-			http.Error(w, xerr.Error(), http.StatusInternalServerError)
-			return
+		fi, serr := os.Stat(bodyFile)
+		if serr == nil && fi.Size() > fs.ChunkThreshold {
+			f, oerr := os.Open(bodyFile)
+			if oerr != nil {
+				os.Remove(bodyFile)
+				http.Error(w, oerr.Error(), http.StatusInternalServerError)
+				return
+			}
+			hCheck := md5.New()
+			manifest, total, cerr := repo.StoreChunkedReader(io.TeeReader(f, hCheck))
+			f.Close()
+			os.Remove(bodyFile)
+			if cerr != nil {
+				http.Error(w, cerr.Error(), http.StatusInternalServerError)
+				return
+			}
+			if !bytes.Equal(hCheck.Sum(nil), bodyMD5[:]) {
+				http.Error(w, "chunked text checksum mismatch", http.StatusInternalServerError)
+				return
+			}
+			chunkManifest, chunkTotal = manifest, uint64(total)
+			dataMD5, hasMD5 = bodyMD5, true
+			dataSHA1 = bodySHA1
+			dataSize = fi.Size()
+		} else {
+			ref, size, xerr := storeText(bodyFile, bodyMD5)
+			if xerr != nil {
+				http.Error(w, xerr.Error(), http.StatusInternalServerError)
+				return
+			}
+			dataTextRef, dataTextSize, dataSize = ref, uint64(size), size
+			dataSHA1 = bodySHA1
 		}
-		dataTextRef, dataTextSize, dataSize = ref, uint64(size), size
-		dataSHA1 = bodySHA1
 	} else {
 		if isSvndiff {
 			var out bytes.Buffer
@@ -685,6 +752,13 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 				return
 			}
 			body = out.Bytes()
+			if want := r.Header.Get("X-SVN-Result-Fulltext-MD5"); want != "" {
+				sum := md5.Sum(body)
+				if !strings.EqualFold(hex.EncodeToString(sum[:]), want) {
+					http.Error(w, "result checksum mismatch: decoded text differs from the client's", http.StatusBadRequest)
+					return
+				}
+			}
 		}
 		data = body
 		dataSize = int64(len(body))
@@ -717,6 +791,8 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 	ch.deltaBase = deltaBase
 	ch.deltaTotal = deltaTotal
 	ch.deltaRef = ""
+	ch.chunkManifest = chunkManifest
+	ch.chunkTotal = chunkTotal
 	ch.baseRev = clientRev
 	ch.dataRef = ""
 	if ch.props == nil {
@@ -1283,24 +1359,26 @@ func collectChanges(repo *fs.Repo, tx *txn) ([]fs.Change, error) {
 			}
 		}
 		out = append(out, fs.Change{
-			Path:         p,
-			Action:       action,
-			Kind:         ch.kind,
-			Data:         ch.data,
-			Props:        ch.props,
-			CopyFromPath: ch.copyFromPath,
-			CopyFromRev:  ch.copyFromRev,
-			BaseRev:      ch.baseRev,
-			DataFile:     ch.dataFile,
-			DataMD5:      ch.dataMD5,
-			HasMD5:       ch.hasMD5,
-			TextRef:      ch.dataTextRef,
-			TextSize:     ch.dataTextSize,
-			DataSHA1:     ch.dataSHA1,
-			HasSHA1:      ch.hasSHA1,
-			Delta:        ch.delta,
-			DeltaBase:    ch.deltaBase,
-			TextTotal:    ch.deltaTotal,
+			Path:          p,
+			Action:        action,
+			Kind:          ch.kind,
+			Data:          ch.data,
+			Props:         ch.props,
+			CopyFromPath:  ch.copyFromPath,
+			CopyFromRev:   ch.copyFromRev,
+			BaseRev:       ch.baseRev,
+			DataFile:      ch.dataFile,
+			DataMD5:       ch.dataMD5,
+			HasMD5:        ch.hasMD5,
+			TextRef:       ch.dataTextRef,
+			TextSize:      ch.dataTextSize,
+			DataSHA1:      ch.dataSHA1,
+			HasSHA1:       ch.hasSHA1,
+			Delta:         ch.delta,
+			DeltaBase:     ch.deltaBase,
+			TextTotal:     ch.deltaTotal,
+			ChunkManifest: ch.chunkManifest,
+			ChunkTotal:    ch.chunkTotal,
 		})
 	}
 	return out, nil

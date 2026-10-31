@@ -49,29 +49,35 @@ type Change struct {
 	Delta     []byte
 	DeltaBase NodeID
 	TextTotal uint64
+	// ChunkManifest carries a pre-stored content-defined chunk manifest for a
+	// large text (the upload path already split and stored the chunks).
+	ChunkManifest []byte
+	ChunkTotal    uint64
 }
 
 // tnode is an in-memory working-copy node during a commit.
 type tnode struct {
-	kind         byte
-	props        map[string]string
-	data         []byte // file full text (as of HEAD when loaded)
-	dataFile     string // streamed body on disk (large PUT)
-	dataMD5      [16]byte
-	hasMD5       bool
-	dataSHA1     [20]byte
-	hasSHA1      bool
-	textRef      string
-	textSize     uint64
-	deltaRep     bool
-	delta        []byte
-	deltaBase    NodeID
-	deltaTotal   uint64
-	baseText     []byte // previous file text captured during this commit (delta base)
-	children     map[string]*tnode
-	copyFrom     *NodeID
-	copyFromPath string
-	copyFromRev  uint64
+	kind          byte
+	props         map[string]string
+	data          []byte // file full text (as of HEAD when loaded)
+	dataFile      string // streamed body on disk (large PUT)
+	dataMD5       [16]byte
+	hasMD5        bool
+	dataSHA1      [20]byte
+	hasSHA1       bool
+	textRef       string
+	textSize      uint64
+	deltaRep      bool
+	delta         []byte
+	deltaBase     NodeID
+	deltaTotal    uint64
+	chunkManifest []byte
+	chunkTotal    uint64
+	baseText      []byte // previous file text captured during this commit (delta base)
+	children      map[string]*tnode
+	copyFrom      *NodeID
+	copyFromPath  string
+	copyFromRev   uint64
 
 	// identity / representation of the current node-rev (as of HEAD)
 	id         NodeID // zero = new this commit

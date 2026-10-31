@@ -51,8 +51,10 @@ type persistedChange struct {
 	// Small bodies are embedded in the fragment; larger ones live under
 	// dav-txns/data (DataRef/DeltaRef). Embedding avoids a second object and
 	// round trip for the common small-file commit.
-	DataInline  []byte `json:"dataInline,omitempty"`
-	DeltaInline []byte `json:"deltaInline,omitempty"`
+	DataInline    []byte `json:"dataInline,omitempty"`
+	DeltaInline   []byte `json:"deltaInline,omitempty"`
+	ChunkManifest []byte `json:"chunkManifest,omitempty"`
+	ChunkTotal    uint64 `json:"chunkTotal,omitempty"`
 }
 
 type persistedTxn struct {
@@ -185,6 +187,7 @@ func snapshotChange(path string, ch *txnChange) persistedChange {
 		DataRef:  ch.dataRef, DataTextRef: ch.dataTextRef, DataTextSize: ch.dataTextSize,
 		DeltaRef: ch.deltaRef, DeltaTotal: ch.deltaTotal,
 		DeltaBaseRev: ch.deltaBase.Rev, DeltaBaseID: ch.deltaBase.ID,
+		ChunkManifest: ch.chunkManifest, ChunkTotal: ch.chunkTotal,
 	}
 	if ch.hasMD5 {
 		pc.DataMD5 = hex.EncodeToString(ch.dataMD5[:])
@@ -370,7 +373,8 @@ func txnChangeFromPersisted(pc persistedChange) *txnChange {
 		dataSHA1: decodeSHA1(pc.DataSHA1), hasSHA1: pc.DataSHA1 != "",
 		dataMD5: decodeMD5(pc.DataMD5), hasMD5: pc.DataMD5 != "",
 		deltaRef: pc.DeltaRef, deltaTotal: pc.DeltaTotal,
-		deltaBase: fs.NodeID{Rev: pc.DeltaBaseRev, ID: pc.DeltaBaseID},
+		deltaBase:     fs.NodeID{Rev: pc.DeltaBaseRev, ID: pc.DeltaBaseID},
+		chunkManifest: pc.ChunkManifest, chunkTotal: pc.ChunkTotal,
 	}
 }
 

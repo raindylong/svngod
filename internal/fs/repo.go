@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -553,6 +554,16 @@ func (r *Repo) StreamText(id NodeID, w io.Writer) (uint64, error) {
 			return cw.n, aerr
 		}
 		return cw.n, nil
+	case TextRepChunked:
+		refs, perr := parseChunkManifest(nr.Text)
+		if perr != nil {
+			return 0, perr
+		}
+		cw := &countWriter{w: w}
+		if _, cerr := io.Copy(cw, r.chunkReader(refs)); cerr != nil {
+			return cw.n, cerr
+		}
+		return cw.n, nil
 	default:
 		n, werr := w.Write(nr.Text)
 		return uint64(n), werr
@@ -586,6 +597,12 @@ func (r *Repo) TextSizeOf(nr *NodeRev) (int64, error) {
 		// the target in memory.
 		n, err := r.StreamText(nr.Node, io.Discard)
 		return int64(n), err
+	case TextRepChunked:
+		refs, err := parseChunkManifest(nr.Text)
+		if err != nil {
+			return 0, err
+		}
+		return int64(manifestSize(refs)), nil
 	}
 	return 0, errors.New("fs: bad text rep")
 }
@@ -593,6 +610,13 @@ func (r *Repo) TextSizeOf(nr *NodeRev) (int64, error) {
 // ReadTextRange returns up to length bytes at off. External texts are read
 // with a ranged object request, so a Range GET does not materialize the file.
 func (r *Repo) ReadTextRange(nr *NodeRev, off, length int64) ([]byte, error) {
+	if nr.TextRep == TextRepChunked {
+		refs, err := parseChunkManifest(nr.Text)
+		if err != nil {
+			return nil, err
+		}
+		return r.readChunkedRange(refs, off, length)
+	}
 	if nr.TextRep == TextRepExternal {
 		if off < 0 || length <= 0 || uint64(off+length) > nr.TextSize {
 			return nil, errors.New("fs: range out of bounds")
@@ -654,13 +678,27 @@ func (r *Repo) GetText(id NodeID) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+	case TextRepChunked:
+		refs, perr := parseChunkManifest(nr.Text)
+		if perr != nil {
+			return nil, perr
+		}
+		var buf bytes.Buffer
+		if _, cerr := io.Copy(&buf, r.chunkReader(refs)); cerr != nil {
+			return nil, cerr
+		}
+		text = buf.Bytes()
 	default:
 		return nil, errors.New("fs: bad text rep")
 	}
 	if sum := md5.Sum(text); !bytes.Equal(sum[:], nr.TextMD5[:]) {
 		return nil, errors.New("fs: text checksum mismatch")
 	}
-	cachePut(r.cache, k, text)
+	// Caching a multi-gigabyte text would pin that much memory per node; large
+	// reads stream instead.
+	if len(text) <= 4<<20 {
+		cachePut(r.cache, k, text)
+	}
 	return text, nil
 }
 
@@ -901,6 +939,34 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 				nodes = append(nodes, nr)
 				continue
 			}
+			if len(t.chunkManifest) > 0 {
+				nr.TextRep = TextRepChunked
+				nr.Text = append([]byte(nil), t.chunkManifest...)
+				nr.TotalSize = t.chunkTotal
+				nr.TextSize = t.chunkTotal
+				if t.hasMD5 {
+					nr.TextMD5 = t.dataMD5
+				}
+				if t.hasSHA1 {
+					nr.TextSHA1 = t.dataSHA1
+				}
+				nodes = append(nodes, nr)
+				continue
+			}
+			if len(t.data) > ChunkThreshold {
+				manifest, total, cerr := r.storeChunkedReader(ctx, bytes.NewReader(t.data))
+				if cerr != nil {
+					return 0, cerr
+				}
+				nr.TextRep = TextRepChunked
+				nr.Text = manifest
+				nr.TotalSize = uint64(total)
+				nr.TextSize = uint64(total)
+				nr.TextMD5 = md5.Sum(t.data)
+				nr.TextSHA1 = sha1.Sum(t.data)
+				nodes = append(nodes, nr)
+				continue
+			}
 			if t.textRef != "" {
 				sum, herr := hex.DecodeString(t.textRef)
 				if herr != nil || len(sum) != 16 {
@@ -922,6 +988,43 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 				continue
 			}
 			if t.dataFile != "" {
+				if st, serr := os.Stat(t.dataFile); serr == nil && st.Size() > ChunkThreshold {
+					f, oerr := os.Open(t.dataFile)
+					if oerr != nil {
+						return 0, oerr
+					}
+					var manifest []byte
+					var total int64
+					var cerr error
+					if t.hasMD5 && t.hasSHA1 {
+						// The upload already hashed the body while spooling.
+						manifest, total, cerr = r.storeChunkedReader(ctx, f)
+					} else {
+						h := md5.New()
+						hs := sha1.New()
+						manifest, total, cerr = r.storeChunkedReader(ctx, io.TeeReader(f, io.MultiWriter(h, hs)))
+						if cerr == nil {
+							copy(nr.TextMD5[:], h.Sum(nil))
+							copy(nr.TextSHA1[:], hs.Sum(nil))
+						}
+					}
+					f.Close()
+					if cerr != nil {
+						return 0, cerr
+					}
+					nr.TextRep = TextRepChunked
+					nr.Text = manifest
+					nr.TotalSize = uint64(total)
+					nr.TextSize = uint64(total)
+					if t.hasMD5 {
+						nr.TextMD5 = t.dataMD5
+					}
+					if t.hasSHA1 {
+						nr.TextSHA1 = t.dataSHA1
+					}
+					nodes = append(nodes, nr)
+					continue
+				}
 				var known *[16]byte
 				if t.hasMD5 {
 					known = &t.dataMD5
@@ -1128,6 +1231,42 @@ func (r *Repo) VerifyRange(from, to uint64, texts bool) ([]VerifyIssue, error) {
 			if nr.Kind != KindFile {
 				continue
 			}
+			if nr.TextRep == TextRepChunked {
+				refs, perr := parseChunkManifest(nr.Text)
+				if perr != nil {
+					issues = append(issues, VerifyIssue{Rev: rev, Err: perr})
+					continue
+				}
+				var sum uint64
+				bad := false
+				for _, ref := range refs {
+					sum += uint64(ref.Size)
+					key := r.keys.Chunk(chunkKeyHash(ref))
+					ok, eerr := r.store.Exists(ctx, key)
+					if eerr != nil || !ok {
+						issues = append(issues, VerifyIssue{Rev: rev, Err: fmt.Errorf("chunk %s missing", chunkKeyHash(ref))})
+						bad = true
+						continue
+					}
+					if !texts {
+						continue
+					}
+					b, gerr := r.store.Get(ctx, key, nil)
+					if gerr != nil {
+						issues = append(issues, VerifyIssue{Rev: rev, Err: gerr})
+						bad = true
+						continue
+					}
+					if uint32(len(b)) != ref.Size || sha256.Sum256(b) != ref.Hash {
+						issues = append(issues, VerifyIssue{Rev: rev, Err: fmt.Errorf("chunk %s checksum mismatch", chunkKeyHash(ref))})
+						bad = true
+					}
+				}
+				if !bad && nr.TotalSize > 0 && sum != nr.TotalSize {
+					issues = append(issues, VerifyIssue{Rev: rev, Err: fmt.Errorf("chunked text size %d, want %d", sum, nr.TotalSize)})
+				}
+				continue
+			}
 			if nr.TextRep == TextRepExternal {
 				ok, eerr := r.store.Exists(ctx, r.keys.Text(nr.TextRef))
 				if eerr != nil || !ok {
@@ -1200,7 +1339,9 @@ func (r *Repo) applyChange(root *tnode, ch *Change) error {
 			t := &tnode{kind: KindFile, props: copyProps(ch.Props), data: append([]byte(nil), ch.Data...),
 				dataFile: ch.DataFile, dataMD5: ch.DataMD5, hasMD5: ch.HasMD5,
 				dataSHA1: ch.DataSHA1, hasSHA1: ch.HasSHA1,
-				textRef: ch.TextRef, textSize: ch.TextSize, dirty: true}
+				textRef: ch.TextRef, textSize: ch.TextSize,
+				chunkManifest: append([]byte(nil), ch.ChunkManifest...), chunkTotal: ch.ChunkTotal,
+				dirty: true}
 			if len(ch.Delta) > 0 {
 				t.deltaRep = true
 				t.delta = append([]byte(nil), ch.Delta...)
@@ -1208,10 +1349,10 @@ func (r *Repo) applyChange(root *tnode, ch *Change) error {
 				t.deltaTotal = ch.TextTotal
 			}
 			if old, ok := parent.children[name]; ok && old.kind == KindFile {
-				// A streamed body becomes an external full text and a delta
-				// change keeps only its delta, so neither needs the old text
-				// loaded into memory.
-				if ch.DataFile == "" && len(ch.Delta) == 0 {
+				// A streamed body becomes an external full text, a delta
+				// change keeps only its delta, and a chunked change carries a
+				// manifest + pre-stored chunks; none needs the old text.
+				if ch.DataFile == "" && len(ch.Delta) == 0 && len(ch.ChunkManifest) == 0 {
 					if err := r.ensureData(old); err != nil {
 						return err
 					}
@@ -1226,7 +1367,8 @@ func (r *Repo) applyChange(root *tnode, ch *Change) error {
 				t.copyFromPath = old.copyFromPath
 				// A props-only change (PROPPATCH) carries no new text; keep the
 				// base revision's content so the commit does not empty the file.
-				if len(t.data) == 0 && t.dataFile == "" && !t.deltaRep {
+				// A chunk manifest is new text and must not be replaced.
+				if len(t.data) == 0 && t.dataFile == "" && !t.deltaRep && len(t.chunkManifest) == 0 {
 					t.data = append([]byte(nil), old.data...)
 				}
 				// A content-only change (PUT with no PROPPATCH) carries no
@@ -1561,6 +1703,7 @@ func (r *Repo) CollectTexts(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	refs := map[string]bool{}
+	chunkRefs := map[string]bool{}
 	for rev := uint64(0); rev <= head; rev++ {
 		rb, err := r.readBlock(rev)
 		if err != nil {
@@ -1573,6 +1716,13 @@ func (r *Repo) CollectTexts(ctx context.Context) (int, error) {
 			}
 			if nr.TextRep == TextRepExternal && nr.TextRef != "" {
 				refs[nr.TextRef] = true
+			}
+			if nr.TextRep == TextRepChunked {
+				if crefs, err := parseChunkManifest(nr.Text); err == nil {
+					for _, ref := range crefs {
+						chunkRefs[chunkKeyHash(ref)] = true
+					}
+				}
 			}
 		}
 	}
@@ -1587,6 +1737,24 @@ func (r *Repo) CollectTexts(ctx context.Context) (int, error) {
 		for _, o := range objs {
 			ref := strings.TrimPrefix(o.Key, prefix)
 			if !refs[ref] {
+				victims = append(victims, o.Key)
+			}
+		}
+		if n == "" {
+			break
+		}
+		next = n
+	}
+	chunkPrefix := r.keys.Prefix + "/chunks/"
+	next = ""
+	for {
+		objs, n, err := r.store.ListPrefix(ctx, chunkPrefix, next, 500)
+		if err != nil {
+			return 0, err
+		}
+		for _, o := range objs {
+			ref := strings.TrimPrefix(o.Key, chunkPrefix)
+			if !chunkRefs[ref] {
 				victims = append(victims, o.Key)
 			}
 		}

@@ -27,6 +27,9 @@ const (
 	// TextRepExternal stores the full text (and its md5) in a separate object,
 	// keeping rev blocks small and letting GET stream without materializing it.
 	TextRepExternal byte = 2
+	// TextRepChunked stores a manifest of content-defined chunks in Text; the
+	// chunks live under <repo>/chunks and are shared across revisions/files.
+	TextRepChunked byte = 3
 )
 
 // PropRep.

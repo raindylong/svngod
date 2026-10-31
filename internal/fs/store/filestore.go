@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"golang.org/x/sys/unix"
 )
 
 // FileStore implements Store on a local directory, one file per object.
@@ -56,6 +58,20 @@ func (s *FileStore) syncFile(f *os.File) error {
 		syncHook()
 	}
 	return f.Sync()
+}
+
+// SyncAll flushes every dirty page of the filesystem containing the store.
+// One syncfs replaces hundreds of per-chunk fsyncs for a large upload.
+func (s *FileStore) SyncAll(_ context.Context) error {
+	if !s.syncWrites {
+		return nil
+	}
+	d, err := os.Open(s.base)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return unix.Syncfs(int(d.Fd()))
 }
 
 func (s *FileStore) syncDir(dir string) error {
@@ -114,10 +130,11 @@ func (s *FileStore) put(_ context.Context, key string, data []byte, durable bool
 	if err != nil {
 		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	dir := filepath.Dir(p)
-	if err := s.ensureDirLocked(dir); err != nil {
+	s.mu.Lock()
+	err = s.ensureDirLocked(dir)
+	s.mu.Unlock()
+	if err != nil {
 		return err
 	}
 	// Write-then-rename: a crash mid-write must not leave a truncated object
@@ -265,9 +282,11 @@ func (s *FileStore) putFrom(_ context.Context, key string, r io.Reader, size int
 	if err != nil {
 		return err
 	}
+	dir := filepath.Dir(p)
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	err = s.ensureDirLocked(dir)
+	s.mu.Unlock()
+	if err != nil {
 		return err
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(p), ".tmp-*")

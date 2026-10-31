@@ -365,6 +365,18 @@ func (m *MirrorStore) PutFromReconstructible(ctx context.Context, key string, r 
 	return nil
 }
 
+// SyncAll flushes the primary first (the copy that must be durable before the
+// commit is acknowledged), then the healthy standbys in parallel.
+func (m *MirrorStore) SyncAll(ctx context.Context) error {
+	p, pi := m.primary()
+	if err := SyncAll(ctx, p); err != nil {
+		m.markDown(pi)
+		return err
+	}
+	m.mirrorWrites(ctx, pi, func(s Store) error { return SyncAll(ctx, s) })
+	return nil
+}
+
 func (m *MirrorStore) Get(ctx context.Context, key string, rng *Range) ([]byte, error) {
 	m.mu.Lock()
 	fenced := m.fenced && key == m.controlKey && key != ""

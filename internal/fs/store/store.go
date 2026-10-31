@@ -58,6 +58,23 @@ func DeletePrefix(ctx context.Context, s Store, prefix string) error {
 	return nil
 }
 
+// BulkSyncer flushes all pending writes of its backing filesystem in one
+// operation. Chunked uploads use it to avoid one fsync per chunk: chunks are
+// written non-durably, then the whole filesystem is synced before the commit
+// publishes a revision that references them.
+type BulkSyncer interface {
+	SyncAll(ctx context.Context) error
+}
+
+// SyncAll flushes a store if it supports bulk syncing; otherwise it is a
+// no-op (S3 and memory stores are already durable/volatile by definition).
+func SyncAll(ctx context.Context, s Store) error {
+	if bs, ok := s.(BulkSyncer); ok {
+		return bs.SyncAll(ctx)
+	}
+	return nil
+}
+
 // ReconstructibleWriter stores state that the client can re-send after a
 // crash (DAV activity/transaction fragments, staged bodies). Such objects do
 // not need the fsync cost of committed revision data: losing them only makes

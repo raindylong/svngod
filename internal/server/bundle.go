@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/md5"
+	"crypto/sha1"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -268,7 +270,28 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 			ch.BaseRev = base
 		}
 		if bc.TextLen > 0 {
-			if bc.TextLen <= 1<<20 {
+			if bc.TextLen > fs.ChunkThreshold && kind == fs.KindFile {
+				// Split the request stream directly into chunks: no temp file
+				// and no second full read for a multi-gigabyte upload.
+				h := md5.New()
+				hs := sha1.New()
+				limited := io.LimitReader(r.Body, bc.TextLen)
+				manifest, total, cerr := repo.StoreChunkedReader(io.TeeReader(limited, io.MultiWriter(h, hs)))
+				if cerr != nil {
+					http.Error(w, "chunk store: "+cerr.Error(), http.StatusInternalServerError)
+					return
+				}
+				if total != bc.TextLen {
+					http.Error(w, "short bundle text", http.StatusBadRequest)
+					return
+				}
+				ch.ChunkManifest = manifest
+				ch.ChunkTotal = uint64(total)
+				copy(ch.DataMD5[:], h.Sum(nil))
+				ch.HasMD5 = true
+				copy(ch.DataSHA1[:], hs.Sum(nil))
+				ch.HasSHA1 = true
+			} else if bc.TextLen <= 1<<20 {
 				buf := make([]byte, bc.TextLen)
 				if _, rerr := io.ReadFull(r.Body, buf); rerr != nil {
 					http.Error(w, "short bundle text", http.StatusBadRequest)
@@ -281,13 +304,21 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 					http.Error(w, terr.Error(), http.StatusInternalServerError)
 					return
 				}
-				if _, cerr := io.CopyN(tmp, r.Body, bc.TextLen); cerr != nil {
+				// Hash while spooling: the commit can then chunk the file
+				// without a second full read for MD5/SHA-1.
+				h := md5.New()
+				hs := sha1.New()
+				if _, cerr := io.CopyN(io.MultiWriter(tmp, h, hs), r.Body, bc.TextLen); cerr != nil {
 					tmp.Close()
 					os.Remove(tmp.Name())
 					http.Error(w, "short bundle text", http.StatusBadRequest)
 					return
 				}
 				tmp.Close()
+				copy(ch.DataMD5[:], h.Sum(nil))
+				ch.HasMD5 = true
+				copy(ch.DataSHA1[:], hs.Sum(nil))
+				ch.HasSHA1 = true
 				tempFiles = append(tempFiles, tmp.Name())
 				ch.DataFile = tmp.Name()
 			}
