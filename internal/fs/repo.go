@@ -902,6 +902,9 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 		}
 	}
 	walk(root)
+	if len(dirty) == 0 {
+		return 0, errors.New("fs: empty commit")
+	}
 	for i, t := range dirty {
 		t.newID = uint64(i + 1)
 	}
@@ -1302,6 +1305,9 @@ func (r *Repo) VerifyRange(from, to uint64, texts bool) ([]VerifyIssue, error) {
 
 // applyChange mutates the working tree for one Change.
 func (r *Repo) applyChange(root *tnode, ch *Change) error {
+	if ch.Noop {
+		return nil
+	}
 	segs := segments(ch.Path)
 	if len(segs) == 0 {
 		return errors.New("fs: empty path in change")

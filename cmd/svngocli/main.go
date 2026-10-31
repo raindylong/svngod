@@ -19,6 +19,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
@@ -330,7 +331,8 @@ type uploadFile struct {
 	local    string // absolute path on disk
 	repoPath string // "/dir/file"
 	size     int64
-	sum      [32]byte
+	sum      [32]byte          // sha256, also part of the idempotency token
+	sha1     [20]byte          // server node checksum, used to skip unchanged files
 	props    map[string]string // binary files get svn:mime-type like svn import
 }
 
@@ -397,7 +399,7 @@ func cmdUpload(args []string) int {
 		fmt.Fprintf(os.Stderr, "svngocli: %v\n", err)
 		return 1
 	}
-	head, bundleOK, err := probeBundle(repoRoot, user, pass)
+	head, bundleOK, statOK, err := probeBundle(repoRoot, user, pass)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "svngocli: %v\n", err)
 		return 1
@@ -448,13 +450,13 @@ func cmdUpload(args []string) int {
 		if rerr != nil {
 			return rerr
 		}
-		sum, serr := hashFile(p)
+		sum, sha, serr := hashFileSums(p)
 		if serr != nil {
 			return serr
 		}
 		rp := joinRepoPath(targetPath, filepath.ToSlash(rel))
 		fmt.Fprintf(digest, "%s\x00%d\x00%x\x00", rp, fi.Size(), sum)
-		files = append(files, uploadFile{local: p, repoPath: rp, size: fi.Size(), sum: sum, props: sniffProps(p)})
+		files = append(files, uploadFile{local: p, repoPath: rp, size: fi.Size(), sum: sum, sha1: sha, props: sniffProps(p)})
 		return nil
 	})
 	if err != nil {
@@ -462,9 +464,41 @@ func cmdUpload(args []string) int {
 		return 1
 	}
 
-	changes := make([]bundleChange, 0, len(files))
+	// Skip files whose HEAD content already matches the local bytes. This is
+	// what makes a small change to a large release tree cheap: the opaque
+	// body only carries the paths that actually differ.
+	var skippedPaths []string
+	if statOK && len(files) > 0 {
+		paths := make([]string, len(files))
+		for i := range files {
+			paths[i] = files[i].repoPath
+		}
+		if infos, serr := fetchStat(repoRoot, paths, user, pass); serr == nil {
+			kept := files[:0]
+			for _, f := range files {
+				if e, ok := infos[f.repoPath]; ok && e.Size == f.size &&
+					strings.EqualFold(e.SHA1, hex.EncodeToString(f.sha1[:])) {
+					skippedPaths = append(skippedPaths, f.repoPath)
+					continue
+				}
+				kept = append(kept, f)
+			}
+			files = kept
+			if len(skippedPaths) > 0 && !quiet {
+				fmt.Fprintf(os.Stderr, "svngocli: %d unchanged file(s) skipped\n", len(skippedPaths))
+			}
+		}
+	}
+
+	changes := make([]bundleChange, 0, len(files)+len(skippedPaths))
 	for _, f := range files {
 		changes = append(changes, bundleChange{Path: f.repoPath, Action: "put", Kind: "file", BaseRev: head, TextLen: f.size, Props: f.props})
+	}
+	// Skipped files are still checked at commit time: if one changed after
+	// the stat request, the commit is refused instead of silently keeping
+	// the newer server content.
+	for _, p := range skippedPaths {
+		changes = append(changes, bundleChange{Path: p, Action: "check", Kind: "file", BaseRev: head})
 	}
 	if delMiss {
 		gone, gerr := missingOnServer(targetURL, targetPath, files, user, pass)
@@ -478,6 +512,16 @@ func cmdUpload(args []string) int {
 		}
 	}
 	token := hex.EncodeToString(digest.Sum(nil))
+
+	if len(files) == 0 && !delMiss {
+		// Every file matched HEAD; sending only check changes would be an
+		// empty commit, so report success without a request. No data can be
+		// lost here because nothing is written.
+		if !quiet {
+			fmt.Printf("Already up to date (r%d); nothing to upload.\n", head)
+		}
+		return 0
+	}
 
 	body, err := buildBundleFile(bundleHeader{Token: token, BaseRev: head, Message: msg, Changes: changes}, files)
 	if err != nil {
@@ -522,19 +566,57 @@ func sniffProps(p string) map[string]string {
 	return nil
 }
 
-func hashFile(p string) ([32]byte, error) {
+func hashFileSums(p string) ([32]byte, [20]byte, error) {
+	var out [32]byte
+	var out1 [20]byte
 	f, err := os.Open(p)
 	if err != nil {
-		return [32]byte{}, err
+		return out, out1, err
 	}
 	defer f.Close()
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return [32]byte{}, err
+	h1 := sha1.New()
+	if _, err := io.Copy(io.MultiWriter(h, h1), f); err != nil {
+		return out, out1, err
 	}
-	var out [32]byte
 	copy(out[:], h.Sum(nil))
-	return out, nil
+	copy(out1[:], h1.Sum(nil))
+	return out, out1, nil
+}
+
+type statEntry struct {
+	SHA1 string `json:"sha1"`
+	Size int64  `json:"size"`
+}
+
+// fetchStat asks the server for the HEAD sha1/size of the given repo paths.
+func fetchStat(repoRoot string, paths []string, user, pass string) (map[string]statEntry, error) {
+	body, err := json.Marshal(map[string]interface{}{"files": paths})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest("POST", strings.TrimSuffix(repoRoot, "/")+"/!svngod/stat", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "svngocli/"+version)
+	setAuth(req, user, pass)
+	resp, err := httpClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("stat: server returned %d", resp.StatusCode)
+	}
+	var out struct {
+		Files map[string]statEntry `json:"files"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<20)).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out.Files, nil
 }
 
 func joinRepoPath(base, rel string) string {
@@ -585,31 +667,32 @@ func parentURL(u string) string {
 }
 
 // probeBundle negotiates the bulk channel and returns the repository HEAD.
-func probeBundle(repoRoot, user, pass string) (uint64, bool, error) {
+func probeBundle(repoRoot, user, pass string) (uint64, bool, bool, error) {
 	req, err := http.NewRequest("OPTIONS", strings.TrimSuffix(repoRoot, "/")+"/", nil)
 	if err != nil {
-		return 0, false, err
+		return 0, false, false, err
 	}
 	setAuth(req, user, pass)
 	req.Header.Set("User-Agent", "svngocli/"+version)
 	resp, err := httpClient().Do(req)
 	if err != nil {
-		return 0, false, err
+		return 0, false, false, err
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode == http.StatusUnauthorized {
-		return 0, false, fmt.Errorf("authentication required (use --username/--password)")
+		return 0, false, false, fmt.Errorf("authentication required (use --username/--password)")
 	}
 	var head uint64
 	fmt.Sscanf(resp.Header.Get("SVN-Youngest-Rev"), "%d", &head)
 	ok := resp.Header.Get("X-Svngod-Bundle") == "1"
+	statOK := resp.Header.Get("X-Svngod-Stat") == "1"
 	if head == 0 {
 		if out, err := runSvnOutput([]string{"info", "--show-item", "revision", "--non-interactive", repoRoot + "@HEAD"}); err == nil {
 			fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &head)
 		}
 	}
-	return head, ok, nil
+	return head, ok, statOK, nil
 }
 
 // missingOnServer lists the server tree under target and returns repo paths

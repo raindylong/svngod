@@ -3,7 +3,9 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -252,5 +254,122 @@ func TestBundleTokenInRevPropsAndRecovery(t *testing.T) {
 	}
 	if _, err := repo.Store().Get(ctx, bundleIntentKey(repo, tok), nil); err == nil {
 		t.Fatal("intent not cleaned up")
+	}
+}
+
+func TestBundleStatReportsHeadHashes(t *testing.T) {
+	ts, repo := newBundleTestServer(t)
+	defer ts.Close()
+	data := bytes.Repeat([]byte("z"), 5<<20)
+	if _, err := repo.CommitTxn(0, []fs.Change{{
+		Path: "/big.bin", Action: fs.ActionAdd, Kind: fs.KindFile, Data: data,
+	}}, map[string]string{"svn:log": "x", "svn:author": "u", "svn:date": "2026-01-01T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"files":["/big.bin","/missing.bin"]}`
+	req, _ := http.NewRequest("POST", ts.URL+"/svn/bun/!svngod/stat", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	var out struct {
+		Files map[string]struct {
+			SHA1 string `json:"sha1"`
+			Size int64  `json:"size"`
+		} `json:"files"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	e, ok := out.Files["/big.bin"]
+	if !ok {
+		t.Fatalf("big.bin missing from stat: %v", out.Files)
+	}
+	want := sha1.Sum(data)
+	if e.SHA1 != hex.EncodeToString(want[:]) || e.Size != int64(len(data)) {
+		t.Fatalf("stat=%+v want sha1=%x size=%d", e, want, len(data))
+	}
+	if _, ok := out.Files["/missing.bin"]; ok {
+		t.Fatal("missing path reported")
+	}
+}
+
+func TestBundleCheckChangeRejectsStaleBase(t *testing.T) {
+	ts, repo := newBundleTestServer(t)
+	defer ts.Close()
+	if _, err := repo.CommitTxn(0, []fs.Change{
+		{Path: "/a.txt", Action: fs.ActionAdd, Kind: fs.KindFile, Data: []byte("a1")},
+		{Path: "/b.txt", Action: fs.ActionAdd, Kind: fs.KindFile, Data: []byte("b1")},
+	}, map[string]string{"svn:log": "r1", "svn:author": "u", "svn:date": "2026-01-01T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.CommitTxn(0, []fs.Change{
+		{Path: "/a.txt", Action: fs.ActionModify, Kind: fs.KindFile, Data: []byte("a2")},
+	}, map[string]string{"svn:log": "r2", "svn:author": "u", "svn:date": "2026-01-01T00:00:01Z"}); err != nil {
+		t.Fatal(err)
+	}
+	build := func(checkBase uint64) []byte {
+		hdr := &testBundle{
+			Token:   strings.Repeat("d4", 16),
+			BaseRev: 2,
+			Message: "check",
+			Changes: []testBundleChange{
+				{Path: "/b.txt", Action: "put", Kind: "file", BaseRev: 2, TextLen: 2},
+				{Path: "/a.txt", Action: "check", Kind: "file", BaseRev: checkBase},
+			},
+		}
+		h, _ := json.Marshal(hdr)
+		var buf bytes.Buffer
+		buf.WriteString(bundleMagic)
+		var sz [8]byte
+		binary.BigEndian.PutUint64(sz[:], uint64(len(h)))
+		buf.Write(sz[:])
+		buf.Write(h)
+		buf.WriteString("b2")
+		return buf.Bytes()
+	}
+	code, out := postBundle(t, ts, build(1))
+	if code != http.StatusConflict {
+		t.Fatalf("stale check status=%d out=%v", code, out)
+	}
+	head, _ := repo.HeadFresh()
+	if head != 2 {
+		t.Fatalf("failed check moved head to %d", head)
+	}
+	// A fresh token is required because the failed attempt consumed the first.
+	b := &testBundle{
+		Token:   strings.Repeat("e5", 16),
+		BaseRev: 2,
+		Message: "check ok",
+		Changes: []testBundleChange{
+			{Path: "/b.txt", Action: "put", Kind: "file", BaseRev: 2, TextLen: 2},
+			{Path: "/a.txt", Action: "check", Kind: "file", BaseRev: 2},
+		},
+	}
+	h, _ := json.Marshal(b)
+	var buf bytes.Buffer
+	buf.WriteString(bundleMagic)
+	var sz [8]byte
+	binary.BigEndian.PutUint64(sz[:], uint64(len(h)))
+	buf.Write(sz[:])
+	buf.Write(h)
+	buf.WriteString("b2")
+	code, out = postBundle(t, ts, buf.Bytes())
+	if code != http.StatusOK {
+		t.Fatalf("fresh check status=%d out=%v", code, out)
+	}
+	head, _ = repo.HeadFresh()
+	if head != 3 {
+		t.Fatalf("head=%d, want 3", head)
+	}
+	nr, _ := repo.Resolve(3, "/a.txt")
+	got, _ := repo.GetText(nr.Node)
+	if string(got) != "a2" {
+		t.Fatalf("/a.txt changed to %q", got)
 	}
 }

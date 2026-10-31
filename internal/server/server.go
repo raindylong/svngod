@@ -206,6 +206,10 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.handleBundleCommit(w, r)
 		return
 	}
+	if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/!svngod/stat") {
+		s.handleBundleStat(w, r)
+		return
+	}
 	ctx := r.Context()
 	res := parseResource(s.cfg.BasePath, r.URL.Path)
 

@@ -781,3 +781,51 @@ func TestVerifyRangeCoversHistory(t *testing.T) {
 		}
 	}
 }
+
+func TestNoopChangeEnforcesOutOfDate(t *testing.T) {
+	st := store.NewMemoryStore()
+	r, err := CreateRepo(st, "noop", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.CommitTxn(0, []Change{
+		{Path: "/a", Action: ActionAdd, Kind: KindFile, Data: []byte("a1")},
+		{Path: "/b", Action: ActionAdd, Kind: KindFile, Data: []byte("b1")},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.CommitTxn(0, []Change{
+		{Path: "/a", Action: ActionModify, Kind: KindFile, Data: []byte("a2")},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	// A check with a stale base must reject the whole commit.
+	_, err = r.CommitTxn(0, []Change{
+		{Path: "/b", Action: ActionModify, Kind: KindFile, Data: []byte("b2")},
+		{Path: "/a", Action: ActionModify, Kind: KindFile, Noop: true, BaseRev: 1},
+	}, nil)
+	var ood *OutOfDateError
+	if !errors.As(err, &ood) {
+		t.Fatalf("stale check err=%v, want OutOfDate", err)
+	}
+	// With the current base it succeeds, changes nothing for /a, and still
+	// applies the real change.
+	rev, err := r.CommitTxn(0, []Change{
+		{Path: "/b", Action: ActionModify, Kind: KindFile, Data: []byte("b2")},
+		{Path: "/a", Action: ActionModify, Kind: KindFile, Noop: true, BaseRev: 2},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rev != 3 {
+		t.Fatalf("rev=%d, want 3", rev)
+	}
+	nr, err := r.Resolve(3, "/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := r.GetText(nr.Node)
+	if string(got) != "a2" {
+		t.Fatalf("/a changed to %q", got)
+	}
+}

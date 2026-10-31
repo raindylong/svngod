@@ -53,6 +53,10 @@ type Change struct {
 	// large text (the upload path already split and stored the chunks).
 	ChunkManifest []byte
 	ChunkTotal    uint64
+	// Noop still runs the per-path out-of-date check but changes nothing.
+	// A bulk client uses it to guard files it skipped as unchanged between
+	// its stat request and the commit.
+	Noop bool
 }
 
 // tnode is an in-memory working-copy node during a commit.

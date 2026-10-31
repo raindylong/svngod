@@ -52,6 +52,7 @@ func (s *Server) handleOptions(w http.ResponseWriter, r *http.Request, res resou
 	h.Set("Allow", allowedMethods)
 	// svngocli negotiates the bulk commit channel through this capability.
 	h.Set("X-Svngod-Bundle", "1")
+	h.Set("X-Svngod-Stat", "1")
 	if httpV2Enabled() {
 		// HTTPv2 negotiation, byte-for-byte as mod_dav_svn 1.14 sends it:
 		// repository-relative URLs without a trailing slash (ra_serf asserts

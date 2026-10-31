@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"crypto/sha1"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -266,6 +267,15 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 
 		action, kind := bundleAction(bc, path, repo, head)
 		ch := fs.Change{Path: path, Action: action, Kind: kind, Props: bc.Props, BaseRev: bc.BaseRev}
+		if bc.Action == "check" {
+			if bc.TextLen != 0 {
+				http.Error(w, "check change must not carry text", http.StatusBadRequest)
+				return
+			}
+			ch.Noop = true
+			ch.Action = fs.ActionModify
+			ch.Kind = fs.KindFile
+		}
 		if ch.BaseRev == 0 && action != fs.ActionAdd {
 			ch.BaseRev = base
 		}
@@ -356,7 +366,88 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 	writeBundleResult(w, rev, false)
 }
 
-// writeBundleError returns a machine-readable error so the client can tell an
+// bundleStatRequest asks for the content hash of paths the client already has
+// locally, so unchanged files can be skipped instead of re-uploaded.
+type bundleStatRequest struct {
+	Path  string   `json:"path"`
+	Files []string `json:"files"`
+}
+
+type bundleStatEntry struct {
+	SHA1 string `json:"sha1,omitempty"`
+	Size int64  `json:"size,omitempty"`
+}
+
+// handleBundleStat serves POST <repo>/!svngod/stat: for each requested path,
+// return the HEAD file's sha1 when known. The client compares it with its
+// local hash and omits matching files from the bundle body.
+func (s *Server) handleBundleStat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "stat endpoint accepts POST", http.StatusMethodNotAllowed)
+		return
+	}
+	rest := strings.TrimPrefix(r.URL.Path, strings.TrimSuffix(s.cfg.BasePath, "/")+"/")
+	name := strings.SplitN(rest, "/", 2)[0]
+	if name == "" {
+		http.Error(w, "repository missing", http.StatusBadRequest)
+		return
+	}
+	repo, ok := s.repo(w, resource{repo: name})
+	if !ok {
+		return
+	}
+	ident, ok := s.authenticate(w, r, name)
+	if !ok {
+		return
+	}
+	user := ident.Username
+	if user == "" && s.cfg.authFor(name) != nil {
+		s.unauthorized(w)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var req bundleStatRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "bad stat request", http.StatusBadRequest)
+		return
+	}
+	if len(req.Files) > maxBundleChanges {
+		http.Error(w, "too many files", http.StatusBadRequest)
+		return
+	}
+	head, err := repo.HeadFresh()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	az := s.cfg.authzFor(name)
+	out := make(map[string]bundleStatEntry, len(req.Files))
+	for _, p := range req.Files {
+		path, perr := cleanBundlePath(p)
+		if perr != nil {
+			continue
+		}
+		if az != nil && !az.Authorize(user, name, path, false) {
+			continue
+		}
+		nr, rerr := repo.Resolve(head, path)
+		if rerr != nil || nr.Kind != fs.KindFile {
+			continue
+		}
+		if nr.TextSHA1 == ([20]byte{}) {
+			continue // unknown; the client will upload it
+		}
+		out[path] = bundleStatEntry{SHA1: hex.EncodeToString(nr.TextSHA1[:]), Size: int64(nr.TotalSize)}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"files": out})
+}
+
+// writeBundleError returns a machine-readable error so the client can tell an// writeBundleError returns a machine-readable error so the client can tell an
 // out-of-date conflict (do not retry; re-run after updating) from a transient
 // failure or a concurrent upload with the same token (retry).
 func writeBundleError(w http.ResponseWriter, status int, code, msg string) {
@@ -522,8 +613,8 @@ func bundleAction(bc *bundleChange, path string, repo *fs.Repo, head uint64) (fs
 		return fs.ActionDelete, kind
 	case "add":
 		return fs.ActionAdd, kind
-	case "modify":
-		return fs.ActionModify, kind
+	case "modify", "check":
+		return fs.ActionModify, fs.KindFile
 	}
 	// "put": resolve existence at HEAD.
 	if nr, err := repo.Resolve(head, path); err == nil {
