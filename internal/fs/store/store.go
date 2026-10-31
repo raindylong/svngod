@@ -20,6 +20,10 @@ var ErrNotFound = errors.New("store: object not found")
 // expected condition does not hold.
 var ErrPreconditionFailed = errors.New("store: precondition failed")
 
+// ErrReplicaLagging means the elected standby has not yet caught up with the
+// last acknowledged HEAD, so it must not accept writes (RPO=0 failover).
+var ErrReplicaLagging = errors.New("store: replica is behind the acknowledged head")
+
 // Range selects a byte window of an object.
 type Range struct {
 	Offset, Length int64 // Length <= 0 means "to end of object"

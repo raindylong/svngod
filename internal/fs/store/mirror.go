@@ -52,6 +52,15 @@ type MirrorStore struct {
 	// fs sets it so a rejoining mirror cannot overwrite a newer HEAD pointer
 	// with its stale copy. Without it, values are treated as equal.
 	mutableOrder func(key string, a, b []byte) int
+
+	// controlKey names the repository's HEAD pointer. ackedCurrent holds the
+	// bytes of the last HEAD this process successfully wrote (or adopted at
+	// startup); after a primary failure the election must not accept writes
+	// on a standby whose copy is older, otherwise a failover could lose an
+	// acknowledged revision.
+	controlKey   string
+	ackedCurrent []byte
+	fenced       bool
 }
 
 // SetMutableOrder installs the ordering used to reconcile mutable objects
@@ -179,9 +188,86 @@ func (m *MirrorStore) primary() (Store, int) {
 	return m.mirrors[0], 0
 }
 
-// markDown records a mirror as failed so it is excluded from service.
+// markDown records a mirror as failed so it is excluded from service. Losing
+// the current primary fences writes until the newly elected standby proves it
+// has the acknowledged HEAD.
 func (m *MirrorStore) markDown(i int) {
-	m.setHealthy(i, false)
+	m.mu.Lock()
+	m.healthy[i] = false
+	m.repairable = true
+	if i == m.prim {
+		m.fenced = true
+	}
+	m.mu.Unlock()
+}
+
+// SetControlKey names the repository HEAD object so failover can compare the
+// standby's copy with the last acknowledged one. Call after the repo is open.
+func (m *MirrorStore) SetControlKey(key string) {
+	m.mu.Lock()
+	m.controlKey = key
+	m.mu.Unlock()
+	if key == "" {
+		return
+	}
+	// Adopt the HEAD only when every reachable mirror agrees. NewMirror's
+	// initial repair has already reconciled them (using mutableOrder), so a
+	// disagreement here means the state is genuinely uncertain and must not
+	// be used as an RPO baseline.
+	var agreed []byte
+	for _, s := range m.mirrors {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		b, err := s.Get(ctx, key, nil)
+		cancel()
+		if err != nil {
+			continue
+		}
+		if agreed == nil {
+			agreed = append([]byte(nil), b...)
+			continue
+		}
+		if ContentETag(agreed) != ContentETag(b) {
+			return
+		}
+	}
+	if len(agreed) > 0 {
+		m.noteAcked(agreed)
+	}
+}
+
+func (m *MirrorStore) noteAcked(b []byte) {
+	m.mu.Lock()
+	m.ackedCurrent = append([]byte(nil), b...)
+	m.fenced = false
+	m.mu.Unlock()
+}
+
+func (m *MirrorStore) ackedCopy() []byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]byte(nil), m.ackedCurrent...)
+}
+
+// checkCaughtUp refuses writes on a standby whose HEAD differs from the last
+// acknowledged one, and asks the repair loop to catch it up.
+func (m *MirrorStore) checkCaughtUp(p Store) error {
+	m.mu.Lock()
+	key, want, fenced := m.controlKey, append([]byte(nil), m.ackedCurrent...), m.fenced
+	m.mu.Unlock()
+	if !fenced || key == "" || len(want) == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	got, err := p.Get(ctx, key, nil)
+	if err != nil || ContentETag(got) != ContentETag(want) {
+		go m.repair()
+		return ErrReplicaLagging
+	}
+	m.mu.Lock()
+	m.fenced = false
+	m.mu.Unlock()
+	return nil
 }
 
 // writePrimary runs a write on the elected primary; on a transport failure it
@@ -190,6 +276,9 @@ func (m *MirrorStore) markDown(i int) {
 // read and the write. Precondition/missing-object results are not retried.
 func (m *MirrorStore) writePrimary(fn func(Store) error) (int, error) {
 	p, pi := m.primary()
+	if err := m.checkCaughtUp(p); err != nil {
+		return pi, err
+	}
 	err := fn(p)
 	if err == nil {
 		return pi, nil
@@ -222,6 +311,9 @@ func (m *MirrorStore) Put(ctx context.Context, key string, data []byte) error {
 	pi, err := m.writePrimary(func(s Store) error { return s.Put(ctx, key, data) })
 	if err != nil {
 		return err
+	}
+	if key == m.controlName() {
+		m.noteAcked(data)
 	}
 	// Best-effort mirror to healthy standbys.
 	m.mirrorWrites(ctx, pi, func(s Store) error { return s.Put(ctx, key, data) })
@@ -274,6 +366,16 @@ func (m *MirrorStore) PutFromReconstructible(ctx context.Context, key string, r 
 }
 
 func (m *MirrorStore) Get(ctx context.Context, key string, rng *Range) ([]byte, error) {
+	m.mu.Lock()
+	fenced := m.fenced && key == m.controlKey && key != ""
+	ack := append([]byte(nil), m.ackedCurrent...)
+	m.mu.Unlock()
+	if fenced && len(ack) > 0 && rng == nil {
+		// Fail closed: expose the last acknowledged HEAD, never a standby's
+		// older pointer. The referenced revision objects may not be readable
+		// until repair finishes, but clients cannot see a stale head.
+		return ack, nil
+	}
 	// Read the primary first: it is the only copy guaranteed to have every
 	// object written so far (a standby write is best effort and may still be
 	// in flight). Fall back to standbys without marking them down when they
@@ -467,10 +569,19 @@ func (m *MirrorStore) CAS(ctx context.Context, key string, expectETag string, da
 	if err != nil {
 		return "", err
 	}
+	if key == m.controlName() {
+		m.noteAcked(data)
+	}
 	// Standbys mirror the current value unconditionally (their own etag does
 	// not matter; they only serve reads after failover).
 	m.mirrorWrites(ctx, pi, func(s Store) error { return s.Put(ctx, key, data) })
 	return newEtag, nil
+}
+
+func (m *MirrorStore) controlName() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.controlKey
 }
 
 func (m *MirrorStore) ListPrefix(ctx context.Context, prefix, continuation string, max int) ([]ListedObj, string, error) {

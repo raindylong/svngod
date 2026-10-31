@@ -96,9 +96,9 @@ section{box-shadow:none;break-inside:avoid;page-break-inside:avoid}
 <th>结果</th>
 </tr></thead><tbody>
 <tr><td>1,000 个文件（约 4MB）</td><td>1.38s</td><td>0.06s（约 22×）</td><td>各 1 个修订，内容校验一致</td></tr>
-<tr><td>30,000 个文件（300 目录）</td><td>70s</td><td>1.2s</td><td>30,300 项齐全，verify 干净</td></tr>
+<tr><td>30,000 个文件（300 目录）</td><td>35s</td><td>1.2s</td><td>30,300 项齐全，verify 干净</td></tr>
 </tbody></table></div>
-<div class="note">原生 Apache 的提交同样是逐文件 PUT；文件数上万时往返次数线性增长，现场常见 600 秒网关超时。svngod 的原生客户端路径 70 秒完成，bundle 路径把往返压到 1 次。</div>
+<div class="note">原生 Apache 的提交同样是逐文件 PUT；文件数上万时往返次数线性增长，现场常见 600 秒网关超时。svngod 的原生客户端路径 35 秒完成，bundle 路径把往返压到 1 次。</div>
 </section><section>
 <h2>实测数据：大文件（1GiB / 2GiB 随机二进制）</h2>
 <div class="table-wrap"><table><thead><tr>
@@ -197,7 +197,7 @@ svngocli upload ./assets https://host/svn/repo/assets -m &quot;release&quot;</co
 <div class="callout">30,000 个文件 1.2 秒，1GiB 4.8 秒，内存 17MiB —— 这是 SVN 协议下可以做到的事。</div>
 </section><section>
 <h2>测试环境与口径</h2>
-<div class="note">Linux x86_64，本地 overlay 盘；svn 1.14.1；Apache 2.4.52 + mod_dav_svn；svngod master @8775856。大文件为 /dev/urandom 随机二进制。所有数据以 sha256 回读、仓库 verify 双重校验。吞吐受硬件、网络与并发影响，生产容量请以自有环境压测为准。对比对象为 Apache mod_dav_svn；svngod 同时兼容标准 SVN dump 与原生客户端。</div>
+<div class="note">Linux x86_64，本地 overlay 盘；svn 1.14.1；Apache 2.4.52 + mod_dav_svn；svngod master（2026-10，含 P0 加固）。大文件为 /dev/urandom 随机二进制。所有数据以 sha256 回读、仓库 verify 双重校验。吞吐受硬件、网络与并发影响，生产容量请以自有环境压测为准。对比对象为 Apache mod_dav_svn；svngod 同时兼容标准 SVN dump 与原生客户端。</div>
 </section></main>
 <footer class="footer">svngod · SVN-compatible version server · 2026</footer>
 </body></html>

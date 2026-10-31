@@ -144,6 +144,7 @@ func CreateRepo(st store.Store, prefix string, shardSize, maxDelta uint64) (*Rep
 	if err := st.Put(ctx, keys.Current(), (&Current{Head: 0, Created: now}).Marshal()); err != nil {
 		return nil, err
 	}
+	wireMirrorControl(st, keys)
 	return &Repo{
 		store: st, keys: keys, shardSz: shardSize, maxDelta: maxDelta,
 		cache: cache.New(1 << 16), nodeCache: make(map[cache.Key]*NodeRev),
@@ -165,10 +166,19 @@ func OpenRepo(st store.Store, prefix string) (*Repo, error) {
 	if err != nil {
 		return nil, err
 	}
+	wireMirrorControl(st, keys)
 	return &Repo{
 		store: st, keys: keys, shardSz: f.ShardSize, maxDelta: f.MaxDeltaChain,
 		cache: cache.New(1 << 16), nodeCache: make(map[cache.Key]*NodeRev),
 	}, nil
+}
+
+// wireMirrorControl tells a mirror store which object is the HEAD pointer, so
+// failover can refuse writes on a standby whose pointer is older.
+func wireMirrorControl(st store.Store, keys *store.Keys) {
+	if ms, ok := st.(*store.MirrorStore); ok {
+		ms.SetControlKey(keys.Current())
+	}
 }
 
 func randomUUID() string {

@@ -109,3 +109,46 @@ func TestMirrorConcurrentWrites(t *testing.T) {
 }
 
 var _ = errors.New // keep errors import if unused in future edits
+
+func TestMirrorFailoverFencesStaleHead(t *testing.T) {
+	ctx := context.Background()
+	a, b := NewMemoryStore(), NewMemoryStore()
+	m := NewMirror([]Store{a, b})
+	defer m.Close()
+	key := "repos/demo/current"
+	if err := m.Put(ctx, key, []byte("head=1")); err != nil {
+		t.Fatal(err)
+	}
+	m.SetControlKey(key) // adopt head=1 as the acknowledged head
+
+	// Standby missed the last commit and still has head=0.
+	if err := b.Put(ctx, key, []byte("head=0")); err != nil {
+		t.Fatal(err)
+	}
+	// Primary fails.
+	m.markDown(0)
+
+	// Reads of the control key must expose the acknowledged head, never the
+	// standby's older pointer.
+	got, err := m.Get(ctx, key, nil)
+	if err != nil || string(got) != "head=1" {
+		t.Fatalf("Get current after failover = %q, %v; want acknowledged head", got, err)
+	}
+	// Writes must be refused until the standby catches up.
+	if err := m.Put(ctx, "repos/demo/revs/2", []byte("x")); !errors.Is(err, ErrReplicaLagging) {
+		t.Fatalf("write on stale standby = %v, want ErrReplicaLagging", err)
+	}
+	// Simulate repair copying the acknowledged pointer.
+	if err := b.Put(ctx, key, []byte("head=1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Put(ctx, "repos/demo/revs/2", []byte("x")); err != nil {
+		t.Fatalf("write after catch-up: %v", err)
+	}
+	if err := m.Put(ctx, key, []byte("head=2")); err != nil {
+		t.Fatalf("advance head: %v", err)
+	}
+	if got, _ := m.Get(ctx, key, nil); string(got) != "head=2" {
+		t.Fatalf("head after write = %q", got)
+	}
+}

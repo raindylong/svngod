@@ -35,9 +35,9 @@ Apache + mod_dav_svn 成熟可靠，但它的提交模型诞生于“一次提�
 | 场景 | 原生 svn 客户端 → svngod | svngocli bundle | 结果 |
 |---|---|---|---|
 | 1,000 个文件（约 4MB） | 1.38s | 0.06s（约 22×） | 各 1 个修订，内容校验一致 |
-| 30,000 个文件（300 目录） | 70s | 1.2s | 30,300 项齐全，verify 干净 |
+| 30,000 个文件（300 目录） | 35s | 1.2s | 30,300 项齐全，verify 干净 |
 
-> 原生 Apache 的提交同样是逐文件 PUT；文件数上万时往返次数线性增长，现场常见 600 秒网关超时。svngod 的原生客户端路径 70 秒完成，bundle 路径把往返压到 1 次。
+> 原生 Apache 的提交同样是逐文件 PUT；文件数上万时往返次数线性增长，现场常见 600 秒网关超时。svngod 的原生客户端路径 35 秒完成，bundle 路径把往返压到 1 次。
 
 ## 实测数据：大文件（1GiB / 2GiB 随机二进制）
 
@@ -134,4 +134,4 @@ svngod 不是另起炉灶的版本控制系统，而是把 SVN 的提交通道�
 
 ## 测试环境与口径
 
-> Linux x86_64，本地 overlay 盘；svn 1.14.1；Apache 2.4.52 + mod_dav_svn；svngod master @8775856。大文件为 /dev/urandom 随机二进制。所有数据以 sha256 回读、仓库 verify 双重校验。吞吐受硬件、网络与并发影响，生产容量请以自有环境压测为准。对比对象为 Apache mod_dav_svn；svngod 同时兼容标准 SVN dump 与原生客户端。
+> Linux x86_64，本地 overlay 盘；svn 1.14.1；Apache 2.4.52 + mod_dav_svn；svngod master（2026-10，含 P0 加固）。大文件为 /dev/urandom 随机二进制。所有数据以 sha256 回读、仓库 verify 双重校验。吞吐受硬件、网络与并发影响，生产容量请以自有环境压测为准。对比对象为 Apache mod_dav_svn；svngod 同时兼容标准 SVN dump 与原生客户端。
