@@ -2,6 +2,7 @@ package server
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -137,3 +138,70 @@ func TestHTTPv2Disabled(t *testing.T) {
 }
 
 var _ = fs.KindFile
+// TestCrossReplicaTransactionRestore covers a load-balanced commit: replica B
+// had already loaded its activity list before replica A created the
+// transaction, so the later PUT/MERGE on B must restore the session on demand
+// from the shared store instead of answering 409.
+func TestCrossReplicaTransactionRestore(t *testing.T) {
+	repo := buildRepo(t)
+	open := func(name string) (*fs.Repo, error) { return repo, nil }
+	a := New(Config{BasePath: "/svn", OpenRepo: open})
+	b := New(Config{BasePath: "/svn", OpenRepo: open})
+	ta := httptest.NewServer(a.Handler())
+	tb := httptest.NewServer(b.Handler())
+	defer ta.Close()
+	defer tb.Close()
+
+	// B sees the repository before the transaction exists (stateLoaded=true).
+	resp := doRequest(t, "PROPFIND", tb.URL+"/svn/demo/!svn/vcc/default",
+		`<?xml version="1.0"?><propfind xmlns="DAV:"><prop><version-name/></prop></propfind>`,
+		"", "", map[string]string{"Depth": "0"})
+	resp.Body.Close()
+
+	resp = doRequest(t, "POST", ta.URL+"/svn/demo/!svn/me",
+		"(create-txn-with-props (svn:log 5 cross))", "", "",
+		map[string]string{"Content-Type": "application/vnd.svn-skel"})
+	resp.Body.Close()
+	txn := resp.Header.Get("SVN-Txn-Name")
+	if txn == "" {
+		t.Fatalf("create-txn status %d, no txn name", resp.StatusCode)
+	}
+
+	for _, c := range []struct{ url, path, body string }{
+		{ta.URL, "/trunk/fromA.txt", "from A\n"},
+		{tb.URL, "/trunk/fromB.txt", "from B\n"},
+	} {
+		r := doRequest(t, "PUT", c.url+"/svn/demo/!svn/txr/"+txn+c.path, c.body,
+			"", "", map[string]string{"Content-Type": "text/plain"})
+		r.Body.Close()
+		if r.StatusCode != http.StatusCreated && r.StatusCode != http.StatusNoContent {
+			t.Fatalf("PUT %s status %d", c.url, r.StatusCode)
+		}
+	}
+
+	merge := `<?xml version="1.0"?><D:merge xmlns:D="DAV:"><D:source><D:href>` +
+		tb.URL + `/svn/demo/!svn/txn/` + txn + `</D:href></D:source></D:merge>`
+	resp = doRequest(t, "MERGE", tb.URL+"/svn/demo", merge, "", "",
+		map[string]string{"Content-Type": "text/xml"})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("MERGE on replica B status %d", resp.StatusCode)
+	}
+	head, _ := repo.HeadFresh()
+	if head != 2 {
+		t.Fatalf("head=%d, want 2", head)
+	}
+	for path, want := range map[string]string{
+		"/trunk/fromA.txt": "from A\n",
+		"/trunk/fromB.txt": "from B\n",
+	} {
+		nr, err := repo.Resolve(2, path)
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		text, _ := repo.GetText(nr.Node)
+		if string(text) != want {
+			t.Fatalf("%s = %q, want %q", path, text, want)
+		}
+	}
+}

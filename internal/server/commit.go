@@ -142,7 +142,7 @@ func (s *Server) handleCheckout(w http.ResponseWriter, r *http.Request, res reso
 		return
 	}
 	if repo, ok := s.repo(w, res); ok {
-		s.loadTxnChanges(repo, "txn-"+actID)
+		s.loadTxnChanges(repo, res.repo, "txn-"+actID)
 	} else {
 		return
 	}
@@ -306,12 +306,14 @@ func (s *Server) handleProppatch(w http.ResponseWriter, r *http.Request, res res
 		return
 	}
 	if res.typ == resTxn {
-		s.loadTxnChanges(repo, res.uuid)
+		s.loadTxnChanges(repo, res.repo, res.uuid)
 	}
 	sets, removes := parsePropertyUpdate(body)
 
 	switch res.typ {
 	case resActivity:
+		// A commit may have been started on another replica.
+		s.restoreActivity(res.repo, repo, res.uuid)
 		// Setting revision properties on the activity (svn:log, author, date).
 		s.mu.Lock()
 		a, ok := s.activities[res.uuid]
@@ -437,7 +439,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 	if !rok {
 		return
 	}
-	s.loadTxnChanges(repo, res.uuid)
+	s.loadTxnChanges(repo, res.repo, res.uuid)
 	s.mu.Lock()
 	tx, ok := s.txns[res.uuid]
 	if !ok {
@@ -826,7 +828,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, res resour
 		return
 	}
 	if repo, ok := s.repo(w, res); ok {
-		s.loadTxnChanges(repo, res.uuid)
+		s.loadTxnChanges(repo, res.repo, res.uuid)
 	} else {
 		return
 	}
@@ -858,7 +860,7 @@ func (s *Server) handleMkcol(w http.ResponseWriter, r *http.Request, res resourc
 		return
 	}
 	if repo, ok := s.repo(w, res); ok {
-		s.loadTxnChanges(repo, res.uuid)
+		s.loadTxnChanges(repo, res.repo, res.uuid)
 	} else {
 		return
 	}
@@ -905,7 +907,7 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 		http.Error(w, "MERGE body must name a source activity", http.StatusBadRequest)
 		return
 	}
-	s.loadTxnChanges(repo, "txn-"+actID)
+	s.loadTxnChanges(repo, res.repo, "txn-"+actID)
 	s.mu.Lock()
 	a, ok := s.activities[actID]
 	if !ok || a.txn == nil {

@@ -374,15 +374,71 @@ func txnChangeFromPersisted(pc persistedChange) *txnChange {
 	}
 }
 
+// restoreActivity loads one commit session from the shared store if this
+// process does not know it yet. A commit can start on one replica (POST
+// create-txn / MKACTIVITY) and continue on another after a load balancer
+// switch, so unknown transaction URLs must be restored on demand rather than
+// answered with 409.
+func (s *Server) restoreActivity(repoName string, repo *fs.Repo, actID string) bool {
+	if repo == nil || actID == "" {
+		return false
+	}
+	if _, ok := s.activityByID(actID); ok {
+		return true
+	}
+	data, err := repo.Store().Get(context.Background(), activityStateKey(repo, actID), nil)
+	if err != nil {
+		return false
+	}
+	var pa persistedActivity
+	if err := json.Unmarshal(data, &pa); err != nil || pa.ID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.activities[pa.ID]; ok {
+		return true
+	}
+	a := &activity{id: pa.ID, repo: repoName, created: pa.Created, revProps: pa.RevProps}
+	if a.revProps == nil {
+		a.revProps = map[string]string{}
+	}
+	if pa.Txn != nil {
+		tx := &txn{id: pa.Txn.ID, baseRev: pa.Txn.BaseRev, changes: map[string]*txnChange{}}
+		for _, pc := range pa.Txn.Changes {
+			tx.changes[pc.Path] = txnChangeFromPersisted(pc)
+		}
+		tx.changesLoaded = false
+		a.txn = tx
+		s.txns[tx.id] = tx
+	}
+	s.activities[a.id] = a
+	return true
+}
+
 // loadTxnChanges reads a restored transaction's change fragments once, when a
-// request actually touches that transaction.
-func (s *Server) loadTxnChanges(repo *fs.Repo, txid string) {
+// request actually touches that transaction. If the transaction is not in
+// memory (created by another replica), it is restored first.
+func (s *Server) loadTxnChanges(repo *fs.Repo, repoName, txid string) {
 	if repo == nil || txid == "" {
 		return
 	}
 	s.mu.Lock()
 	tx := s.txns[txid]
-	if tx == nil || tx.changesLoaded {
+	s.mu.Unlock()
+	if tx == nil {
+		if !s.restoreActivity(repoName, repo, strings.TrimPrefix(txid, "txn-")) {
+			return
+		}
+		s.mu.Lock()
+		tx = s.txns[txid]
+		s.mu.Unlock()
+	}
+	if tx == nil {
+		return
+	}
+	s.mu.Lock()
+	if tx.changesLoaded {
 		s.mu.Unlock()
 		return
 	}

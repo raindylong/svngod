@@ -714,9 +714,9 @@ func (s *Server) handleCopyMove(w http.ResponseWriter, r *http.Request, res reso
 		return
 	}
 	if repo, ok := s.repo(w, res); ok {
-		s.loadTxnChanges(repo, dres.uuid)
+		s.loadTxnChanges(repo, dres.repo, dres.uuid)
 		if res.typ == resTxn {
-			s.loadTxnChanges(repo, res.uuid)
+			s.loadTxnChanges(repo, res.repo, res.uuid)
 		}
 	} else {
 		return
