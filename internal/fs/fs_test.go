@@ -3,11 +3,14 @@ package fs
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"crypto/sha1"
 	"errors"
 	"strings"
 	"testing"
 
 	"svngod/internal/fs/store"
+	"svngod/internal/svndiff"
 )
 
 func TestNodeRevRoundTrip(t *testing.T) {
@@ -634,5 +637,104 @@ func TestCollectTexts(t *testing.T) {
 		if got, err := repo.GetText(nr.Node); err != nil || !bytes.Equal(got, want) {
 			t.Fatalf("rev %d text wrong: len=%d err=%v", rev, len(got), err)
 		}
+	}
+}
+
+// TestCommitClientDelta stores a change as a client-supplied svndiff stream
+// against an exact base node (large-binary delta storage) and checks the
+// reconstructed text, the recorded hashes and the stale-base rejection.
+func TestCommitClientDelta(t *testing.T) {
+	st := store.NewMemoryStore()
+	repo, err := CreateRepo(st, "repos/delta", 4096, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := bytes.Repeat([]byte("0123456789abcdef"), 4096) // 64 KiB
+	rev1, err := repo.CommitTxn(0, []Change{{Path: "/big.bin", Action: ActionAdd, Kind: KindFile, Data: base}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n1, err := repo.Resolve(rev1, "/big.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := append([]byte(nil), base...)
+	copy(next[100:], "CHANGED!")
+	delta, err := svndiff.Encode(base, next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(delta) > len(next)/2 {
+		t.Fatalf("delta too large for the test: %d", len(delta))
+	}
+	sum := md5.Sum(next)
+	sha := sha1.Sum(next)
+	rev2, err := repo.CommitTxn(rev1, []Change{{
+		Path: "/big.bin", Action: ActionModify, Kind: KindFile,
+		BaseRev: rev1, Delta: delta, DeltaBase: n1.Node,
+		TextTotal: uint64(len(next)), DataMD5: sum, HasMD5: true,
+		DataSHA1: sha, HasSHA1: true,
+	}}, nil)
+	if err != nil {
+		t.Fatalf("commit delta: %v", err)
+	}
+	nr, err := repo.Resolve(rev2, "/big.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nr.TextRep != TextRepDelta || nr.Base == nil || *nr.Base != n1.Node {
+		t.Fatalf("node rep=%d base=%v, want inline delta on %v", nr.TextRep, nr.Base, n1.Node)
+	}
+	if nr.TotalSize != uint64(len(next)) || nr.TextSHA1 != sha || nr.TextMD5 != sum {
+		t.Fatalf("metadata mismatch: size=%d sha=%x", nr.TotalSize, nr.TextSHA1)
+	}
+	got, err := repo.GetText(nr.Node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, next) {
+		t.Fatal("reconstructed text mismatch")
+	}
+
+	// A delta may also be taken against an older full-text ancestor rather
+	// than the immediate parent (that is how large-text edits keep chains at
+	// depth one); such a change is valid and must reconstruct correctly.
+	third := append([]byte(nil), next...)
+	copy(third[200:], "THIRD!")
+	delta3, err := svndiff.Encode(base, third)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum3 := md5.Sum(third)
+	sha3 := sha1.Sum(third)
+	rev3, err := repo.CommitTxn(rev2, []Change{{
+		Path: "/big.bin", Action: ActionModify, Kind: KindFile,
+		BaseRev: rev2, Delta: delta3, DeltaBase: n1.Node,
+		TextTotal: uint64(len(third)), DataMD5: sum3, HasMD5: true,
+		DataSHA1: sha3, HasSHA1: true,
+	}}, nil)
+	if err != nil {
+		t.Fatalf("commit delta against ancestor: %v", err)
+	}
+	nr3, err := repo.Resolve(rev3, "/big.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nr3.Base == nil || *nr3.Base != n1.Node || nr3.DeltaDepth != 1 {
+		t.Fatalf("ancestor-based delta: base=%v depth=%d", nr3.Base, nr3.DeltaDepth)
+	}
+	if got, _ := repo.GetText(nr3.Node); !bytes.Equal(got, third) {
+		t.Fatal("ancestor-based delta content mismatch")
+	}
+
+	// A delta built against a node that is no longer the parent must be
+	// refused, otherwise the new node would decode to the wrong content.
+	_, err = repo.CommitTxn(rev2, []Change{{
+		Path: "/big.bin", Action: ActionModify, Kind: KindFile,
+		BaseRev: rev1, Delta: delta, DeltaBase: n1.Node,
+		TextTotal: uint64(len(next)),
+	}}, nil)
+	if !errors.Is(err, ErrOutOfDate) {
+		t.Fatalf("stale delta base: err=%v, want out of date", err)
 	}
 }

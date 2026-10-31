@@ -64,6 +64,12 @@ type txnChange struct {
 	// in the node so update reports need not read the text back.
 	dataSHA1 [20]byte
 	hasSHA1  bool
+	// delta holds the client's svndiff stream for a large-text edit kept as a
+	// delta (see fs.Change.Delta); deltaRef is its persisted object name.
+	delta      []byte
+	deltaRef   string
+	deltaBase  fs.NodeID
+	deltaTotal uint64
 	// gen bumps whenever the body reference changes, so a concurrent
 	// persistActivity cannot attach a reference to newer bytes.
 	gen uint64
@@ -424,6 +430,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 	clientRev := clientBaseRevision(r)
 	isNew := true
 	var baseText []byte
+	var baseNode *fs.NodeRev
 	if clientRev > 0 {
 		head, herr := repo.Head()
 		if herr == nil {
@@ -442,6 +449,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 		if clientRev > 0 {
 			if nr, err := repo.Resolve(clientRev, res.path); err == nil && nr.Kind == fs.KindFile {
 				isNew = false
+				baseNode = nr
 				bt, gerr := repo.GetText(nr.Node)
 				if gerr == nil {
 					baseText = bt
@@ -464,6 +472,11 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 	var dataTextRef string
 	var dataTextSize uint64
 	var dataSHA1 [20]byte
+	var dataMD5 [16]byte
+	var hasMD5 bool
+	var deltaBytes []byte
+	var deltaBase fs.NodeID
+	var deltaTotal uint64
 
 	const maxPutBody = 512 << 20
 	storeText := func(path string, sum [16]byte) (string, int64, error) {
@@ -486,7 +499,13 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 	// Small bodies (the common delta case) are kept inline so edits of small
 	// files do not create per-revision objects.
 	if isSvndiff && (r.ContentLength < 0 || r.ContentLength > putStreamThreshold) {
-		outPath, sum, sha, derr := decodeDeltaToFile(baseText, r.Body, maxPutBody)
+		// Keep the raw delta when it is tiny: an edit of a large binary file
+		// often sends a few KiB against a 30 MiB base, and storing that delta
+		// instead of a fresh full copy is the difference between 5 KiB and
+		// 30 MiB on disk (Helix Core's +S binary delta storage).
+		var deltaBuf bytes.Buffer
+		sink := &capWriter{w: &deltaBuf, left: deltaInlineCap}
+		outPath, sum, sha, derr := decodeDeltaToFile(baseText, io.TeeReader(r.Body, sink), maxPutBody)
 		if derr != nil {
 			if errors.Is(derr, errBodyTooLarge) {
 				http.Error(w, derr.Error(), http.StatusRequestEntityTooLarge)
@@ -501,22 +520,60 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 			http.Error(w, serr.Error(), http.StatusInternalServerError)
 			return
 		}
-		if st.Size() > putStreamThreshold {
-			ref, size, xerr := storeText(outPath, sum)
-			if xerr != nil {
-				http.Error(w, xerr.Error(), http.StatusInternalServerError)
-				return
+		// Large text, small delta: store the delta instead of a fresh copy.
+		// The target is always a full-text node, so a read stays one apply
+		// (a chain would make reads and later uploads progressively slower).
+		size := st.Size()
+		useDelta := false
+		if size > putStreamThreshold && !isNew && baseNode != nil {
+			clientOK := deltaBuf.Len() > 0 && sink.ok() &&
+				deltaBuf.Len() <= deltaInlineCap && int64(deltaBuf.Len()) < size/2
+			if clientOK && baseNode.DeltaDepth == 0 {
+				// The client diffed against a full text: reuse its stream.
+				deltaBytes = append([]byte(nil), deltaBuf.Bytes()...)
+				deltaBase = baseNode.Node
+				useDelta = true
+			} else if size <= reencodeCap {
+				// Otherwise re-encode against the last full revision (one
+				// ancestor lookup) so future reads and edits stay at depth 1.
+				if anc, aerr := repo.FullTextBase(baseNode); aerr == nil && anc.Node != baseNode.Node {
+					if newText, rerr := os.ReadFile(outPath); rerr == nil {
+						if ancText, gerr := repo.GetText(anc.Node); gerr == nil {
+							if d, eerr := svndiff.Encode(ancText, newText); eerr == nil &&
+								len(d) <= deltaInlineCap && len(d) < len(newText)/2 {
+								deltaBytes = d
+								deltaBase = anc.Node
+								useDelta = true
+							}
+						}
+					}
+				}
 			}
-			dataTextRef, dataTextSize, dataSize = ref, uint64(size), size
-			dataSHA1 = sha
-		} else {
-			b, rerr := os.ReadFile(outPath)
-			os.Remove(outPath)
-			if rerr != nil {
-				http.Error(w, rerr.Error(), http.StatusInternalServerError)
-				return
+			if useDelta {
+				deltaTotal = uint64(size)
+				dataMD5, hasMD5 = sum, true
+				dataSHA1 = sha
+				os.Remove(outPath)
 			}
-			data, dataSize = b, int64(len(b))
+		}
+		if !useDelta {
+			if size > putStreamThreshold {
+				ref, refSize, xerr := storeText(outPath, sum)
+				if xerr != nil {
+					http.Error(w, xerr.Error(), http.StatusInternalServerError)
+					return
+				}
+				dataTextRef, dataTextSize, dataSize = ref, uint64(refSize), refSize
+				dataSHA1 = sha
+			} else {
+				b, rerr := os.ReadFile(outPath)
+				os.Remove(outPath)
+				if rerr != nil {
+					http.Error(w, rerr.Error(), http.StatusInternalServerError)
+					return
+				}
+				data, dataSize = b, int64(len(b))
+			}
 		}
 	} else if body, bodyFile, bodyMD5, bodySHA1, berr := readBody(r.Body, putStreamThreshold, maxPutBody); berr != nil {
 		http.Error(w, berr.Error(), statusForSpool(berr))
@@ -567,6 +624,12 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 	ch.dataTextSize = dataTextSize
 	ch.dataSHA1 = dataSHA1
 	ch.hasSHA1 = dataSHA1 != ([20]byte{})
+	ch.dataMD5 = dataMD5
+	ch.hasMD5 = hasMD5
+	ch.delta = deltaBytes
+	ch.deltaBase = deltaBase
+	ch.deltaTotal = deltaTotal
+	ch.deltaRef = ""
 	ch.baseRev = clientRev
 	ch.dataRef = ""
 	if ch.props == nil {
@@ -587,6 +650,16 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 // buffered. It matches the external-text threshold so large files go straight
 // from the socket to their content-addressed object.
 const putStreamThreshold = 1 << 20
+
+// deltaInlineCap bounds the client delta kept inline in a node-rev. Larger
+// deltas fall back to a full (external) text object.
+const deltaInlineCap = 256 << 10
+
+// reencodeCap bounds the text size for re-encoding a delta against the last
+// full revision. Larger texts still use the client's delta when its base is a
+// full text, otherwise a full copy; that keeps memory bounded while never
+// growing a chain beyond one link.
+const reencodeCap = 32 << 20
 
 var errBodyTooLarge = errors.New("file too large")
 
@@ -653,7 +726,7 @@ func decodeDeltaToFile(base []byte, delta io.Reader, limit int64) (string, [16]b
 	outPath := out.Name()
 	h := md5.New()
 	hs := sha1.New()
-	if err := svndiff.ApplyTo(base, delta, &capWriter{w: io.MultiWriter(out, h, hs), left: limit}); err != nil {
+	if err := svndiff.ApplyTo(base, delta, &strictCapWriter{w: io.MultiWriter(out, h, hs), left: limit}); err != nil {
 		out.Close()
 		os.Remove(outPath)
 		return "", sum, sha, err
@@ -667,13 +740,33 @@ func decodeDeltaToFile(base []byte, delta io.Reader, limit int64) (string, [16]b
 	return outPath, sum, sha, nil
 }
 
-// capWriter forwards writes until the byte budget is exhausted.
+// capWriter forwards writes until the byte budget is exhausted. In strict
+// mode (used for decoded text) the overflow is an error; in tee mode it just
+// marks the stream as too large and swallows the rest.
 type capWriter struct {
+	w        io.Writer
+	left     int64
+	overflow bool
+}
+
+func (c *capWriter) Write(p []byte) (int, error) {
+	if int64(len(p)) > c.left {
+		c.overflow = true
+		return len(p), nil // tee mode: stop capturing, keep the stream flowing
+	}
+	c.left -= int64(len(p))
+	return c.w.Write(p)
+}
+
+func (c *capWriter) ok() bool { return !c.overflow }
+
+// strictCapWriter fails the write once the budget is exhausted.
+type strictCapWriter struct {
 	w    io.Writer
 	left int64
 }
 
-func (c *capWriter) Write(p []byte) (int, error) {
+func (c *strictCapWriter) Write(p []byte) (int, error) {
 	if int64(len(p)) > c.left {
 		return 0, errBodyTooLarge
 	}
@@ -787,7 +880,12 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 		return
 	}
 	tx := a.txn
-	changes := collectChanges(repo, tx)
+	changes, cerr := collectChanges(repo, tx)
+	if cerr != nil {
+		s.mu.Unlock()
+		http.Error(w, "commit data unavailable: "+cerr.Error(), http.StatusInternalServerError)
+		return
+	}
 	// Streamed bodies live in temp files; they are consumed by the commit (or
 	// dropped on any early exit), so clean them up when the request ends.
 	defer func() {
@@ -904,7 +1002,7 @@ func (s *Server) baseOf(r *http.Request, repo string) string {
 }
 
 // collectChanges converts a txn's pending changes into fs.Change list.
-func collectChanges(repo *fs.Repo, tx *txn) []fs.Change {
+func collectChanges(repo *fs.Repo, tx *txn) ([]fs.Change, error) {
 	paths := make([]string, 0, len(tx.changes))
 	for p := range tx.changes {
 		paths = append(paths, p)
@@ -913,6 +1011,15 @@ func collectChanges(repo *fs.Repo, tx *txn) []fs.Change {
 	out := make([]fs.Change, 0, len(paths))
 	for _, p := range paths {
 		ch := tx.changes[p]
+		if len(ch.delta) == 0 && ch.deltaRef != "" {
+			b, err := repo.Store().Get(context.Background(), activityDataKey(repo, ch.deltaRef), nil)
+			if err != nil {
+				// Committing without the delta would silently write an empty
+				// file, so refuse instead.
+				return nil, fmt.Errorf("load delta %s: %w", ch.deltaRef, err)
+			}
+			ch.delta = b
+		}
 		if ch.dataTextRef == "" && ch.dataRef != "" && len(ch.data) == 0 && ch.dataFile == "" {
 			if ch.streamed {
 				if tmp, terr := createTemp("txn"); terr == nil {
@@ -953,9 +1060,12 @@ func collectChanges(repo *fs.Repo, tx *txn) []fs.Change {
 			TextSize:     ch.dataTextSize,
 			DataSHA1:     ch.dataSHA1,
 			HasSHA1:      ch.hasSHA1,
+			Delta:        ch.delta,
+			DeltaBase:    ch.deltaBase,
+			TextTotal:    ch.deltaTotal,
 		})
 	}
-	return out
+	return out, nil
 }
 
 // mergeResponse writes the <D:merge-response> containing the new revision.

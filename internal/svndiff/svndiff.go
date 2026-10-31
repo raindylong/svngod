@@ -210,27 +210,40 @@ func encodeInstruction(buf *bytes.Buffer, it instr) {
 // (O(src_len * windows) map inserts). Two slots per hash give a little
 // slack against collisions while keeping memory at 8 MiB.
 type srcIndex struct {
-	src []byte
-	tab []int32 // two slots per bucket, storing position+1 (0 = empty)
+	src   []byte
+	tab   []int32 // two slots per bucket, storing position+1 (0 = empty)
+	built bool
 }
 
 const srcIndexBits = 20 // 1<<20 buckets -> 2M int32 = 8 MiB
 
-func newSrcIndex(src []byte) *srcIndex {
-	ix := &srcIndex{src: src, tab: make([]int32, 2<<srcIndexBits)}
-	if len(src) < 4 {
-		return ix
+// srcIndexLazy is how many literal bytes are emitted before the index is
+// built. Small in-place edits stay aligned with the predicted source offset,
+// so they never pay for indexing a large source (a 30 MiB file costs ~190 ms
+// to index); resynchronising after a real move or bulk change still does.
+const srcIndexLazy = 4096
+
+func newSrcIndex(src []byte) *srcIndex { return &srcIndex{src: src} }
+
+// build fills the hash table once. Callers trigger it lazily.
+func (ix *srcIndex) build() {
+	if ix.built {
+		return
 	}
+	ix.built = true
+	if len(ix.src) < 4 {
+		return
+	}
+	ix.tab = make([]int32, 2<<srcIndexBits)
 	mask := uint32(1<<srcIndexBits - 1)
-	for i := 0; i+4 <= len(src); i++ {
-		h := hash4(src[i:])
+	for i := 0; i+4 <= len(ix.src); i++ {
+		h := hash4(ix.src[i:])
 		h ^= h >> 13
 		b := (h & mask) * 2
 		// Keep the two most recent positions for this hash.
 		ix.tab[b+1] = ix.tab[b]
 		ix.tab[b] = int32(i + 1)
 	}
-	return ix
 }
 
 // findMatch returns (length, offset) of the longest source match for t.
@@ -290,6 +303,7 @@ func matchWindow(ix *srcIndex, tview []byte, expected int) ([]instr, []byte, int
 		}
 		return l
 	}
+	litRun := 0
 	for i := 0; i < len(tview); {
 		// Prefer the position predicted from the previous copy/literal run.
 		if expected >= 0 && expected < len(ix.src) && i+minMatch <= len(tview) {
@@ -298,8 +312,27 @@ func matchWindow(ix *srcIndex, tview []byte, expected int) ([]instr, []byte, int
 				ops = append(ops, instr{action: actionSource, offset: uint64(expected), length: uint64(l)})
 				i += l
 				expected += l
+				litRun = 0
 				continue
 			}
+		}
+		// Only pay for the source index once enough literal bytes have gone
+		// by that realignment is likely (a moved block), not for a small edit
+		// that resumes at the predicted offset a few bytes later.
+		if !ix.built && litRun >= srcIndexLazy {
+			ix.build()
+		}
+		if !ix.built {
+			if newStart < 0 {
+				newStart = len(newData)
+			}
+			newData = append(newData, tview[i])
+			i++
+			if expected >= 0 {
+				expected++
+			}
+			litRun++
+			continue
 		}
 		bestLen, bestOff := ix.findMatch(tview[i:])
 		if bestLen >= minMatch {
@@ -316,6 +349,7 @@ func matchWindow(ix *srcIndex, tview []byte, expected int) ([]instr, []byte, int
 			if expected >= 0 {
 				expected++
 			}
+			litRun++
 		}
 	}
 	flushNew()

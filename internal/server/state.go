@@ -39,6 +39,11 @@ type persistedChange struct {
 	DataTextRef  string            `json:"dataTextRef,omitempty"`
 	DataTextSize uint64            `json:"dataTextSize,omitempty"`
 	DataSHA1     string            `json:"dataSha1,omitempty"`
+	DataMD5      string            `json:"dataMd5,omitempty"`
+	DeltaRef     string            `json:"deltaRef,omitempty"`
+	DeltaBaseRev uint64            `json:"deltaBaseRev,omitempty"`
+	DeltaBaseID  uint64            `json:"deltaBaseId,omitempty"`
+	DeltaTotal   uint64            `json:"deltaTotal,omitempty"`
 }
 
 type persistedTxn struct {
@@ -137,6 +142,25 @@ func (s *Server) persistActivity(repo *fs.Repo, actID string) {
 				CopyFromRev: ch.copyFromRev, BaseRev: ch.baseRev,
 			}
 			switch {
+			case len(ch.delta) > 0:
+				// A large-text edit kept as a delta: persist the delta stream
+				// (content addressed) plus the exact base node and full-text
+				// hashes, so a restart can commit without the text itself.
+				ref := ch.deltaRef
+				if ref == "" {
+					sum := sha1.Sum(ch.delta)
+					ref = hex.EncodeToString(sum[:])
+				}
+				pc.DeltaRef = ref
+				pc.DeltaBaseRev = ch.deltaBase.Rev
+				pc.DeltaBaseID = ch.deltaBase.ID
+				pc.DeltaTotal = ch.deltaTotal
+				if ch.hasMD5 {
+					pc.DataMD5 = hex.EncodeToString(ch.dataMD5[:])
+				}
+				if ch.hasSHA1 {
+					pc.DataSHA1 = hex.EncodeToString(ch.dataSHA1[:])
+				}
 			case ch.dataTextRef != "":
 				// The body is already a durable text object; only the reference
 				// needs to be persisted.
@@ -165,10 +189,11 @@ func (s *Server) persistActivity(repo *fs.Repo, actID string) {
 	// does not get a stale reference. Without this every PUT re-hashed and
 	// re-uploaded every pending body (O(n^2) for a many-file commit).
 	type pendingBody struct {
-		ch   *txnChange
-		gen  uint64
-		ref  string
-		data []byte
+		ch    *txnChange
+		gen   uint64
+		ref   string
+		data  []byte
+		delta bool
 	}
 	var pending []pendingBody
 	if a.txn != nil {
@@ -178,6 +203,13 @@ func (s *Server) persistActivity(repo *fs.Repo, actID string) {
 				pending = append(pending, pendingBody{
 					ch: ch, gen: ch.gen, ref: hex.EncodeToString(sum[:]),
 					data: append([]byte(nil), ch.data...),
+				})
+			}
+			if len(ch.delta) > 0 && ch.deltaRef == "" {
+				sum := sha1.Sum(ch.delta)
+				pending = append(pending, pendingBody{
+					ch: ch, gen: ch.gen, ref: hex.EncodeToString(sum[:]),
+					data: append([]byte(nil), ch.delta...), delta: true,
 				})
 			}
 		}
@@ -204,7 +236,11 @@ func (s *Server) persistActivity(repo *fs.Repo, actID string) {
 		}
 		s.mu.Lock()
 		if pb.ch.gen == pb.gen {
-			pb.ch.dataRef = pb.ref
+			if pb.delta {
+				pb.ch.deltaRef = pb.ref
+			} else {
+				pb.ch.dataRef = pb.ref
+			}
 		}
 		s.mu.Unlock()
 	}
@@ -240,6 +276,17 @@ func putTxnFile(ctx context.Context, repo *fs.Repo, path string) (string, error)
 		return "", err
 	}
 	return ref, nil
+}
+
+// decodeMD5 parses a persisted hex MD5; a bad value is treated as unknown.
+func decodeMD5(s string) [16]byte {
+	var out [16]byte
+	b, err := hex.DecodeString(s)
+	if err != nil || len(b) != 16 {
+		return out
+	}
+	copy(out[:], b)
+	return out
 }
 
 // decodeSHA1 parses a persisted hex SHA-1; a bad value is treated as unknown.
@@ -331,6 +378,9 @@ func (s *Server) ensureActivitiesLoaded(repoName string, repo *fs.Repo) {
 					copyFromRev: pc.CopyFromRev, baseRev: pc.BaseRev, dataRef: pc.DataRef,
 					streamed: pc.Streamed, dataTextRef: pc.DataTextRef, dataTextSize: pc.DataTextSize,
 					dataSHA1: decodeSHA1(pc.DataSHA1), hasSHA1: pc.DataSHA1 != "",
+					dataMD5: decodeMD5(pc.DataMD5), hasMD5: pc.DataMD5 != "",
+					deltaRef: pc.DeltaRef, deltaTotal: pc.DeltaTotal,
+					deltaBase: fs.NodeID{Rev: pc.DeltaBaseRev, ID: pc.DeltaBaseID},
 				}
 			}
 			a.txn = tx

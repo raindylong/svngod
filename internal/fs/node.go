@@ -41,6 +41,14 @@ type Change struct {
 	// upload path stores it before commit so the commit only records it).
 	TextRef  string
 	TextSize uint64
+	// Delta carries the client's svndiff stream against DeltaBase. The upload
+	// path keeps it when it is far smaller than the decoded text, so an edit
+	// of a large binary file costs a few KiB instead of a full copy (Helix
+	// Core's +S delta storage for binary). DataMD5/DataSHA1 then describe the
+	// full text, and TextTotal is its length.
+	Delta     []byte
+	DeltaBase NodeID
+	TextTotal uint64
 }
 
 // tnode is an in-memory working-copy node during a commit.
@@ -55,6 +63,10 @@ type tnode struct {
 	hasSHA1      bool
 	textRef      string
 	textSize     uint64
+	deltaRep     bool
+	delta        []byte
+	deltaBase    NodeID
+	deltaTotal   uint64
 	baseText     []byte // previous file text captured during this commit (delta base)
 	children     map[string]*tnode
 	copyFrom     *NodeID

@@ -368,6 +368,49 @@ func (r *Repo) PutTextFile(ctx context.Context, path, ref string) error {
 	return r.store.PutFrom(ctx, key, f, st.Size())
 }
 
+// FullTextBase returns the nearest node in nr's delta chain that stores its
+// text in full (DeltaDepth 0). A delta is always taken against such a node so
+// reading it costs a single apply, no matter how many edits came before.
+func (r *Repo) FullTextBase(nr *NodeRev) (*NodeRev, error) {
+	for i := 0; i < 256; i++ {
+		if nr.DeltaDepth == 0 {
+			return nr, nil
+		}
+		if nr.Base == nil {
+			return nil, errors.New("fs: delta node without base")
+		}
+		next, err := r.GetNodeRev(*nr.Base)
+		if err != nil {
+			return nil, err
+		}
+		nr = next
+	}
+	return nil, errors.New("fs: delta chain too deep")
+}
+
+// deltaBaseOf reports the node with the given id if it is target itself or
+// reachable through the node's Delta Base links, i.e. the delta applies to it.
+func (r *Repo) deltaBaseOf(target *NodeRev, want NodeID) (*NodeRev, error) {
+	for i := 0; i < 256; i++ {
+		if target.Node == want {
+			return target, nil
+		}
+		if target.DeltaDepth == 0 || target.Base == nil {
+			break
+		}
+		nr, err := r.GetNodeRev(*target.Base)
+		if err != nil {
+			return nil, err
+		}
+		target = nr
+	}
+	return nil, errors.New("fs: delta base is not in the node's history")
+}
+
+// MaxDeltaDepth is the longest delta chain the repository stores before it
+// writes a full text instead.
+func (r *Repo) MaxDeltaDepth() uint64 { return r.maxDelta }
+
 // externalizeFile streams a file body into a content-addressed text object and
 // returns its md5, sha1, size and reference. The body is hashed and uploaded
 // in two passes, so memory use stays constant for arbitrarily large uploads.
@@ -666,6 +709,10 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 		if base == 0 {
 			base = baseRev
 		}
+		if len(ch.Delta) > 0 && base == 0 {
+			log.Printf("fs: commit OOD delta without a base path=%s", ch.Path)
+			return 0, &OutOfDateError{Path: ch.Path}
+		}
 		hnr, err := r.Resolve(cur.Head, ch.Path)
 		if err == nil {
 			if base == 0 {
@@ -679,6 +726,22 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 			if hnr.Node.Rev > base {
 				log.Printf("fs: commit OOD path=%s headRev=%d baseRev=%d -> reject", ch.Path, hnr.Node.Rev, base)
 				return 0, &OutOfDateError{Path: ch.Path}
+			}
+			if len(ch.Delta) > 0 {
+				// The delta was built against a node in this path's history.
+				// HEAD must still be exactly the node the client diffed from
+				// (a delete/re-add can leave a different node with an older
+				// revision in place), and the recorded base must be reachable
+				// from it.
+				bnr, berr := r.Resolve(base, ch.Path)
+				if berr != nil || hnr.Node != bnr.Node {
+					log.Printf("fs: commit OOD delta path=%s base=%d (node changed)", ch.Path, base)
+					return 0, &OutOfDateError{Path: ch.Path}
+				}
+				if _, berr := r.deltaBaseOf(bnr, ch.DeltaBase); berr != nil {
+					log.Printf("fs: commit OOD delta base path=%s base=%d: %v", ch.Path, base, berr)
+					return 0, &OutOfDateError{Path: ch.Path}
+				}
 			}
 			continue
 		}
@@ -736,6 +799,29 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 			nr.CopyFromPath = t.copyFromPath
 		}
 		if t.kind == KindFile {
+			if t.deltaRep {
+				if t.deltaBase.IsZero() {
+					return 0, errors.New("fs: delta change without a base")
+				}
+				bn, berr := r.GetNodeRev(t.deltaBase)
+				if berr != nil {
+					return 0, berr
+				}
+				nr.TextRep = TextRepDelta
+				nr.Text = append([]byte(nil), t.delta...)
+				base := t.deltaBase
+				nr.Base = &base
+				nr.DeltaDepth = bn.DeltaDepth + 1
+				nr.TotalSize = t.deltaTotal
+				if t.hasMD5 {
+					copy(nr.TextMD5[:], t.dataMD5[:])
+				}
+				if t.hasSHA1 {
+					nr.TextSHA1 = t.dataSHA1
+				}
+				nodes = append(nodes, nr)
+				continue
+			}
 			if t.textRef != "" {
 				sum, herr := hex.DecodeString(t.textRef)
 				if herr != nil || len(sum) != 16 {
@@ -955,10 +1041,17 @@ func (r *Repo) applyChange(root *tnode, ch *Change) error {
 				dataFile: ch.DataFile, dataMD5: ch.DataMD5, hasMD5: ch.HasMD5,
 				dataSHA1: ch.DataSHA1, hasSHA1: ch.HasSHA1,
 				textRef: ch.TextRef, textSize: ch.TextSize, dirty: true}
+			if len(ch.Delta) > 0 {
+				t.deltaRep = true
+				t.delta = append([]byte(nil), ch.Delta...)
+				t.deltaBase = ch.DeltaBase
+				t.deltaTotal = ch.TextTotal
+			}
 			if old, ok := parent.children[name]; ok && old.kind == KindFile {
-				// A streamed body becomes an external full text; no base text
-				// is needed, so do not load the old file into memory.
-				if ch.DataFile == "" {
+				// A streamed body becomes an external full text and a delta
+				// change keeps only its delta, so neither needs the old text
+				// loaded into memory.
+				if ch.DataFile == "" && len(ch.Delta) == 0 {
 					if err := r.ensureData(old); err != nil {
 						return err
 					}
@@ -973,7 +1066,7 @@ func (r *Repo) applyChange(root *tnode, ch *Change) error {
 				t.copyFromPath = old.copyFromPath
 				// A props-only change (PROPPATCH) carries no new text; keep the
 				// base revision's content so the commit does not empty the file.
-				if len(t.data) == 0 && t.dataFile == "" {
+				if len(t.data) == 0 && t.dataFile == "" && !t.deltaRep {
 					t.data = append([]byte(nil), old.data...)
 				}
 				// A content-only change (PUT with no PROPPATCH) carries no
