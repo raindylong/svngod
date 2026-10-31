@@ -478,61 +478,54 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 		return ref, st.Size(), nil
 	}
 
-	body, bodyFile, bodyMD5, bodySHA1, berr := readBody(r.Body, putStreamThreshold, maxPutBody)
-	if berr != nil {
-		http.Error(w, berr.Error(), statusForSpool(berr))
-		return
-	}
-	if bodyFile != "" {
-		// Large body: decode (svndiff) straight into a text temp, then keep it
-		// as an external text object. Small bodies (the common delta case) stay
-		// inline so edits of small files do not create per-revision objects.
-		if isSvndiff {
-			in, oerr := os.Open(bodyFile)
-			if oerr != nil {
-				os.Remove(bodyFile)
-				http.Error(w, oerr.Error(), http.StatusInternalServerError)
-				return
-			}
-			outPath, sum, sha, derr := decodeDeltaToFile(baseText, in)
-			in.Close()
-			os.Remove(bodyFile)
-			if derr != nil {
-				http.Error(w, "svndiff decode: "+derr.Error(), http.StatusBadRequest)
-				return
-			}
-			st, serr := os.Stat(outPath)
-			if serr != nil || st.Size() > maxPutBody {
-				os.Remove(outPath)
-				http.Error(w, "file too large", http.StatusRequestEntityTooLarge)
-				return
-			}
-			if st.Size() > putStreamThreshold {
-				ref, size, xerr := storeText(outPath, sum)
-				if xerr != nil {
-					http.Error(w, xerr.Error(), http.StatusInternalServerError)
-					return
-				}
-				dataTextRef, dataTextSize, dataSize = ref, uint64(size), size
-				dataSHA1 = sha
+	// A large svndiff body is decoded straight from the socket into its text
+	// object: spooling it first would write and re-read the whole payload.
+	// Small bodies (the common delta case) are kept inline so edits of small
+	// files do not create per-revision objects.
+	if isSvndiff && (r.ContentLength < 0 || r.ContentLength > putStreamThreshold) {
+		outPath, sum, sha, derr := decodeDeltaToFile(baseText, r.Body, maxPutBody)
+		if derr != nil {
+			if errors.Is(derr, errBodyTooLarge) {
+				http.Error(w, derr.Error(), http.StatusRequestEntityTooLarge)
 			} else {
-				b, rerr := os.ReadFile(outPath)
-				os.Remove(outPath)
-				if rerr != nil {
-					http.Error(w, rerr.Error(), http.StatusInternalServerError)
-					return
-				}
-				data, dataSize = b, int64(len(b))
+				http.Error(w, "svndiff decode: "+derr.Error(), http.StatusBadRequest)
 			}
-		} else {
-			ref, size, xerr := storeText(bodyFile, bodyMD5)
+			return
+		}
+		st, serr := os.Stat(outPath)
+		if serr != nil {
+			os.Remove(outPath)
+			http.Error(w, serr.Error(), http.StatusInternalServerError)
+			return
+		}
+		if st.Size() > putStreamThreshold {
+			ref, size, xerr := storeText(outPath, sum)
 			if xerr != nil {
 				http.Error(w, xerr.Error(), http.StatusInternalServerError)
 				return
 			}
 			dataTextRef, dataTextSize, dataSize = ref, uint64(size), size
-			dataSHA1 = bodySHA1
+			dataSHA1 = sha
+		} else {
+			b, rerr := os.ReadFile(outPath)
+			os.Remove(outPath)
+			if rerr != nil {
+				http.Error(w, rerr.Error(), http.StatusInternalServerError)
+				return
+			}
+			data, dataSize = b, int64(len(b))
 		}
+	} else if body, bodyFile, bodyMD5, bodySHA1, berr := readBody(r.Body, putStreamThreshold, maxPutBody); berr != nil {
+		http.Error(w, berr.Error(), statusForSpool(berr))
+		return
+	} else if bodyFile != "" {
+		ref, size, xerr := storeText(bodyFile, bodyMD5)
+		if xerr != nil {
+			http.Error(w, xerr.Error(), http.StatusInternalServerError)
+			return
+		}
+		dataTextRef, dataTextSize, dataSize = ref, uint64(size), size
+		dataSHA1 = bodySHA1
 	} else {
 		if isSvndiff {
 			var derr error
@@ -644,8 +637,9 @@ func statusForSpool(err error) int {
 	return http.StatusBadRequest
 }
 
-// decodeDeltaToFile streams a spooled svndiff delta into a text temp file.
-func decodeDeltaToFile(base []byte, delta io.Reader) (string, [16]byte, [20]byte, error) {
+// decodeDeltaToFile streams a svndiff delta into a text temp file, failing
+// once the decoded text exceeds limit (a small delta can expand arbitrarily).
+func decodeDeltaToFile(base []byte, delta io.Reader, limit int64) (string, [16]byte, [20]byte, error) {
 	var sum [16]byte
 	var sha [20]byte
 	out, err := createTemp("text")
@@ -655,7 +649,7 @@ func decodeDeltaToFile(base []byte, delta io.Reader) (string, [16]byte, [20]byte
 	outPath := out.Name()
 	h := md5.New()
 	hs := sha1.New()
-	if err := svndiff.ApplyTo(base, delta, io.MultiWriter(out, h, hs)); err != nil {
+	if err := svndiff.ApplyTo(base, delta, &capWriter{w: io.MultiWriter(out, h, hs), left: limit}); err != nil {
 		out.Close()
 		os.Remove(outPath)
 		return "", sum, sha, err
@@ -667,6 +661,20 @@ func decodeDeltaToFile(base []byte, delta io.Reader) (string, [16]byte, [20]byte
 	copy(sum[:], h.Sum(nil))
 	copy(sha[:], hs.Sum(nil))
 	return outPath, sum, sha, nil
+}
+
+// capWriter forwards writes until the byte budget is exhausted.
+type capWriter struct {
+	w    io.Writer
+	left int64
+}
+
+func (c *capWriter) Write(p []byte) (int, error) {
+	if int64(len(p)) > c.left {
+		return 0, errBodyTooLarge
+	}
+	c.left -= int64(len(p))
+	return c.w.Write(p)
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, res resource) {
