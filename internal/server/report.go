@@ -116,6 +116,14 @@ func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name s
 		return
 	}
 	rev := head
+	// <S:text-deltas>yes</S:text-deltas> asks for file texts inline
+	// (<S:txdelta>) instead of letting the client fetch them with GET. Clients
+	// omit it for checkouts; embedding the text made a checkout REPORT carry
+	// the whole tree as base64.
+	sendAll := false
+	if td, ok := root.child("text-deltas"); ok {
+		sendAll = strings.EqualFold(strings.TrimSpace(td.Content), "yes")
+	}
 	if tr, ok := root.child("target-revision"); ok {
 		if n, err := strconv.ParseUint(strings.TrimSpace(tr.Content), 10, 64); err == nil {
 			rev = n
@@ -185,7 +193,7 @@ func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name s
 		rp, _ := repo.GetRevProps(rev)
 		uuid, _ := repo.UUID()
 		b.WriteString("  <S:open-directory rev=\"" + strconv.FormatUint(anchorRev, 10) + "\">\n")
-		if err := s.updateWalkDir(&b, repo, base, rev, newPath, "open-directory", true, rp, uuid, wb, 0, limit, filesOnly, explicitDepth, 0, updateTarget, oldPath); err != nil {
+		if err := s.updateWalkDir(&b, repo, base, rev, newPath, "open-directory", true, rp, uuid, wb, 0, limit, filesOnly, explicitDepth, 0, updateTarget, oldPath, sendAll); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -207,7 +215,7 @@ func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name s
 	b.WriteString("  <S:target-revision rev=\"" + strconv.FormatUint(rev, 10) + "\"/>\n")
 	rp, _ := repo.GetRevProps(rev)
 	uuid, _ := repo.UUID()
-	if err := s.updateWalkDir(&b, repo, base, rev, rootPath, "open-directory", true, rp, uuid, wb, 0, limit, filesOnly, explicitDepth, 0, "", rootPath); err != nil {
+	if err := s.updateWalkDir(&b, repo, base, rev, rootPath, "open-directory", true, rp, uuid, wb, 0, limit, filesOnly, explicitDepth, 0, "", rootPath, sendAll); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -413,7 +421,7 @@ func (w *wcBaseline) entryDepthLevel(path string) (int, bool) {
 // baseline decision comes from the client's per-path <S:entry> revisions
 // (wcBaseline), so mixed-revision WCs update correctly. Paths present in the
 // client's baseline but absent from the target are reported as delete-entry.
-func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, rev uint64, path, openEl string, wrap bool, rp *fs.RevProps, uuid string, wb *wcBaseline, level, limit int, filesOnly, explicitDepth bool, copyFloor uint64, wrapName, wcPath string) error {
+func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, rev uint64, path, openEl string, wrap bool, rp *fs.RevProps, uuid string, wb *wcBaseline, level, limit int, filesOnly, explicitDepth bool, copyFloor uint64, wrapName, wcPath string, sendAll bool) error {
 	outRev := rev
 	if br, ok := wb.revFor(wcPath); ok {
 		outRev = br
@@ -497,7 +505,7 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 					b.WriteString("    </S:open-directory>\n")
 					continue
 				}
-				if err := s.updateWalkDir(b, repo, base, rev, cpath, "open-directory", false, rp, uuid, wb, childLevel, cl, false, explicitDepth, copyFloor, "", cwcPath); err != nil {
+				if err := s.updateWalkDir(b, repo, base, rev, cpath, "open-directory", false, rp, uuid, wb, childLevel, cl, false, explicitDepth, copyFloor, "", cwcPath, sendAll); err != nil {
 					return err
 				}
 				b.WriteString("    </S:open-directory>\n")
@@ -527,7 +535,7 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 					b.WriteString("    </S:add-directory>\n")
 					continue
 				}
-				if err := s.updateWalkDir(b, repo, base, rev, cpath, "add-directory", false, rp, uuid, wb, childLevel, cl, false, explicitDepth, copyFloor, "", cwcPath); err != nil {
+				if err := s.updateWalkDir(b, repo, base, rev, cpath, "add-directory", false, rp, uuid, wb, childLevel, cl, false, explicitDepth, copyFloor, "", cwcPath, sendAll); err != nil {
 					return err
 				}
 				b.WriteString("    </S:add-directory>\n")
@@ -617,17 +625,19 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 			fileRev = rev
 		}
 		ver := rvrHref(base, cpath, fileRev)
-		delta, derr := svndiff.Encode(nil, text)
-		if derr != nil {
-			return derr
-		}
-		sum := md5.Sum(text)
 		b.WriteString("    <S:add-file name=\"" + xmlEscape(c.Name) + "\" sha1-checksum=\"" + sha1Hex(text) + "\">\n")
 		b.WriteString("      <D:checked-in><D:href>" + xmlEscape(ver) + "</D:href></D:checked-in>\n")
 		writeEntryProps(b, rp, uuid, rev)
 		writeNodeProps(b, nr.Props)
-		b.WriteString("      <S:txdelta>" + base64.StdEncoding.EncodeToString(delta) + "</S:txdelta>\n")
-		b.WriteString("      <S:prop><V:md5-checksum>" + hex.EncodeToString(sum[:]) + "</V:md5-checksum></S:prop>\n")
+		if sendAll {
+			delta, derr := svndiff.Encode(nil, text)
+			if derr != nil {
+				return derr
+			}
+			sum := md5.Sum(text)
+			b.WriteString("      <S:txdelta>" + base64.StdEncoding.EncodeToString(delta) + "</S:txdelta>\n")
+			b.WriteString("      <S:prop><V:md5-checksum>" + hex.EncodeToString(sum[:]) + "</V:md5-checksum></S:prop>\n")
+		}
 		b.WriteString("    </S:add-file>\n")
 	}
 	// Deletions: anything the client has at its baseline but the target lacks.
