@@ -282,7 +282,7 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request, res reso
 			children := depth == "1" || depth == "infinity"
 			// When listing, parent href must use the same !svn/bln prefix as its
 			// children, else the client's svn_fspath__skip_ancestor assertion fails.
-			if err := s.propNode(&b, repo, base, res.repo, rev, path, nil, props, propnames, children); err != nil {
+			if err := s.propNode(&b, repo, base, res.repo, rev, path, nil, props, propnames, children, false); err != nil {
 				if errors.Is(err, fs.ErrPathNotFound) {
 					http.Error(w, "Not Found", http.StatusNotFound)
 					return
@@ -307,7 +307,8 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request, res reso
 			}
 		}
 	default:
-		if err := s.propNode(&b, repo, base, res.repo, rev, path, nil, props, propnames, depth == "1" || depth == "infinity"); err != nil {
+		if err := s.propNode(&b, repo, base, res.repo, rev, path, nil, props, propnames, depth == "1" || depth == "infinity",
+			res.typ == resRev && (res.path == "" || res.path == "/") && len(dprops) == 0 && !propnames); err != nil {
 			if errors.Is(err, fs.ErrPathNotFound) {
 				http.Error(w, "Not Found", http.StatusNotFound)
 				return
@@ -415,7 +416,7 @@ func (s *Server) propBaselineColl(b *strings.Builder, repo *fs.Repo, base, name 
 }
 
 // propNode writes props for a concrete node (file or dir) at (rev,path).
-func (s *Server) propNode(b *strings.Builder, repo *fs.Repo, base, name string, rev uint64, path string, nr *fs.NodeRev, props []Name, propnames, publicHref bool) error {
+func (s *Server) propNode(b *strings.Builder, repo *fs.Repo, base, name string, rev uint64, path string, nr *fs.NodeRev, props []Name, propnames, publicHref, allRevProps bool) error {
 	if nr == nil {
 		rn, err := repo.Resolve(rev, path)
 		if err != nil {
@@ -531,6 +532,48 @@ func (s *Server) propNode(b *strings.Builder, repo *fs.Repo, base, name string, 
 			b.WriteString("      <D:getcontentlength>" + strconv.Itoa(len(children)) + "</D:getcontentlength>\n")
 		}
 	}
+	// Requested SVN-namespace properties that are not node properties are
+	// revision properties: `svn propget --revprop` PROPFINDs !svn/rev/<N>
+	// asking for <S:log/> (and friends). mod_dav_svn serves them from the
+	// revision's revprops; omitting them makes the client report E200017.
+	if len(props) > 0 {
+		var rp *fs.RevProps
+		for _, p := range props {
+			if p.NS != NS_SVN || p.Local == "" {
+				continue
+			}
+			key := "svn:" + p.Local
+			if _, isNodeProp := nr.Props[key]; isNodeProp {
+				continue
+			}
+			if rp == nil {
+				rp, _ = repo.GetRevProps(rev)
+			}
+			if rp == nil {
+				continue
+			}
+			if v, ok := rp.Props[key]; ok {
+				b.WriteString("      " + davPropElement(key, v) + "\n")
+			}
+		}
+	}
+	// allprop on a revision resource means "list the revision properties"
+	// (svn proplist --revprop). Node property listings never take this path:
+	// allRevProps is only set for !svn/rev/<N> with no explicit prop list.
+	if allRevProps {
+		if rp, _ := repo.GetRevProps(rev); rp != nil {
+			keys := make([]string, 0, len(rp.Props))
+			for k := range rp.Props {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				if strings.HasPrefix(k, "svn:") {
+					b.WriteString("      " + davPropElement(k, rp.Props[k]) + "\n")
+				}
+			}
+		}
+	}
 	b.WriteString("      </D:prop>\n      <D:status>HTTP/1.1 200 OK</D:status>\n    </D:propstat>\n")
 	b.WriteString("  </D:response>\n")
 	return nil
@@ -568,7 +611,7 @@ func (s *Server) propChildren(b *strings.Builder, repo *fs.Repo, base, name stri
 		// pre-parsed rev so propNode does not re-Resolve (which would expand the
 		// whole parent dir per child => O(n^2) on a big directory).
 		cnr := &fs.NodeRev{Node: c.ID, Kind: c.Kind, Props: c.Props}
-		if err := s.propNode(b, repo, base, name, rev, cpath, cnr, props, false, true); err != nil {
+		if err := s.propNode(b, repo, base, name, rev, cpath, cnr, props, false, true, false); err != nil {
 			return err
 		}
 		if depth == "infinity" {

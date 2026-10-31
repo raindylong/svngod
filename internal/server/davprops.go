@@ -268,7 +268,7 @@ func parsePropfindRequest(body []byte) ([]davProp, bool) {
 		if selfClose {
 			tag = strings.TrimSuffix(tag, "/")
 		}
-		prefix, local := splitQName(strings.TrimSpace(tag))
+		_, local := splitQName(strings.TrimSpace(tag))
 		switch local {
 		case "propfind":
 			continue
@@ -278,8 +278,28 @@ func parsePropfindRequest(body []byte) ([]davProp, bool) {
 			inProp = true
 		default:
 			if inProp {
+				// The tag body still carries its attributes; the element name
+				// ends at the first whitespace. (An unprefixed property such as
+				// <log xmlns="...svn/"/> otherwise parses as local name
+				// `log xmlns=...`, so revprop reads silently miss.)
+				name := tag
+				if i := strings.IndexAny(name, " \t\r\n"); i >= 0 {
+					name = name[:i]
+				}
+				prefix, local := splitQName(name)
 				nsURI := nsmap[prefix]
-				if prefix == "" {
+				if prefix == "" && nsURI == "" {
+					nsURI = nsmap[""]
+				}
+				// A default xmlns on the element itself overrides the document
+				// default for that element.
+				for _, a := range splitAttrs(tag) {
+					if a.name == "xmlns" {
+						nsURI = a.val
+						break
+					}
+				}
+				if prefix == "" && nsURI == "" {
 					nsURI = nsmap[""]
 				}
 				out = append(out, davProp{ns: nsURI, local: local})
