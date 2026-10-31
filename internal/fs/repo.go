@@ -732,6 +732,16 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// Serialise finalize across processes sharing the store: writing the
+	// revision block before the `current` CAS is only safe if no second
+	// replica is doing the same for the same revision number.
+	ctxLease := context.Background()
+	releaseLease, lerr := r.acquireCommitLease(ctxLease)
+	if lerr != nil {
+		return 0, lerr
+	}
+	defer releaseLease()
+
 	if len(changes) == 0 {
 		return 0, errors.New("fs: empty commit")
 	}
