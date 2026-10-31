@@ -73,8 +73,12 @@ type NodeRev struct {
 	// representation (inline full text, delta bytes or external object). It
 	// is written as an optional trailing field so old blocks still decode.
 	TotalSize uint64
-	Base      *NodeID // delta base, when TextRep==TextRepDelta
-	Children  []Child // dir only
+	// TextSHA1 is the full text's SHA-1 when known (hashed while streaming an
+	// upload). Update reports use it instead of reading the text again. Zero
+	// means unknown; it is a second optional trailing field.
+	TextSHA1 [20]byte
+	Base     *NodeID // delta base, when TextRep==TextRepDelta
+	Children []Child // dir only
 	// ByName is a runtime-only name->Child index for directories, built on
 	// decode/cache; it is NOT persisted (Marshal ignores it) and lets Resolve
 	// find a child in O(1) instead of scanning Children (O(n) on a big dir).
@@ -132,10 +136,13 @@ func (nr *NodeRev) Marshal() []byte {
 			wire.WriteUvarint(&b, c.ID.ID)
 		}
 	}
-	// Optional trailing field: full text size for files. Older node-revs end
-	// here, so absence simply means "unknown".
-	if nr.TotalSize > 0 {
+	// Optional trailing fields: full text size, then the text SHA-1 when
+	// known. Older node-revs end here, so absence simply means "unknown".
+	if nr.TotalSize > 0 || nr.TextSHA1 != ([20]byte{}) {
 		wire.WriteUvarint(&b, nr.TotalSize)
+		if nr.TextSHA1 != ([20]byte{}) {
+			b.Write(nr.TextSHA1[:])
+		}
 	}
 	body := b.Bytes()
 	out := make([]byte, 0, len(body)+4)
@@ -294,8 +301,12 @@ func UnmarshalNodeRev(b []byte) (*NodeRev, error) {
 		}
 	}
 	if p < len(body) {
-		if nr.TotalSize, _, err = wire.ReadUvarint(body[p:]); err != nil {
+		if nr.TotalSize, n, err = wire.ReadUvarint(body[p:]); err != nil {
 			return nil, err
+		}
+		p += n
+		if len(body)-p >= 20 {
+			copy(nr.TextSHA1[:], body[p:p+20])
 		}
 	}
 	return nr, nil

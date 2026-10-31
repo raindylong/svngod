@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha1"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -324,46 +325,52 @@ func (r *Repo) PutTextFile(ctx context.Context, path, ref string) error {
 }
 
 // externalizeFile streams a file body into a content-addressed text object and
-// returns its md5, size and reference. The body is hashed and uploaded in two
-// passes, so memory use stays constant for arbitrarily large uploads.
-func (r *Repo) externalizeFile(ctx context.Context, path string, known *[16]byte) ([16]byte, uint64, string, error) {
+// returns its md5, sha1, size and reference. The body is hashed and uploaded
+// in two passes, so memory use stays constant for arbitrarily large uploads.
+func (r *Repo) externalizeFile(ctx context.Context, path string, known *[16]byte, knownSHA1 *[20]byte) ([16]byte, [20]byte, uint64, string, error) {
 	var sum [16]byte
+	var sha [20]byte
 	var n int64
-	if known != nil {
+	if known != nil && knownSHA1 != nil {
 		// The upload path already hashed the body while streaming it.
-		sum = *known
+		sum, sha = *known, *knownSHA1
 		st, serr := os.Stat(path)
 		if serr != nil {
-			return sum, 0, "", serr
+			return sum, sha, 0, "", serr
 		}
 		n = st.Size()
 	} else {
 		f, err := os.Open(path)
 		if err != nil {
-			return sum, 0, "", err
+			return sum, sha, 0, "", err
 		}
 		h := md5.New()
-		n, err = io.Copy(h, f)
+		hs := sha1.New()
+		n, err = io.Copy(io.MultiWriter(h, hs), f)
 		f.Close()
 		if err != nil {
-			return sum, 0, "", err
+			return sum, sha, 0, "", err
 		}
 		copy(sum[:], h.Sum(nil))
+		if known != nil {
+			sum = *known
+		}
+		copy(sha[:], hs.Sum(nil))
 	}
 	ref := hex.EncodeToString(sum[:])
 	key := r.keys.Text(ref)
 	if ok, herr := r.store.Exists(ctx, key); herr == nil && ok {
-		return sum, uint64(n), ref, nil
+		return sum, sha, uint64(n), ref, nil
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return sum, 0, "", err
+		return sum, sha, 0, "", err
 	}
 	defer f.Close()
 	if err := r.store.PutFrom(ctx, key, f, n); err != nil {
-		return sum, 0, "", err
+		return sum, sha, 0, "", err
 	}
-	return sum, uint64(n), ref, nil
+	return sum, sha, uint64(n), ref, nil
 }
 
 // StreamText writes a node's full text to w. External texts are streamed from
@@ -694,6 +701,9 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 					return 0, errors.New("fs: uploaded text object missing")
 				}
 				copy(nr.TextMD5[:], sum)
+				if t.hasSHA1 {
+					nr.TextSHA1 = t.dataSHA1
+				}
 				nr.TextRep = TextRepExternal
 				nr.TextRef = t.textRef
 				nr.TextSize = t.textSize
@@ -707,11 +717,16 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 				if t.hasMD5 {
 					known = &t.dataMD5
 				}
-				sum, size, ref, xerr := r.externalizeFile(ctx, t.dataFile, known)
+				var knownSHA1 *[20]byte
+				if t.hasSHA1 {
+					knownSHA1 = &t.dataSHA1
+				}
+				sum, sha, size, ref, xerr := r.externalizeFile(ctx, t.dataFile, known, knownSHA1)
 				if xerr != nil {
 					return 0, xerr
 				}
 				copy(nr.TextMD5[:], sum[:])
+				nr.TextSHA1 = sha
 				nr.TextRep = TextRepExternal
 				nr.TextRef = ref
 				nr.TextSize = size
@@ -725,6 +740,11 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 			}
 			sum := md5.Sum(t.data)
 			copy(nr.TextMD5[:], sum[:])
+			if t.hasSHA1 {
+				nr.TextSHA1 = t.dataSHA1
+			} else if len(t.data) > 0 {
+				nr.TextSHA1 = sha1.Sum(t.data)
+			}
 			if t.id.IsZero() || t.deltaDepth+1 >= r.maxDelta {
 				nr.DeltaDepth = 0
 				if len(t.data) > externalTextThreshold {
@@ -889,6 +909,7 @@ func (r *Repo) applyChange(root *tnode, ch *Change) error {
 		if ch.Kind == KindFile {
 			t := &tnode{kind: KindFile, props: copyProps(ch.Props), data: append([]byte(nil), ch.Data...),
 				dataFile: ch.DataFile, dataMD5: ch.DataMD5, hasMD5: ch.HasMD5,
+				dataSHA1: ch.DataSHA1, hasSHA1: ch.HasSHA1,
 				textRef: ch.TextRef, textSize: ch.TextSize, dirty: true}
 			if old, ok := parent.children[name]; ok && old.kind == KindFile {
 				// A streamed body becomes an external full text; no base text

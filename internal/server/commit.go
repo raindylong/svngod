@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/sha1"
 	"encoding/hex"
 	"encoding/xml"
 	"errors"
@@ -59,6 +60,10 @@ type txnChange struct {
 	// only records the reference and persistence needs no body copy).
 	dataTextRef  string
 	dataTextSize uint64
+	// dataSHA1 is the body's SHA-1 when hashed while streaming; it is stored
+	// in the node so update reports need not read the text back.
+	dataSHA1 [20]byte
+	hasSHA1  bool
 }
 
 // txn is a checked-out working resource bound to an activity.
@@ -455,6 +460,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 	var dataSize int64
 	var dataTextRef string
 	var dataTextSize uint64
+	var dataSHA1 [20]byte
 
 	const maxPutBody = 512 << 20
 	storeText := func(path string, sum [16]byte) (string, int64, error) {
@@ -472,7 +478,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 		return ref, st.Size(), nil
 	}
 
-	body, bodyFile, bodyMD5, berr := readBody(r.Body, putStreamThreshold, maxPutBody)
+	body, bodyFile, bodyMD5, bodySHA1, berr := readBody(r.Body, putStreamThreshold, maxPutBody)
 	if berr != nil {
 		http.Error(w, berr.Error(), statusForSpool(berr))
 		return
@@ -488,7 +494,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 				http.Error(w, oerr.Error(), http.StatusInternalServerError)
 				return
 			}
-			outPath, sum, derr := decodeDeltaToFile(baseText, in)
+			outPath, sum, sha, derr := decodeDeltaToFile(baseText, in)
 			in.Close()
 			os.Remove(bodyFile)
 			if derr != nil {
@@ -508,6 +514,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 					return
 				}
 				dataTextRef, dataTextSize, dataSize = ref, uint64(size), size
+				dataSHA1 = sha
 			} else {
 				b, rerr := os.ReadFile(outPath)
 				os.Remove(outPath)
@@ -524,6 +531,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 				return
 			}
 			dataTextRef, dataTextSize, dataSize = ref, uint64(size), size
+			dataSHA1 = bodySHA1
 		}
 	} else {
 		if isSvndiff {
@@ -560,6 +568,8 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 	ch.streamed = false
 	ch.dataTextRef = dataTextRef
 	ch.dataTextSize = dataTextSize
+	ch.dataSHA1 = dataSHA1
+	ch.hasSHA1 = dataSHA1 != ([20]byte{})
 	ch.baseRev = clientRev
 	ch.dataRef = ""
 	if ch.props == nil {
@@ -585,27 +595,29 @@ var errBodyTooLarge = errors.New("file too large")
 
 // readBody reads a PUT body, keeping at most threshold bytes in memory. Larger
 // bodies are spilled to a temp file and returned by path.
-func readBody(r io.Reader, threshold, limit int64) ([]byte, string, [16]byte, error) {
+func readBody(r io.Reader, threshold, limit int64) ([]byte, string, [16]byte, [20]byte, error) {
 	var sum [16]byte
+	var sha [20]byte
 	head := make([]byte, threshold+1)
 	n, err := io.ReadFull(r, head)
 	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
-		return nil, "", sum, err
+		return nil, "", sum, sha, err
 	}
 	if int64(n) <= threshold {
-		return head[:n], "", sum, nil
+		return head[:n], "", sum, sha, nil
 	}
 	f, cerr := createTemp("body")
 	if cerr != nil {
-		return nil, "", sum, cerr
+		return nil, "", sum, sha, cerr
 	}
 	path := f.Name()
 	h := md5.New()
-	dst := io.MultiWriter(f, h)
+	hs := sha1.New()
+	dst := io.MultiWriter(f, h, hs)
 	if _, werr := dst.Write(head[:n]); werr != nil {
 		f.Close()
 		os.Remove(path)
-		return nil, "", sum, werr
+		return nil, "", sum, sha, werr
 	}
 	rest, cerr2 := io.Copy(dst, io.LimitReader(r, limit-int64(n)+1))
 	cerr3 := f.Close()
@@ -614,14 +626,15 @@ func readBody(r io.Reader, threshold, limit int64) ([]byte, string, [16]byte, er
 	}
 	if cerr2 != nil {
 		os.Remove(path)
-		return nil, "", sum, cerr2
+		return nil, "", sum, sha, cerr2
 	}
 	if int64(n)+rest > limit {
 		os.Remove(path)
-		return nil, "", sum, errBodyTooLarge
+		return nil, "", sum, sha, errBodyTooLarge
 	}
 	copy(sum[:], h.Sum(nil))
-	return nil, path, sum, nil
+	copy(sha[:], hs.Sum(nil))
+	return nil, path, sum, sha, nil
 }
 
 func statusForSpool(err error) int {
@@ -632,25 +645,28 @@ func statusForSpool(err error) int {
 }
 
 // decodeDeltaToFile streams a spooled svndiff delta into a text temp file.
-func decodeDeltaToFile(base []byte, delta io.Reader) (string, [16]byte, error) {
+func decodeDeltaToFile(base []byte, delta io.Reader) (string, [16]byte, [20]byte, error) {
 	var sum [16]byte
+	var sha [20]byte
 	out, err := createTemp("text")
 	if err != nil {
-		return "", sum, err
+		return "", sum, sha, err
 	}
 	outPath := out.Name()
 	h := md5.New()
-	if err := svndiff.ApplyTo(base, delta, io.MultiWriter(out, h)); err != nil {
+	hs := sha1.New()
+	if err := svndiff.ApplyTo(base, delta, io.MultiWriter(out, h, hs)); err != nil {
 		out.Close()
 		os.Remove(outPath)
-		return "", sum, err
+		return "", sum, sha, err
 	}
 	if err := out.Close(); err != nil {
 		os.Remove(outPath)
-		return "", sum, err
+		return "", sum, sha, err
 	}
 	copy(sum[:], h.Sum(nil))
-	return outPath, sum, nil
+	copy(sha[:], hs.Sum(nil))
+	return outPath, sum, sha, nil
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, res resource) {
@@ -923,6 +939,8 @@ func collectChanges(repo *fs.Repo, tx *txn) []fs.Change {
 			HasMD5:       ch.hasMD5,
 			TextRef:      ch.dataTextRef,
 			TextSize:     ch.dataTextSize,
+			DataSHA1:     ch.dataSHA1,
+			HasSHA1:      ch.hasSHA1,
 		})
 	}
 	return out

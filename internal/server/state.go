@@ -38,6 +38,7 @@ type persistedChange struct {
 	BaseRev      uint64            `json:"baseRev,omitempty"`
 	DataTextRef  string            `json:"dataTextRef,omitempty"`
 	DataTextSize uint64            `json:"dataTextSize,omitempty"`
+	DataSHA1     string            `json:"dataSha1,omitempty"`
 }
 
 type persistedTxn struct {
@@ -141,6 +142,9 @@ func (s *Server) persistActivity(repo *fs.Repo, actID string) {
 				// needs to be persisted.
 				pc.DataTextRef = ch.dataTextRef
 				pc.DataTextSize = ch.dataTextSize
+				if ch.hasSHA1 {
+					pc.DataSHA1 = hex.EncodeToString(ch.dataSHA1[:])
+				}
 			case ch.dataFile != "":
 				pc.Streamed = true
 				files = append(files, fileBody{index: len(pt.Changes), path: ch.dataFile})
@@ -216,6 +220,17 @@ func putTxnFile(ctx context.Context, repo *fs.Repo, path string) (string, error)
 		return "", err
 	}
 	return ref, nil
+}
+
+// decodeSHA1 parses a persisted hex SHA-1; a bad value is treated as unknown.
+func decodeSHA1(s string) [20]byte {
+	var out [20]byte
+	b, err := hex.DecodeString(s)
+	if err != nil || len(b) != 20 {
+		return out
+	}
+	copy(out[:], b)
+	return out
 }
 
 // dropActivityState removes a persisted session (commit finished or aborted).
@@ -295,6 +310,7 @@ func (s *Server) ensureActivitiesLoaded(repoName string, repo *fs.Repo) {
 					props: copyMap(pc.Props), copyFromPath: pc.CopyFromPath,
 					copyFromRev: pc.CopyFromRev, baseRev: pc.BaseRev, dataRef: pc.DataRef,
 					streamed: pc.Streamed, dataTextRef: pc.DataTextRef, dataTextSize: pc.DataTextSize,
+					dataSHA1: decodeSHA1(pc.DataSHA1), hasSHA1: pc.DataSHA1 != "",
 				}
 			}
 			a.txn = tx

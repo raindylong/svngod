@@ -578,18 +578,21 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 				b.WriteString("    </S:open-file>\n")
 				continue
 			}
-			text, terr := repo.GetText(nr.Node)
-			if terr != nil {
-				return terr
-			}
-			var baseText []byte
-			if bt, gerr := repo.GetText(baseNode.Node); gerr == nil {
-				baseText = bt
-			}
 			// A switch compares different paths: revisions do not tell us
-			// whether the content changed, so compare the text itself.
-			if !samePath && bytes.Equal(baseText, text) && !propsChanged {
-				continue
+			// whether the content changed, so compare the text itself. A plain
+			// update trusts the node revisions and needs no text at all when
+			// the stored checksums are known.
+			var text []byte
+			if !samePath {
+				t, gerr := repo.GetText(nr.Node)
+				if gerr != nil {
+					return gerr
+				}
+				bt, gerr := repo.GetText(baseNode.Node)
+				if gerr == nil && bytes.Equal(bt, t) && !propsChanged {
+					continue
+				}
+				text = t
 			}
 			fileRev := pathCreatedRev(repo, nr)
 			if fileRev < copyFloor {
@@ -599,11 +602,18 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 				fileRev = rev
 			}
 			ver := rvrHref(base, cpath, fileRev)
-			ss := sha1.Sum(text)
-			bs := md5.Sum(text)
-			if baseText != nil {
-				bs = md5.Sum(baseText)
+			ss := nr.TextSHA1
+			if ss == ([20]byte{}) {
+				if text == nil {
+					t, gerr := repo.GetText(nr.Node)
+					if gerr != nil {
+						return gerr
+					}
+					text = t
+				}
+				ss = sha1.Sum(text)
 			}
+			bs := baseNode.TextMD5
 			b.WriteString("    <S:open-file name=\"" + xmlEscape(c.Name) + "\" rev=\"" + strconv.FormatUint(outRev, 10) + "\">\n")
 			b.WriteString("      <D:checked-in><D:href>" + xmlEscape(ver) + "</D:href></D:checked-in>\n")
 			writeEntryProps(b, rp, uuid, rev)
@@ -612,11 +622,16 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 			b.WriteString("    </S:open-file>\n")
 			continue
 		}
-		text, err := repo.GetText(nr.Node)
-		if err != nil {
-			return err
+		// New file in this working copy. The text is only needed when the
+		// client asked for inline deltas or when no stored SHA-1 exists.
+		var text []byte
+		if sendAll || nr.TextSHA1 == ([20]byte{}) {
+			t, terr := repo.GetText(nr.Node)
+			if terr != nil {
+				return terr
+			}
+			text = t
 		}
-		// New file in this working copy.
 		fileRev := pathCreatedRev(repo, nr)
 		if fileRev < copyFloor {
 			fileRev = copyFloor
@@ -625,7 +640,11 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 			fileRev = rev
 		}
 		ver := rvrHref(base, cpath, fileRev)
-		b.WriteString("    <S:add-file name=\"" + xmlEscape(c.Name) + "\" sha1-checksum=\"" + sha1Hex(text) + "\">\n")
+		ss := nr.TextSHA1
+		if ss == ([20]byte{}) {
+			ss = sha1.Sum(text)
+		}
+		b.WriteString("    <S:add-file name=\"" + xmlEscape(c.Name) + "\" sha1-checksum=\"" + hex.EncodeToString(ss[:]) + "\">\n")
 		b.WriteString("      <D:checked-in><D:href>" + xmlEscape(ver) + "</D:href></D:checked-in>\n")
 		writeEntryProps(b, rp, uuid, rev)
 		writeNodeProps(b, nr.Props)
@@ -667,12 +686,6 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 		b.WriteString("  </S:" + openEl + ">\n")
 	}
 	return nil
-}
-
-// sha1Hex returns the lowercase hex SHA-1 of data.
-func sha1Hex(b []byte) string {
-	s := sha1.Sum(b)
-	return hex.EncodeToString(s[:])
 }
 
 // writeNodeProps emits <S:set-prop> for each node property (svn namespace and

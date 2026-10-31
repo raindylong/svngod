@@ -33,6 +33,10 @@ type Change struct {
 	// streaming (lets the commit skip a full hash pass).
 	DataMD5 [16]byte
 	HasMD5  bool
+	// DataSHA1 is the body's SHA-1 when the upload path hashed it while
+	// streaming; update reports then avoid re-reading the whole text.
+	DataSHA1 [20]byte
+	HasSHA1  bool
 	// TextRef/TextSize point at an already-stored external text object (the
 	// upload path stores it before commit so the commit only records it).
 	TextRef  string
@@ -47,6 +51,8 @@ type tnode struct {
 	dataFile     string // streamed body on disk (large PUT)
 	dataMD5      [16]byte
 	hasMD5       bool
+	dataSHA1     [20]byte
+	hasSHA1      bool
 	textRef      string
 	textSize     uint64
 	baseText     []byte // previous file text captured during this commit (delta base)
