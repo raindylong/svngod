@@ -20,6 +20,9 @@ import (
 type FileStore struct {
 	base string
 	mu   sync.Mutex
+	// dirs caches directories already created; MkdirAll on an existing deep
+	// path stats every component, which a 30k-file commit paid per fragment.
+	dirs map[string]bool
 }
 
 // NewFileStore builds a FileStore rooted at base (created if missing).
@@ -27,7 +30,7 @@ func NewFileStore(base string) (*FileStore, error) {
 	if err := os.MkdirAll(base, 0o755); err != nil {
 		return nil, err
 	}
-	return &FileStore{base: base}, nil
+	return &FileStore{base: base, dirs: make(map[string]bool)}, nil
 }
 
 // objPath maps a slash-separated key to an absolute path, rejecting escapes.
@@ -42,6 +45,20 @@ func (s *FileStore) objPath(key string) (string, error) {
 	return filepath.Join(s.base, clean), nil
 }
 
+// ensureDirLocked creates dir once. Caller holds s.mu.
+func (s *FileStore) ensureDirLocked(dir string) error {
+	if s.dirs[dir] {
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	if len(s.dirs) < 1<<16 {
+		s.dirs[dir] = true
+	}
+	return nil
+}
+
 func (s *FileStore) Put(_ context.Context, key string, data []byte) error {
 	p, err := s.objPath(key)
 	if err != nil {
@@ -49,10 +66,31 @@ func (s *FileStore) Put(_ context.Context, key string, data []byte) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	dir := filepath.Dir(p)
+	if err := s.ensureDirLocked(dir); err != nil {
 		return err
 	}
-	return os.WriteFile(p, data, 0o644)
+	// Write-then-rename: a crash mid-write must not leave a truncated object
+	// that a resumed session would parse as its staged change.
+	tmp, err := os.CreateTemp(dir, ".put-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, p); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 func (s *FileStore) Get(_ context.Context, key string, rng *Range) ([]byte, error) {
@@ -90,7 +128,7 @@ func (s *FileStore) PutFile(_ context.Context, key, src string) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	if err := s.ensureDirLocked(filepath.Dir(p)); err != nil {
 		return err
 	}
 	if err := os.Link(src, p); err == nil {
@@ -214,7 +252,7 @@ func (s *FileStore) CreateIfAbsent(_ context.Context, key string, data []byte) e
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	if err := s.ensureDirLocked(filepath.Dir(p)); err != nil {
 		return err
 	}
 	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
@@ -318,6 +356,25 @@ func (s *FileStore) ListPrefix(_ context.Context, prefix, continuation string, m
 		return out[:max], out[max-1].Key, nil
 	}
 	return out, "", nil
+}
+
+// DeletePrefix removes a directory tree under base (one syscall per directory
+// instead of one per object).
+func (s *FileStore) DeletePrefix(_ context.Context, prefix string) error {
+	if prefix == "" || strings.Contains(prefix, "\x00") {
+		return fmt.Errorf("store: invalid prefix %q", prefix)
+	}
+	clean := filepath.Clean(filepath.FromSlash(prefix))
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(os.PathSeparator)) || filepath.IsAbs(clean) {
+		return fmt.Errorf("store: prefix escapes base: %q", prefix)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	err := os.RemoveAll(filepath.Join(s.base, clean))
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *FileStore) Delete(_ context.Context, keys []string) error {

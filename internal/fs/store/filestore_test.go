@@ -50,3 +50,36 @@ func TestFileStoreListPrefixPages(t *testing.T) {
 		t.Fatalf("saw %d objects, want %d", len(seen), n)
 	}
 }
+
+// TestFileStoreDeletePrefix removes a whole session subtree in one call.
+func TestFileStoreDeletePrefix(t *testing.T) {
+	ctx := context.Background()
+	st, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		if err := st.Put(ctx, fmt.Sprintf("repos/r/dav-txns/changes/a/%d", i), []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.Put(ctx, "repos/r/keep", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeletePrefix(ctx, "repos/r/dav-txns/changes/a/"); err != nil {
+		t.Fatal(err)
+	}
+	objs, _, err := st.ListPrefix(ctx, "repos/r/dav-txns/changes/a/", "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objs) != 0 {
+		t.Fatalf("prefix not empty: %v", objs)
+	}
+	if ok, err := st.Exists(ctx, "repos/r/keep"); err != nil || !ok {
+		t.Fatalf("unrelated object removed (ok=%v err=%v)", ok, err)
+	}
+	if err := st.DeletePrefix(ctx, "../escape"); err == nil {
+		t.Fatal("expected escape rejection")
+	}
+}

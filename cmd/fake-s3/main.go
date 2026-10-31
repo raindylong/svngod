@@ -20,6 +20,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -143,6 +144,11 @@ func main() {
 		delay = time.Duration(ms) * time.Millisecond
 	}
 	failAll := os.Getenv("FAKE_S3_FAIL") == "1"
+	errPct := 0
+	if v, err := strconv.Atoi(os.Getenv("FAKE_S3_ERROR_PCT")); err == nil && v > 0 {
+		errPct = v
+	}
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		panic(err)
 	}
@@ -177,7 +183,7 @@ func main() {
 		if delay > 0 {
 			time.Sleep(delay)
 		}
-		if failAll {
+		if failAll || (errPct > 0 && rng.Intn(100) < errPct) {
 			writeError(sw, 500, "InternalError", "injected failure")
 			return
 		}

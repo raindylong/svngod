@@ -2,12 +2,15 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha1"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"svngod/internal/fs"
 	"svngod/internal/fs/store"
@@ -385,5 +388,86 @@ func TestFragmentsRestoreAllChangeKinds(t *testing.T) {
 	}
 	if nr.Props["flag"] != "on" {
 		t.Fatalf("keep.txt props=%v", nr.Props)
+	}
+}
+
+// TestExpiredSessionReapedOnLoad: a session abandoned by its client must not
+// keep its staged fragments forever. Loading a repository drops manifests
+// older than sessionTTL together with their change fragments.
+func TestExpiredSessionReapedOnLoad(t *testing.T) {
+	st := store.NewMemoryStore()
+	if _, err := fs.CreateRepo(st, "reap", 4096, 64); err != nil {
+		t.Fatal(err)
+	}
+	newServer := func() *httptest.Server {
+		repo, err := fs.OpenRepo(st, "reap")
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv := New(Config{
+			BasePath: "/svn",
+			OpenRepo: func(name string) (*fs.Repo, error) {
+				if name != "reap" {
+					return nil, fs.ErrRepoNotFound
+				}
+				return repo, nil
+			},
+		})
+		return httptest.NewServer(srv.Handler())
+	}
+	ts1 := newServer()
+	base := ts1.URL + "/svn/reap"
+	resp := doRequest(t, "MKACTIVITY", base+"/!svn/act/u-old", "", "", "", nil)
+	if resp.StatusCode != 201 {
+		t.Fatalf("MKACTIVITY=%d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	checkout := `<?xml version="1.0"?><D:checkout xmlns:D="DAV:"><D:activity-set><D:href>` +
+		base + `/!svn/act/u-old</D:href></D:activity-set></D:checkout>`
+	resp = doRequest(t, "CHECKOUT", base+"/!svn/vcc/default", checkout, "", "", nil)
+	if resp.StatusCode != 201 {
+		t.Fatalf("CHECKOUT=%d", resp.StatusCode)
+	}
+	txn := strings.TrimSuffix(resp.Header.Get("Location"), "/")
+	resp.Body.Close()
+	resp = doRequest(t, "PUT", txn+"/a.txt", "staged", "", "", nil)
+	if resp.StatusCode != 201 {
+		t.Fatalf("PUT=%d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	ts1.Close()
+
+	repo, err := fs.OpenRepo(st, "reap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := persistedActivity{ID: "u-old", Created: time.Now().Add(-2 * sessionTTL).Unix()}
+	data, err := json.Marshal(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Put(context.Background(), activityStateKey(repo, "u-old"), data); err != nil {
+		t.Fatal(err)
+	}
+	objs, _, _ := st.ListPrefix(context.Background(), activityChangesPrefix(repo, "u-old"), "", 100)
+	if len(objs) == 0 {
+		t.Fatal("test setup: expected staged fragments")
+	}
+
+	ts2 := newServer()
+	defer ts2.Close()
+	// Any request for the repo triggers the one-time session load.
+	resp = doRequest(t, "OPTIONS", ts2.URL+"/svn/reap", "", "", "", nil)
+	resp.Body.Close()
+
+	objs, _, err = st.ListPrefix(context.Background(), activityChangesPrefix(repo, "u-old"), "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objs) != 0 {
+		t.Fatalf("fragments survived: %d objects", len(objs))
+	}
+	if _, ok, _ := st.Head(context.Background(), activityStateKey(repo, "u-old")); ok {
+		t.Fatal("manifest survived")
 	}
 }

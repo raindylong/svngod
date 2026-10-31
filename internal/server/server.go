@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"svngod/internal/auth"
 	"svngod/internal/authz"
@@ -159,7 +160,15 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	sw := &statusWriter{ResponseWriter: w}
 	w = sw
-	defer func() { log.Printf("HTTP %d %s %s", sw.code, r.Method, r.URL.Path) }()
+	// One summary line per request (status + user) when a logger is set; the
+	// previous unconditional line doubled the log volume of a 30k-file commit.
+	user := ""
+	start := time.Now()
+	defer func() {
+		if s.cfg.Logger != nil {
+			s.cfg.Logger.Printf("HTTP %d %s %s user=%q %v", sw.code, r.Method, r.URL.Path, user, time.Since(start).Round(time.Microsecond))
+		}
+	}()
 	ctx := r.Context()
 	res := parseResource(s.cfg.BasePath, r.URL.Path)
 
@@ -167,6 +176,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return // 401 already written
 	}
+	user = ident.Username
 	ctx = context.WithValue(ctx, identityKey{}, ident)
 	r = r.WithContext(ctx)
 
@@ -181,10 +191,6 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		}
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
-	}
-
-	if s.cfg.Logger != nil {
-		s.cfg.Logger.Printf("%s %s user=%q", r.Method, r.URL.Path, ident.Username)
 	}
 
 	switch r.Method {

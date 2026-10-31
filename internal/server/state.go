@@ -63,9 +63,15 @@ type persistedTxn struct {
 
 type persistedActivity struct {
 	ID       string            `json:"id"`
+	Created  int64             `json:"created,omitempty"`
 	RevProps map[string]string `json:"revProps,omitempty"`
 	Txn      *persistedTxn     `json:"txn,omitempty"`
 }
+
+// sessionTTL bounds how long an abandoned commit session (client gave up
+// mid-commit) keeps its staged fragments. An active commit is far shorter;
+// the next repo load reaps older ones.
+const sessionTTL = 24 * time.Hour
 
 func activityStateKey(repo *fs.Repo, id string) string {
 	return repo.Keys().Prefix + "/dav-txns/activity-" + id + ".json"
@@ -152,7 +158,7 @@ func (s *Server) persistActivity(repo *fs.Repo, actID string) {
 		s.mu.Unlock()
 		return
 	}
-	pa := persistedActivity{ID: a.id}
+	pa := persistedActivity{ID: a.id, Created: a.created}
 	if len(a.revProps) > 0 {
 		pa.RevProps = copyMap(a.revProps)
 	}
@@ -338,60 +344,66 @@ func decodeSHA1(s string) [20]byte {
 	return out
 }
 
-// dropActivityState removes a persisted session (commit finished or aborted).
-// Data objects are content addressed and left for a future GC.
+// dropActivityState removes a persisted session (commit finished or aborted):
+// one bulk prefix delete for its fragments plus the activity manifest.
 func (s *Server) dropActivityState(repo *fs.Repo, actID string) {
-	s.dropActivityStatePaths(repo, actID, nil)
-}
-
-// dropActivityStatePaths removes the session, deleting fragments by their
-// known paths when the caller still has the transaction in memory (saves a
-// listing round trip on every commit).
-func (s *Server) dropActivityStatePaths(repo *fs.Repo, actID string, paths []string) {
 	if repo == nil || actID == "" {
 		return
 	}
 	ctx := context.Background()
-	if paths != nil {
-		if len(paths) > 0 {
-			keys := make([]string, len(paths))
-			for i, p := range paths {
-				keys[i] = activityChangeKey(repo, actID, p)
-			}
-			if err := repo.Store().Delete(ctx, keys); err != nil {
-				log.Printf("txn: drop changes %s: %v", actID, err)
-			}
-		}
-		if err := repo.Store().Delete(ctx, []string{activityStateKey(repo, actID)}); err != nil {
-			log.Printf("txn: drop %s: %v", actID, err)
-		}
-		return
-	}
-	prefix := activityChangesPrefix(repo, actID)
-	next := ""
-	for {
-		objs, n, err := repo.Store().ListPrefix(ctx, prefix, next, 500)
-		if err != nil {
-			log.Printf("txn: list changes %s: %v", actID, err)
-			break
-		}
-		if len(objs) > 0 {
-			keys := make([]string, len(objs))
-			for i := range objs {
-				keys[i] = objs[i].Key
-			}
-			if err := repo.Store().Delete(ctx, keys); err != nil {
-				log.Printf("txn: drop changes %s: %v", actID, err)
-			}
-		}
-		if n == "" || n == next {
-			break
-		}
-		next = n
+	if err := store.DeletePrefix(ctx, repo.Store(), activityChangesPrefix(repo, actID)); err != nil {
+		log.Printf("txn: drop changes %s: %v", actID, err)
 	}
 	if err := repo.Store().Delete(ctx, []string{activityStateKey(repo, actID)}); err != nil {
 		log.Printf("txn: drop %s: %v", actID, err)
 	}
+}
+
+// txnChangeFromPersisted rebuilds the in-memory change from its stored form.
+func txnChangeFromPersisted(pc persistedChange) *txnChange {
+	return &txnChange{
+		action: actionByName(pc.Action), kind: kindByName(pc.Kind),
+		props: copyMap(pc.Props), copyFromPath: pc.CopyFromPath,
+		copyFromRev: pc.CopyFromRev, baseRev: pc.BaseRev, dataRef: pc.DataRef,
+		data: pc.DataInline, delta: pc.DeltaInline,
+		streamed: pc.Streamed, dataTextRef: pc.DataTextRef, dataTextSize: pc.DataTextSize,
+		dataSHA1: decodeSHA1(pc.DataSHA1), hasSHA1: pc.DataSHA1 != "",
+		dataMD5: decodeMD5(pc.DataMD5), hasMD5: pc.DataMD5 != "",
+		deltaRef: pc.DeltaRef, deltaTotal: pc.DeltaTotal,
+		deltaBase: fs.NodeID{Rev: pc.DeltaBaseRev, ID: pc.DeltaBaseID},
+	}
+}
+
+// loadTxnChanges reads a restored transaction's change fragments once, when a
+// request actually touches that transaction.
+func (s *Server) loadTxnChanges(repo *fs.Repo, txid string) {
+	if repo == nil || txid == "" {
+		return
+	}
+	s.mu.Lock()
+	tx := s.txns[txid]
+	if tx == nil || tx.changesLoaded {
+		s.mu.Unlock()
+		return
+	}
+	actID := strings.TrimPrefix(txid, "txn-")
+	s.mu.Unlock()
+
+	frags := loadChangeFragments(context.Background(), repo, actID)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx = s.txns[txid]
+	if tx == nil || tx.changesLoaded {
+		return
+	}
+	for _, pc := range frags {
+		if pc.Path == "" {
+			continue
+		}
+		tx.changes[pc.Path] = txnChangeFromPersisted(pc)
+	}
+	tx.changesLoaded = true
 }
 
 // loadChangeFragments reads every persisted change of one activity.
@@ -478,30 +490,20 @@ func (s *Server) ensureActivitiesLoaded(repoName string, repo *fs.Repo) {
 		next = n
 	}
 
-	// Per-change fragments carry the pending edits; merge them over any
-	// legacy manifest changes (fragments are authoritative).
-	for i := range manifests {
-		pa := &manifests[i]
-		if pa.Txn == nil {
+	// Reap sessions whose client gave up long ago; their staged fragments
+	// would otherwise accumulate after aborted large commits. This happens
+	// before any fragment is read (fragments load lazily per transaction).
+	now := time.Now().Unix()
+	kept := make([]persistedActivity, 0, len(manifests))
+	for _, pa := range manifests {
+		if pa.Created > 0 && now-pa.Created > int64(sessionTTL/time.Second) {
+			log.Printf("txn: reaping expired session %s (age %ds)", pa.ID, now-pa.Created)
+			s.dropActivityState(repo, pa.ID)
 			continue
 		}
-		frags := loadChangeFragments(ctx, repo, pa.ID)
-		if len(frags) == 0 {
-			continue
-		}
-		index := make(map[string]int, len(pa.Txn.Changes))
-		for j, pc := range pa.Txn.Changes {
-			index[pc.Path] = j
-		}
-		for _, pc := range frags {
-			if j, ok := index[pc.Path]; ok {
-				pa.Txn.Changes[j] = pc
-			} else {
-				index[pc.Path] = len(pa.Txn.Changes)
-				pa.Txn.Changes = append(pa.Txn.Changes, pc)
-			}
-		}
+		kept = append(kept, pa)
 	}
+	manifests = kept
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -516,18 +518,11 @@ func (s *Server) ensureActivitiesLoaded(repoName string, repo *fs.Repo) {
 		if pa.Txn != nil {
 			tx := &txn{id: pa.Txn.ID, baseRev: pa.Txn.BaseRev, changes: map[string]*txnChange{}}
 			for _, pc := range pa.Txn.Changes {
-				tx.changes[pc.Path] = &txnChange{
-					action: actionByName(pc.Action), kind: kindByName(pc.Kind),
-					props: copyMap(pc.Props), copyFromPath: pc.CopyFromPath,
-					copyFromRev: pc.CopyFromRev, baseRev: pc.BaseRev, dataRef: pc.DataRef,
-					data: pc.DataInline, delta: pc.DeltaInline,
-					streamed: pc.Streamed, dataTextRef: pc.DataTextRef, dataTextSize: pc.DataTextSize,
-					dataSHA1: decodeSHA1(pc.DataSHA1), hasSHA1: pc.DataSHA1 != "",
-					dataMD5: decodeMD5(pc.DataMD5), hasMD5: pc.DataMD5 != "",
-					deltaRef: pc.DeltaRef, deltaTotal: pc.DeltaTotal,
-					deltaBase: fs.NodeID{Rev: pc.DeltaBaseRev, ID: pc.DeltaBaseID},
-				}
+				tx.changes[pc.Path] = txnChangeFromPersisted(pc)
 			}
+			// Fragments are loaded on first use: a large abandoned session
+			// must not delay startup by thousands of object reads.
+			tx.changesLoaded = false
 			a.txn = tx
 			s.txns[tx.id] = tx
 		}

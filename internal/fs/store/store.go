@@ -25,6 +25,42 @@ type Range struct {
 	Offset, Length int64 // Length <= 0 means "to end of object"
 }
 
+// DeletePrefix drops every object under prefix, using the store's bulk
+// capability when available and list+delete otherwise.
+func DeletePrefix(ctx context.Context, s Store, prefix string) error {
+	if pd, ok := s.(PrefixDeleter); ok {
+		return pd.DeletePrefix(ctx, prefix)
+	}
+	next := ""
+	for {
+		objs, n, err := s.ListPrefix(ctx, prefix, next, 1000)
+		if err != nil {
+			return err
+		}
+		if len(objs) > 0 {
+			keys := make([]string, len(objs))
+			for i := range objs {
+				keys[i] = objs[i].Key
+			}
+			if err := s.Delete(ctx, keys); err != nil {
+				return err
+			}
+		}
+		if n == "" || n == next {
+			break
+		}
+		next = n
+	}
+	return nil
+}
+
+// PrefixDeleter is implemented by stores that can drop a whole key prefix in
+// one operation. Session cleanup after a large commit would otherwise unlink
+// one object per changed file (tens of thousands on a 30k-file commit).
+type PrefixDeleter interface {
+	DeletePrefix(ctx context.Context, prefix string) error
+}
+
 // ListedObj is one object returned by ListPrefix.
 type ListedObj struct {
 	Key  string

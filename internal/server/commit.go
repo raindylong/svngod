@@ -25,6 +25,7 @@ import (
 // activity is a server-side commit session, keyed by the MKACTIVITY uuid.
 type activity struct {
 	id       string
+	created  int64             // unix seconds; bounds abandoned sessions
 	revProps map[string]string // svn:log / svn:author / svn:date (set via PROPPATCH)
 	txn      *txn
 }
@@ -80,6 +81,10 @@ type txn struct {
 	id      string
 	baseRev uint64
 	changes map[string]*txnChange
+	// changesLoaded is false for a transaction restored from the store: its
+	// fragments are read on demand, so an abandoned large session does not
+	// slow down every server start.
+	changesLoaded bool
 }
 
 func (s *Server) activityByID(id string) (*activity, bool) {
@@ -109,7 +114,7 @@ func (s *Server) handleMkactivity(w http.ResponseWriter, r *http.Request, res re
 	}
 	s.mu.Lock()
 	if _, ok := s.activities[res.uuid]; !ok {
-		s.activities[res.uuid] = &activity{id: res.uuid, revProps: map[string]string{}}
+		s.activities[res.uuid] = &activity{id: res.uuid, created: time.Now().Unix(), revProps: map[string]string{}}
 	}
 	s.mu.Unlock()
 	s.persistActivity(repo, res.uuid)
@@ -135,6 +140,11 @@ func (s *Server) handleCheckout(w http.ResponseWriter, r *http.Request, res reso
 		http.Error(w, "CHECKOUT Destination is not an activity URI", http.StatusConflict)
 		return
 	}
+	if repo, ok := s.repo(w, res); ok {
+		s.loadTxnChanges(repo, "txn-"+actID)
+	} else {
+		return
+	}
 	s.mu.Lock()
 	a, ok := s.activities[actID]
 	if !ok {
@@ -156,7 +166,7 @@ func (s *Server) handleCheckout(w http.ResponseWriter, r *http.Request, res reso
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		a.txn = &txn{id: "txn-" + actID, baseRev: head, changes: map[string]*txnChange{}}
+		a.txn = &txn{id: "txn-" + actID, baseRev: head, changes: map[string]*txnChange{}, changesLoaded: true}
 		s.txns[a.txn.id] = a.txn
 		repoHandle = repo
 	}
@@ -290,6 +300,9 @@ func (s *Server) handleProppatch(w http.ResponseWriter, r *http.Request, res res
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if res.typ == resTxn {
+		s.loadTxnChanges(repo, res.uuid)
+	}
 	sets, removes := parsePropertyUpdate(body)
 
 	switch res.typ {
@@ -419,6 +432,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 	if !rok {
 		return
 	}
+	s.loadTxnChanges(repo, res.uuid)
 	s.mu.Lock()
 	tx, ok := s.txns[res.uuid]
 	if !ok {
@@ -781,14 +795,12 @@ func (c *strictCapWriter) Write(p []byte) (int, error) {
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, res resource) {
 	if res.typ == resActivity {
 		var files []string
-		var fragPaths []string
 		s.mu.Lock()
 		a, had := s.activities[res.uuid]
 		delete(s.activities, res.uuid)
 		if had && a.txn != nil {
 			delete(s.txns, a.txn.id)
-			for p, ch := range a.txn.changes {
-				fragPaths = append(fragPaths, p)
+			for _, ch := range a.txn.changes {
 				if ch.dataFile != "" {
 					files = append(files, ch.dataFile)
 				}
@@ -799,13 +811,18 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, res resour
 			os.Remove(f)
 		}
 		if repo, ok := s.repo(w, res); ok {
-			s.dropActivityStatePaths(repo, res.uuid, fragPaths)
+			s.dropActivityState(repo, res.uuid)
 		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	if res.typ != resTxn {
 		http.Error(w, "DELETE only applies to a transaction working resource", http.StatusBadRequest)
+		return
+	}
+	if repo, ok := s.repo(w, res); ok {
+		s.loadTxnChanges(repo, res.uuid)
+	} else {
 		return
 	}
 	if e := s.getLockLocked(res.repo, res.path); e != nil && !lockTokenMatches(r.Header.Get("If"), e.token) {
@@ -833,6 +850,11 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, res resour
 func (s *Server) handleMkcol(w http.ResponseWriter, r *http.Request, res resource) {
 	if res.typ != resTxn {
 		http.Error(w, "MKCOL only applies to a transaction working resource", http.StatusBadRequest)
+		return
+	}
+	if repo, ok := s.repo(w, res); ok {
+		s.loadTxnChanges(repo, res.uuid)
+	} else {
 		return
 	}
 	s.mu.Lock()
@@ -878,6 +900,7 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 		http.Error(w, "MERGE body must name a source activity", http.StatusBadRequest)
 		return
 	}
+	s.loadTxnChanges(repo, "txn-"+actID)
 	s.mu.Lock()
 	a, ok := s.activities[actID]
 	if !ok || a.txn == nil {
@@ -886,10 +909,6 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 		return
 	}
 	tx := a.txn
-	fragPaths := make([]string, 0, len(tx.changes))
-	for p := range tx.changes {
-		fragPaths = append(fragPaths, p)
-	}
 	changes, cerr := collectChanges(repo, tx)
 	if cerr != nil {
 		s.mu.Unlock()
@@ -967,7 +986,7 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 	}
 
 	rev, err := repo.CommitTxn(tx.baseRev, changes, revProps)
-	s.dropActivityStatePaths(repo, actID, fragPaths)
+	s.dropActivityState(repo, actID)
 	if err != nil {
 		log.Printf("CommitTxn failed: %v", err)
 		for _, c := range changes {

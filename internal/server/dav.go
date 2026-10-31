@@ -649,6 +649,14 @@ func (s *Server) handleCopyMove(w http.ResponseWriter, r *http.Request, res reso
 		http.Error(w, "COPY destination must be a transaction working resource", http.StatusBadRequest)
 		return
 	}
+	if repo, ok := s.repo(w, res); ok {
+		s.loadTxnChanges(repo, dres.uuid)
+		if res.typ == resTxn {
+			s.loadTxnChanges(repo, res.uuid)
+		}
+	} else {
+		return
+	}
 
 	// srcPlans accumulates the materializations needed in the destination txn.
 	var srcPlans []srcPlan

@@ -184,12 +184,43 @@ func (m *MirrorStore) markDown(i int) {
 	m.setHealthy(i, false)
 }
 
+// writePrimary runs a write on the elected primary; on a transport failure it
+// marks that mirror down and retries on the next healthy one, so a PUT or
+// commit does not fail just because the elected primary went away between the
+// read and the write. Precondition/missing-object results are not retried.
+func (m *MirrorStore) writePrimary(fn func(Store) error) (int, error) {
+	p, pi := m.primary()
+	err := fn(p)
+	if err == nil {
+		return pi, nil
+	}
+	if errors.Is(err, ErrPreconditionFailed) || errors.Is(err, ErrNotFound) {
+		return pi, err
+	}
+	m.markDown(pi)
+	n := len(m.mirrors)
+	for step := 1; step < n; step++ {
+		idx := (pi + step) % n
+		if !m.isHealthy(idx) {
+			continue
+		}
+		if e := fn(m.mirrors[idx]); e == nil {
+			return idx, nil
+		} else if errors.Is(e, ErrPreconditionFailed) || errors.Is(e, ErrNotFound) {
+			return idx, e
+		} else {
+			m.markDown(idx)
+			err = e
+		}
+	}
+	return pi, err
+}
+
 // --- Store interface ---
 
 func (m *MirrorStore) Put(ctx context.Context, key string, data []byte) error {
-	p, pi := m.primary()
-	if err := p.Put(ctx, key, data); err != nil {
-		m.markDown(pi)
+	pi, err := m.writePrimary(func(s Store) error { return s.Put(ctx, key, data) })
+	if err != nil {
 		return err
 	}
 	// Best-effort mirror to healthy standbys.
@@ -249,15 +280,15 @@ func (m *MirrorStore) PutFrom(ctx context.Context, key string, r io.Reader, size
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	p, pi := m.primary()
-	f, err := os.Open(tmpName)
+	pi, err := m.writePrimary(func(s Store) error {
+		f, oerr := os.Open(tmpName)
+		if oerr != nil {
+			return oerr
+		}
+		defer f.Close()
+		return s.PutFrom(ctx, key, f, size)
+	})
 	if err != nil {
-		return err
-	}
-	err = p.PutFrom(ctx, key, f, size)
-	f.Close()
-	if err != nil {
-		m.markDown(pi)
 		return err
 	}
 	m.mirrorWrites(ctx, pi, func(s Store) error {
@@ -373,9 +404,8 @@ func (m *MirrorStore) Head(ctx context.Context, key string) (string, bool, error
 // must be atomic) and overwrites it on standbys: a standby that already holds
 // the same lock object must not be treated as a failure.
 func (m *MirrorStore) CreateIfAbsent(ctx context.Context, key string, data []byte) error {
-	p, pi := m.primary()
-	if err := p.CreateIfAbsent(ctx, key, data); err != nil {
-		m.markDown(pi)
+	pi, err := m.writePrimary(func(s Store) error { return s.CreateIfAbsent(ctx, key, data) })
+	if err != nil {
 		return err
 	}
 	m.mirrorWrites(ctx, pi, func(s Store) error { return s.Put(ctx, key, data) })
@@ -383,10 +413,13 @@ func (m *MirrorStore) CreateIfAbsent(ctx context.Context, key string, data []byt
 }
 
 func (m *MirrorStore) CAS(ctx context.Context, key string, expectETag string, data []byte) (string, error) {
-	p, pi := m.primary()
-	newEtag, err := p.CAS(ctx, key, expectETag, data)
+	var newEtag string
+	pi, err := m.writePrimary(func(s Store) error {
+		var cerr error
+		newEtag, cerr = s.CAS(ctx, key, expectETag, data)
+		return cerr
+	})
 	if err != nil {
-		m.markDown(pi)
 		return "", err
 	}
 	// Standbys mirror the current value unconditionally (their own etag does
@@ -406,12 +439,22 @@ func (m *MirrorStore) ListPrefix(ctx context.Context, prefix, continuation strin
 }
 
 func (m *MirrorStore) Delete(ctx context.Context, keys []string) error {
-	p, pi := m.primary()
-	if err := p.Delete(ctx, keys); err != nil {
-		m.markDown(pi)
+	pi, err := m.writePrimary(func(s Store) error { return s.Delete(ctx, keys) })
+	if err != nil {
 		return err
 	}
 	m.mirrorWrites(ctx, pi, func(s Store) error { return s.Delete(ctx, keys) })
+	return nil
+}
+
+// DeletePrefix drops a whole prefix on the primary and on healthy standbys.
+func (m *MirrorStore) DeletePrefix(ctx context.Context, prefix string) error {
+	p, pi := m.primary()
+	if err := DeletePrefix(ctx, p, prefix); err != nil {
+		m.markDown(pi)
+		return err
+	}
+	m.mirrorWrites(ctx, pi, func(s Store) error { return DeletePrefix(ctx, s, prefix) })
 	return nil
 }
 

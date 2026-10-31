@@ -113,17 +113,86 @@ func joinKey(a, b string) string {
 
 func (s *S3Store) key(rel string) string { return joinKey(s.prefix, rel) }
 
+// retry runs op up to three times for transient object-store failures
+// (connection resets, timeouts, 5xx, throttling). A long commit uploads tens
+// of thousands of small objects; one transient error used to abort the whole
+// client commit, so the server retries instead of surfacing it.
+func retry(ctx context.Context, op func() error) error {
+	backoff := 100 * time.Millisecond
+	for attempt := 0; ; attempt++ {
+		err := op()
+		if err == nil || attempt >= 4 || !isTransient(err) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff *= 3
+	}
+}
+
+// isTransient reports whether an S3 error is worth retrying.
+func isTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrNotFound) || errors.Is(err, ErrPreconditionFailed) {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	resp := minio.ToErrorResponse(err)
+	switch resp.StatusCode {
+	case 0, 408, 429, 500, 502, 503, 504:
+		return true
+	}
+	switch resp.Code {
+	case "RequestTimeout", "SlowDown", "InternalError", "ServiceUnavailable", "XMinioServerNotInitialized":
+		return true
+	}
+	return false
+}
+
+// seekableReader rewinds r for a retry; nil when r cannot be replayed.
+func seekableReader(r io.Reader) io.ReadSeeker {
+	if s, ok := r.(io.ReadSeeker); ok {
+		return s
+	}
+	return nil
+}
+
 // singlePut is used for every object: one PUT up to 5 GiB instead of a
 // multipart upload. svngod's largest object is a 512 MiB text, so multipart
 // only added round trips (and required the gateway to implement it).
 var singlePut = minio.PutObjectOptions{ContentType: "application/octet-stream", PartSize: 5 << 30}
 
 func (s *S3Store) Put(ctx context.Context, key string, data []byte) error {
-	_, err := s.client.PutObject(ctx, s.bucket, s.key(key), bytes.NewReader(data), int64(len(data)), singlePut)
-	return err
+	return retry(ctx, func() error {
+		_, err := s.client.PutObject(ctx, s.bucket, s.key(key), bytes.NewReader(data), int64(len(data)), singlePut)
+		return err
+	})
 }
 
 func (s *S3Store) Get(ctx context.Context, key string, rng *Range) ([]byte, error) {
+	var buf []byte
+	err := retry(ctx, func() error {
+		var gerr error
+		buf, gerr = s.getOnce(ctx, key, rng)
+		return gerr
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return buf, nil
+}
+
+func (s *S3Store) getOnce(ctx context.Context, key string, rng *Range) ([]byte, error) {
 	opt := minio.GetObjectOptions{}
 	if rng != nil {
 		end := int64(0)
@@ -141,18 +210,30 @@ func (s *S3Store) Get(ctx context.Context, key string, rng *Range) ([]byte, erro
 	defer obj.Close()
 	buf, err := io.ReadAll(obj)
 	if err != nil {
-		resp := minio.ToErrorResponse(err)
-		if resp.StatusCode == 404 || resp.Code == "NoSuchKey" {
-			return nil, ErrNotFound
-		}
 		return nil, err
 	}
 	return buf, nil
 }
 
 func (s *S3Store) PutFrom(ctx context.Context, key string, r io.Reader, size int64) error {
-	_, err := s.client.PutObject(ctx, s.bucket, s.key(key), io.LimitReader(r, size), size, singlePut)
-	return err
+	sr := seekableReader(r)
+	return retry(ctx, func() error {
+		if sr != nil {
+			if _, err := sr.Seek(0, io.SeekStart); err != nil {
+				return err
+			}
+		}
+		_, err := s.client.PutObject(ctx, s.bucket, s.key(key), io.LimitReader(srOr(r, sr), size), size, singlePut)
+		return err
+	})
+}
+
+// srOr prefers the seekable reader when the caller supplied one.
+func srOr(r io.Reader, sr io.ReadSeeker) io.Reader {
+	if sr != nil {
+		return sr
+	}
+	return r
 }
 
 func isNotFound(err error) bool {
@@ -161,26 +242,44 @@ func isNotFound(err error) bool {
 }
 
 func (s *S3Store) Exists(ctx context.Context, key string) (bool, error) {
-	_, err := s.client.StatObject(ctx, s.bucket, s.key(key), minio.StatObjectOptions{})
-	if err != nil {
-		if isNotFound(err) {
-			return false, nil
+	var exists bool
+	err := retry(ctx, func() error {
+		_, err := s.client.StatObject(ctx, s.bucket, s.key(key), minio.StatObjectOptions{})
+		if err != nil {
+			if isNotFound(err) {
+				exists = false
+				return nil
+			}
+			return err
 		}
-		return false, err
-	}
-	return true, nil
+		exists = true
+		return nil
+	})
+	return exists, err
 }
 
 func (s *S3Store) GetTo(ctx context.Context, key string, w io.Writer) (int64, error) {
-	obj, err := s.client.GetObject(ctx, s.bucket, s.key(key), minio.GetObjectOptions{})
+	var n int64
+	err := retry(ctx, func() error {
+		obj, gerr := s.client.GetObject(ctx, s.bucket, s.key(key), minio.GetObjectOptions{})
+		if gerr != nil {
+			return gerr
+		}
+		defer obj.Close()
+		var cerr error
+		n, cerr = io.Copy(w, obj)
+		if cerr != nil && n > 0 {
+			// Bytes already reached w; a retry would duplicate them.
+			return &noRetryError{cerr}
+		}
+		return cerr
+	})
 	if err != nil {
-		return 0, err
-	}
-	defer obj.Close()
-	n, err := io.Copy(w, obj)
-	if err != nil {
-		resp := minio.ToErrorResponse(err)
-		if resp.StatusCode == http.StatusNotFound || resp.Code == "NoSuchKey" {
+		var nr *noRetryError
+		if errors.As(err, &nr) {
+			return n, nr.err
+		}
+		if isNotFound(err) {
 			return n, ErrNotFound
 		}
 		return n, err
@@ -188,22 +287,45 @@ func (s *S3Store) GetTo(ctx context.Context, key string, w io.Writer) (int64, er
 	return n, nil
 }
 
+// noRetryError marks a failure that must not be retried (partial output).
+type noRetryError struct{ err error }
+
+func (e *noRetryError) Error() string { return e.err.Error() }
+func (e *noRetryError) Unwrap() error { return e.err }
+
 func (s *S3Store) Head(ctx context.Context, key string) (string, bool, error) {
-	info, err := s.client.StatObject(ctx, s.bucket, s.key(key), minio.StatObjectOptions{})
-	if err != nil {
-		resp := minio.ToErrorResponse(err)
-		if resp.StatusCode == 404 || resp.Code == "NoSuchKey" {
-			return "", false, nil
+	var etag string
+	err := retry(ctx, func() error {
+		info, err := s.client.StatObject(ctx, s.bucket, s.key(key), minio.StatObjectOptions{})
+		if err != nil {
+			if isNotFound(err) {
+				etag = ""
+				return nil
+			}
+			return err
 		}
+		etag = info.ETag
+		return nil
+	})
+	if err != nil {
 		return "", false, err
 	}
-	return info.ETag, true, nil
+	return etag, etag != "", nil
 }
 
 // CreateIfAbsent creates the object only if it does not exist. The write uses
 // If-None-Match: * so it is atomic across replicas; gateways that do not
 // implement conditional writes fall back to a HEAD+PUT (best effort).
 func (s *S3Store) CreateIfAbsent(ctx context.Context, key string, data []byte) error {
+	var err error
+	_ = retry(ctx, func() error {
+		err = s.createIfAbsentOnce(ctx, key, data)
+		return err
+	})
+	return err
+}
+
+func (s *S3Store) createIfAbsentOnce(ctx context.Context, key string, data []byte) error {
 	opts := minio.PutObjectOptions{ContentType: "application/octet-stream"}
 	opts.SetMatchETagExcept("*")
 	_, err := s.client.PutObject(ctx, s.bucket, s.key(key), bytes.NewReader(data), int64(len(data)), opts)
@@ -232,6 +354,16 @@ func (s *S3Store) CreateIfAbsent(ctx context.Context, key string, data []byte) e
 // gets a 412 and ErrPreconditionFailed. Without the conditional write this was
 // a TOCTOU check and silently dropped a committed revision.
 func (s *S3Store) CAS(ctx context.Context, key string, expectETag string, data []byte) (string, error) {
+	var etag string
+	err := retry(ctx, func() error {
+		var cerr error
+		etag, cerr = s.casOnce(ctx, key, expectETag, data)
+		return cerr
+	})
+	return etag, err
+}
+
+func (s *S3Store) casOnce(ctx context.Context, key string, expectETag string, data []byte) (string, error) {
 	info, err := s.client.StatObject(ctx, s.bucket, s.key(key), minio.StatObjectOptions{})
 	if err != nil {
 		if isNotFound(err) {
@@ -284,6 +416,17 @@ func isPreconditionFailed(err error) bool {
 }
 
 func (s *S3Store) ListPrefix(ctx context.Context, prefix, continuation string, max int) ([]ListedObj, string, error) {
+	var out []ListedObj
+	var next string
+	err := retry(ctx, func() error {
+		var lerr error
+		out, next, lerr = s.listPrefixOnce(ctx, prefix, continuation, max)
+		return lerr
+	})
+	return out, next, err
+}
+
+func (s *S3Store) listPrefixOnce(ctx context.Context, prefix, continuation string, max int) ([]ListedObj, string, error) {
 	if max <= 0 {
 		max = 1000
 	}
@@ -312,6 +455,15 @@ func (s *S3Store) ListPrefix(ctx context.Context, prefix, continuation string, m
 }
 
 func (s *S3Store) Delete(ctx context.Context, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	// A transient failure here (session cleanup, GC) is retried rather than
+	// leaking objects.
+	return retry(ctx, func() error { return s.deleteOnce(ctx, keys) })
+}
+
+func (s *S3Store) deleteOnce(ctx context.Context, keys []string) error {
 	objs := make(chan minio.ObjectInfo, len(keys))
 	for _, k := range keys {
 		objs <- minio.ObjectInfo{Key: s.key(k)}
