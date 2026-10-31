@@ -142,6 +142,7 @@ func (s *Server) handleCheckout(w http.ResponseWriter, r *http.Request, res reso
 		http.Error(w, "activity does not exist", http.StatusConflict)
 		return
 	}
+	created := a.txn == nil
 	var repoHandle *fs.Repo
 	if a.txn == nil {
 		repo, rok := s.openRepoOnly(w, res.repo)
@@ -149,7 +150,7 @@ func (s *Server) handleCheckout(w http.ResponseWriter, r *http.Request, res reso
 			s.mu.Unlock()
 			return
 		}
-		head, err := repo.Head()
+		head, err := repo.HeadFresh()
 		if err != nil {
 			s.mu.Unlock()
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -158,14 +159,12 @@ func (s *Server) handleCheckout(w http.ResponseWriter, r *http.Request, res reso
 		a.txn = &txn{id: "txn-" + actID, baseRev: head, changes: map[string]*txnChange{}}
 		s.txns[a.txn.id] = a.txn
 		repoHandle = repo
-	} else if op := s.cfg.openerFor(res.repo); op != nil {
-		if h, err := op(res.repo); err == nil {
-			repoHandle = h
-		}
 	}
 	tx := a.txn
 	s.mu.Unlock()
-	if repoHandle != nil {
+	// Only a newly created transaction needs durable state; a per-file
+	// CHECKOUT only opens a working resource and is recreated by its PUT.
+	if created && repoHandle != nil {
 		s.persistActivity(repoHandle, actID)
 	}
 
@@ -215,6 +214,14 @@ func extractActivityFromBody(r *http.Request) string {
 }
 
 func (s *Server) openRepoOnly(w http.ResponseWriter, name string) (*fs.Repo, bool) {
+	// Prefer the shared instance: a fresh Repo per call means duplicate caches
+	// (format/uuid/rev blocks) and duplicate commit mutexes.
+	s.repoMapMu.Lock()
+	r := s.repoCache[name]
+	s.repoMapMu.Unlock()
+	if r != nil {
+		return r, true
+	}
 	opener := s.cfg.openerFor(name)
 	if opener == nil {
 		http.Error(w, "no repositories configured", http.StatusInternalServerError)
@@ -225,6 +232,13 @@ func (s *Server) openRepoOnly(w http.ResponseWriter, name string) (*fs.Repo, boo
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return nil, false
 	}
+	s.repoMapMu.Lock()
+	if prev := s.repoCache[name]; prev != nil {
+		r = prev
+	} else {
+		s.repoCache[name] = r
+	}
+	s.repoMapMu.Unlock()
 	return r, true
 }
 
@@ -371,7 +385,7 @@ func (s *Server) handleProppatch(w http.ResponseWriter, r *http.Request, res res
 			delete(ch.props, svnPropertyKey(p.ns, p.local))
 		}
 		s.mu.Unlock()
-		s.persistActivity(repo, strings.TrimPrefix(tx.id, "txn-"))
+		s.persistChange(repo, strings.TrimPrefix(tx.id, "txn-"), res.path)
 		// 207 multistatus acknowledging each prop
 		var b strings.Builder
 		b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
@@ -432,36 +446,26 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 	var baseText []byte
 	var baseNode *fs.NodeRev
 	if clientRev > 0 {
-		head, herr := repo.Head()
-		if herr == nil {
-			if hnr, err := repo.Resolve(head, res.path); err == nil {
-				if hnr.Node.Rev > clientRev {
-					writeOutOfDate(w, res.path)
-					return
-				}
-			} else if _, err := repo.Resolve(clientRev, res.path); err == nil {
-				writeOutOfDate(w, res.path) // deleted since the client's base
-				return
-			} else {
-				clientRev = 0 // not present at the client's base either
-			}
-		}
-		if clientRev > 0 {
-			if nr, err := repo.Resolve(clientRev, res.path); err == nil && nr.Kind == fs.KindFile {
-				isNew = false
-				baseNode = nr
-				bt, gerr := repo.GetText(nr.Node)
-				if gerr == nil {
-					baseText = bt
-					if want := r.Header.Get("X-SVN-Base-Fulltext-MD5"); want != "" {
-						sum := md5.Sum(bt)
-						if !strings.EqualFold(hex.EncodeToString(sum[:]), want) {
-							writeOutOfDate(w, res.path)
-							return
-						}
+		// Resolve the client's own base only. Whether HEAD moved is checked by
+		// CommitTxn against the exact node (one fewer round trip per PUT, which
+		// matters for object stores); a stale change fails there with the same
+		// out-of-date answer instead of before the upload.
+		if nr, err := repo.Resolve(clientRev, res.path); err == nil && nr.Kind == fs.KindFile {
+			isNew = false
+			baseNode = nr
+			bt, gerr := repo.GetText(nr.Node)
+			if gerr == nil {
+				baseText = bt
+				if want := r.Header.Get("X-SVN-Base-Fulltext-MD5"); want != "" {
+					sum := md5.Sum(bt)
+					if !strings.EqualFold(hex.EncodeToString(sum[:]), want) {
+						writeOutOfDate(w, res.path)
+						return
 					}
 				}
 			}
+		} else if err != nil {
+			clientRev = 0 // not present at the client's base: a new file
 		}
 	}
 	_ = txnBase
@@ -636,7 +640,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 		ch.props = map[string]string{}
 	}
 	s.mu.Unlock()
-	s.persistActivity(repo, actID)
+	s.persistChange(repo, actID, res.path)
 
 	w.Header().Set("Location", s.absURL(r, res.repo, "/!svn/txn/"+tx.id+res.path))
 	if isNew {
@@ -777,12 +781,14 @@ func (c *strictCapWriter) Write(p []byte) (int, error) {
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, res resource) {
 	if res.typ == resActivity {
 		var files []string
+		var fragPaths []string
 		s.mu.Lock()
 		a, had := s.activities[res.uuid]
 		delete(s.activities, res.uuid)
 		if had && a.txn != nil {
 			delete(s.txns, a.txn.id)
-			for _, ch := range a.txn.changes {
+			for p, ch := range a.txn.changes {
+				fragPaths = append(fragPaths, p)
 				if ch.dataFile != "" {
 					files = append(files, ch.dataFile)
 				}
@@ -793,7 +799,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, res resour
 			os.Remove(f)
 		}
 		if repo, ok := s.repo(w, res); ok {
-			s.dropActivityState(repo, res.uuid)
+			s.dropActivityStatePaths(repo, res.uuid, fragPaths)
 		}
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -819,7 +825,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, res resour
 	actID := strings.TrimPrefix(tx.id, "txn-")
 	s.mu.Unlock()
 	if repo, ok := s.repo(w, res); ok {
-		s.persistActivity(repo, actID)
+		s.persistChange(repo, actID, res.path)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -844,7 +850,7 @@ func (s *Server) handleMkcol(w http.ResponseWriter, r *http.Request, res resourc
 	actID := strings.TrimPrefix(tx.id, "txn-")
 	s.mu.Unlock()
 	if repo, ok := s.repo(w, res); ok {
-		s.persistActivity(repo, actID)
+		s.persistChange(repo, actID, res.path)
 	}
 	w.WriteHeader(http.StatusCreated)
 }
@@ -880,6 +886,10 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 		return
 	}
 	tx := a.txn
+	fragPaths := make([]string, 0, len(tx.changes))
+	for p := range tx.changes {
+		fragPaths = append(fragPaths, p)
+	}
 	changes, cerr := collectChanges(repo, tx)
 	if cerr != nil {
 		s.mu.Unlock()
@@ -957,7 +967,7 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 	}
 
 	rev, err := repo.CommitTxn(tx.baseRev, changes, revProps)
-	s.dropActivityState(repo, actID)
+	s.dropActivityStatePaths(repo, actID, fragPaths)
 	if err != nil {
 		log.Printf("CommitTxn failed: %v", err)
 		for _, c := range changes {

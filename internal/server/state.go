@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"svngod/internal/fs"
@@ -21,10 +22,13 @@ import (
 //
 // Layout (per repository):
 //
-//	dav-txns/activity-<id>.json   activity + transaction manifest
-//	dav-txns/data/<sha1>          file bodies referenced by the manifest
+//	dav-txns/activity-<id>.json            activity metadata + transaction id
+//	dav-txns/changes/<id>/<sha1(path)>     one pending change (small bodies inline)
+//	dav-txns/data/<sha1>                   larger bodies/deltas by reference
 //
-// Data objects are content-addressed, so identical PUTs share one object.
+// Each PUT writes only its own change fragment, so staging a large commit is
+// one object per file instead of rewriting a growing manifest (S3: fewer and
+// smaller requests). Data objects are content-addressed.
 
 type persistedChange struct {
 	Path         string            `json:"path"`
@@ -44,6 +48,11 @@ type persistedChange struct {
 	DeltaBaseRev uint64            `json:"deltaBaseRev,omitempty"`
 	DeltaBaseID  uint64            `json:"deltaBaseId,omitempty"`
 	DeltaTotal   uint64            `json:"deltaTotal,omitempty"`
+	// Small bodies are embedded in the fragment; larger ones live under
+	// dav-txns/data (DataRef/DeltaRef). Embedding avoids a second object and
+	// round trip for the common small-file commit.
+	DataInline  []byte `json:"dataInline,omitempty"`
+	DeltaInline []byte `json:"deltaInline,omitempty"`
 }
 
 type persistedTxn struct {
@@ -65,6 +74,19 @@ func activityStateKey(repo *fs.Repo, id string) string {
 func activityDataKey(repo *fs.Repo, ref string) string {
 	return repo.Keys().Prefix + "/dav-txns/data/" + ref
 }
+
+// activityChangesPrefix holds one fragment object per pending path.
+func activityChangesPrefix(repo *fs.Repo, id string) string {
+	return repo.Keys().Prefix + "/dav-txns/changes/" + id + "/"
+}
+
+func activityChangeKey(repo *fs.Repo, id, path string) string {
+	sum := sha1.Sum([]byte(path))
+	return activityChangesPrefix(repo, id) + hex.EncodeToString(sum[:])
+}
+
+// fragmentInlineCap is the largest body embedded in a change fragment.
+const fragmentInlineCap = 256 << 10
 
 func actionName(a fs.ChangeAction) string {
 	switch a {
@@ -112,142 +134,158 @@ func kindByName(s string) byte {
 	return 0
 }
 
-// persistActivity snapshots one commit session and writes it to the repo
-// store. Best effort: a failing write must not fail the request.
+// persistActivity writes the activity-level state: revision properties and the
+// transaction identity. Per-change state is stored by persistChange.
 func (s *Server) persistActivity(repo *fs.Repo, actID string) {
+	if repo == nil || actID == "" {
+		return
+	}
 	s.mu.Lock()
 	a, ok := s.activities[actID]
 	if !ok {
 		s.mu.Unlock()
 		return
 	}
+	if a.txn == nil && len(a.revProps) == 0 {
+		// Nothing durable yet (MKACTIVITY before CHECKOUT): skipping the write
+		// saves an object per commit and loses only an empty session.
+		s.mu.Unlock()
+		return
+	}
 	pa := persistedActivity{ID: a.id}
 	if len(a.revProps) > 0 {
-		pa.RevProps = map[string]string{}
-		for k, v := range a.revProps {
-			pa.RevProps[k] = v
+		pa.RevProps = copyMap(a.revProps)
+	}
+	if a.txn != nil {
+		pa.Txn = &persistedTxn{ID: a.txn.id, BaseRev: a.txn.baseRev}
+	}
+	s.mu.Unlock()
+	data, err := json.Marshal(pa)
+	if err != nil {
+		return
+	}
+	if err := repo.Store().Put(context.Background(), activityStateKey(repo, actID), data); err != nil {
+		log.Printf("txn: persist %s: %v", actID, err)
+	}
+}
+
+// snapshotChange builds the persisted form of one change. Caller holds s.mu.
+func snapshotChange(path string, ch *txnChange) persistedChange {
+	pc := persistedChange{
+		Path: path, Action: actionName(ch.action), Kind: kindName(ch.kind),
+		Props: copyMap(ch.props), CopyFromPath: ch.copyFromPath,
+		CopyFromRev: ch.copyFromRev, BaseRev: ch.baseRev,
+		Streamed: ch.streamed || ch.dataFile != "",
+		DataRef:  ch.dataRef, DataTextRef: ch.dataTextRef, DataTextSize: ch.dataTextSize,
+		DeltaRef: ch.deltaRef, DeltaTotal: ch.deltaTotal,
+		DeltaBaseRev: ch.deltaBase.Rev, DeltaBaseID: ch.deltaBase.ID,
+	}
+	if ch.hasMD5 {
+		pc.DataMD5 = hex.EncodeToString(ch.dataMD5[:])
+	}
+	if ch.hasSHA1 {
+		pc.DataSHA1 = hex.EncodeToString(ch.dataSHA1[:])
+	}
+	return pc
+}
+
+// persistChange writes one pending change as its own fragment object. This is
+// what turns staging into O(1) per PUT: the manifest is no longer rewritten,
+// and small bodies need no separate data object either.
+func (s *Server) persistChange(repo *fs.Repo, actID, path string) {
+	if repo == nil || actID == "" {
+		return
+	}
+	s.mu.Lock()
+	a, ok := s.activities[actID]
+	if !ok || a.txn == nil {
+		s.mu.Unlock()
+		return
+	}
+	ch, exists := a.txn.changes[path]
+	if !exists {
+		// The change was dropped inside the transaction (e.g. MOVE of a file
+		// added in the same commit); its fragment must not survive.
+		s.mu.Unlock()
+		s.dropChangeFragment(repo, actID, path)
+		return
+	}
+	pc := snapshotChange(path, ch)
+	gen := ch.gen
+	file := ch.dataFile
+	var body, delta []byte
+	switch {
+	case ch.dataRef != "" || file != "":
+		// already persisted (ref) or streamed to disk (flushed below)
+	case len(ch.data) > 0:
+		if len(ch.data) <= fragmentInlineCap {
+			pc.DataInline = append([]byte(nil), ch.data...)
+		} else {
+			body = append([]byte(nil), ch.data...)
 		}
 	}
-	type fileBody struct {
-		index int
-		path  string
-	}
-	var files []fileBody
-	if a.txn != nil {
-		pt := &persistedTxn{ID: a.txn.id, BaseRev: a.txn.baseRev}
-		for p, ch := range a.txn.changes {
-			pc := persistedChange{
-				Path: p, Action: actionName(ch.action), Kind: kindName(ch.kind),
-				Props: copyMap(ch.props), CopyFromPath: ch.copyFromPath,
-				CopyFromRev: ch.copyFromRev, BaseRev: ch.baseRev,
-			}
-			switch {
-			case len(ch.delta) > 0:
-				// A large-text edit kept as a delta: persist the delta stream
-				// (content addressed) plus the exact base node and full-text
-				// hashes, so a restart can commit without the text itself.
-				ref := ch.deltaRef
-				if ref == "" {
-					sum := sha1.Sum(ch.delta)
-					ref = hex.EncodeToString(sum[:])
-				}
-				pc.DeltaRef = ref
-				pc.DeltaBaseRev = ch.deltaBase.Rev
-				pc.DeltaBaseID = ch.deltaBase.ID
-				pc.DeltaTotal = ch.deltaTotal
-				if ch.hasMD5 {
-					pc.DataMD5 = hex.EncodeToString(ch.dataMD5[:])
-				}
-				if ch.hasSHA1 {
-					pc.DataSHA1 = hex.EncodeToString(ch.dataSHA1[:])
-				}
-			case ch.dataTextRef != "":
-				// The body is already a durable text object; only the reference
-				// needs to be persisted.
-				pc.DataTextRef = ch.dataTextRef
-				pc.DataTextSize = ch.dataTextSize
-				if ch.hasSHA1 {
-					pc.DataSHA1 = hex.EncodeToString(ch.dataSHA1[:])
-				}
-			case ch.dataFile != "":
-				pc.Streamed = true
-				files = append(files, fileBody{index: len(pt.Changes), path: ch.dataFile})
-			case len(ch.data) > 0:
-				if ch.dataRef != "" {
-					pc.DataRef = ch.dataRef // already uploaded by an earlier PUT
-				} else {
-					sum := sha1.Sum(ch.data)
-					pc.DataRef = hex.EncodeToString(sum[:])
-				}
-			}
-			pt.Changes = append(pt.Changes, pc)
-		}
-		pa.Txn = pt
-	}
-	// Copy only payloads that have not been stored yet, and remember the
-	// generation they came from so a concurrent PUT that replaces the body
-	// does not get a stale reference. Without this every PUT re-hashed and
-	// re-uploaded every pending body (O(n^2) for a many-file commit).
-	type pendingBody struct {
-		ch    *txnChange
-		gen   uint64
-		ref   string
-		data  []byte
-		delta bool
-	}
-	var pending []pendingBody
-	if a.txn != nil {
-		for _, ch := range a.txn.changes {
-			if len(ch.data) > 0 && ch.dataRef == "" {
-				sum := sha1.Sum(ch.data)
-				pending = append(pending, pendingBody{
-					ch: ch, gen: ch.gen, ref: hex.EncodeToString(sum[:]),
-					data: append([]byte(nil), ch.data...),
-				})
-			}
-			if len(ch.delta) > 0 && ch.deltaRef == "" {
-				sum := sha1.Sum(ch.delta)
-				pending = append(pending, pendingBody{
-					ch: ch, gen: ch.gen, ref: hex.EncodeToString(sum[:]),
-					data: append([]byte(nil), ch.delta...), delta: true,
-				})
-			}
+	if len(ch.delta) > 0 && ch.deltaRef == "" {
+		if len(ch.delta) <= fragmentInlineCap {
+			pc.DeltaInline = append([]byte(nil), ch.delta...)
+		} else {
+			delta = append([]byte(nil), ch.delta...)
 		}
 	}
 	s.mu.Unlock()
 
 	ctx := context.Background()
-	// Bodies on disk are hashed and uploaded (streaming) so a restart can
-	// resume the commit without the temp file.
-	for _, fb := range files {
-		ref, err := putTxnFile(ctx, repo, fb.path)
-		if err != nil {
-			log.Printf("txn: persist body %s: %v", fb.path, err)
-			continue
+	if file != "" && pc.DataRef == "" {
+		if ref, err := putTxnFile(ctx, repo, file); err == nil {
+			pc.DataRef = ref
+		} else {
+			log.Printf("txn: persist body %s: %v", file, err)
 		}
-		pa.Txn.Changes[fb.index].DataRef = ref
 	}
-	for _, pb := range pending {
-		if _, exists, err := repo.Store().Head(ctx, activityDataKey(repo, pb.ref)); err != nil || !exists {
-			if err := repo.Store().Put(ctx, activityDataKey(repo, pb.ref), pb.data); err != nil {
-				log.Printf("txn: persist data %s: %v", pb.ref, err)
-				continue
-			}
+	if body != nil {
+		ref := hex.EncodeToString(sha1Sum(body))
+		if err := repo.Store().Put(ctx, activityDataKey(repo, ref), body); err != nil {
+			log.Printf("txn: persist data %s: %v", ref, err)
+			return
 		}
+		pc.DataRef = ref
 		s.mu.Lock()
-		if pb.ch.gen == pb.gen {
-			if pb.delta {
-				pb.ch.deltaRef = pb.ref
-			} else {
-				pb.ch.dataRef = pb.ref
-			}
+		if ch.gen == gen {
+			ch.dataRef = ref
 		}
 		s.mu.Unlock()
 	}
-	if data, err := json.Marshal(pa); err == nil {
-		if err := repo.Store().Put(ctx, activityStateKey(repo, actID), data); err != nil {
-			log.Printf("txn: persist %s: %v", actID, err)
+	if delta != nil {
+		ref := hex.EncodeToString(sha1Sum(delta))
+		if err := repo.Store().Put(ctx, activityDataKey(repo, ref), delta); err != nil {
+			log.Printf("txn: persist delta %s: %v", ref, err)
+			return
 		}
+		pc.DeltaRef = ref
+		s.mu.Lock()
+		if ch.gen == gen {
+			ch.deltaRef = ref
+		}
+		s.mu.Unlock()
+	}
+	data, err := json.Marshal(pc)
+	if err != nil {
+		return
+	}
+	if err := repo.Store().Put(ctx, activityChangeKey(repo, actID, path), data); err != nil {
+		log.Printf("txn: persist change %s: %v", path, err)
+	}
+}
+
+func sha1Sum(b []byte) []byte {
+	h := sha1.Sum(b)
+	return h[:]
+}
+
+// dropChangeFragment removes one change's persisted state.
+func (s *Server) dropChangeFragment(repo *fs.Repo, actID, path string) {
+	ctx := context.Background()
+	if err := repo.Store().Delete(ctx, []string{activityChangeKey(repo, actID, path)}); err != nil {
+		log.Printf("txn: drop change %s: %v", path, err)
 	}
 }
 
@@ -303,12 +341,90 @@ func decodeSHA1(s string) [20]byte {
 // dropActivityState removes a persisted session (commit finished or aborted).
 // Data objects are content addressed and left for a future GC.
 func (s *Server) dropActivityState(repo *fs.Repo, actID string) {
+	s.dropActivityStatePaths(repo, actID, nil)
+}
+
+// dropActivityStatePaths removes the session, deleting fragments by their
+// known paths when the caller still has the transaction in memory (saves a
+// listing round trip on every commit).
+func (s *Server) dropActivityStatePaths(repo *fs.Repo, actID string, paths []string) {
 	if repo == nil || actID == "" {
 		return
 	}
-	if err := repo.Store().Delete(context.Background(), []string{activityStateKey(repo, actID)}); err != nil {
+	ctx := context.Background()
+	if paths != nil {
+		if len(paths) > 0 {
+			keys := make([]string, len(paths))
+			for i, p := range paths {
+				keys[i] = activityChangeKey(repo, actID, p)
+			}
+			if err := repo.Store().Delete(ctx, keys); err != nil {
+				log.Printf("txn: drop changes %s: %v", actID, err)
+			}
+		}
+		if err := repo.Store().Delete(ctx, []string{activityStateKey(repo, actID)}); err != nil {
+			log.Printf("txn: drop %s: %v", actID, err)
+		}
+		return
+	}
+	prefix := activityChangesPrefix(repo, actID)
+	next := ""
+	for {
+		objs, n, err := repo.Store().ListPrefix(ctx, prefix, next, 500)
+		if err != nil {
+			log.Printf("txn: list changes %s: %v", actID, err)
+			break
+		}
+		if len(objs) > 0 {
+			keys := make([]string, len(objs))
+			for i := range objs {
+				keys[i] = objs[i].Key
+			}
+			if err := repo.Store().Delete(ctx, keys); err != nil {
+				log.Printf("txn: drop changes %s: %v", actID, err)
+			}
+		}
+		if n == "" || n == next {
+			break
+		}
+		next = n
+	}
+	if err := repo.Store().Delete(ctx, []string{activityStateKey(repo, actID)}); err != nil {
 		log.Printf("txn: drop %s: %v", actID, err)
 	}
+}
+
+// loadChangeFragments reads every persisted change of one activity.
+func loadChangeFragments(ctx context.Context, repo *fs.Repo, actID string) []persistedChange {
+	prefix := activityChangesPrefix(repo, actID)
+	var out []persistedChange
+	next := ""
+	for {
+		objs, n, err := repo.Store().ListPrefix(ctx, prefix, next, 500)
+		if err != nil {
+			log.Printf("txn: list changes %s: %v", actID, err)
+			break
+		}
+		for _, o := range objs {
+			data, err := repo.Store().Get(ctx, o.Key, nil)
+			if err != nil {
+				if err != store.ErrNotFound {
+					log.Printf("txn: read change %s: %v", o.Key, err)
+				}
+				continue
+			}
+			var pc persistedChange
+			if err := json.Unmarshal(data, &pc); err != nil || pc.Path == "" {
+				continue
+			}
+			out = append(out, pc)
+		}
+		if n == "" || n == next {
+			break
+		}
+		next = n
+	}
+	return out
 }
 
 // ensureActivitiesLoaded restores persisted commit sessions for a repository.
@@ -332,6 +448,9 @@ func (s *Server) ensureActivitiesLoaded(repoName string, repo *fs.Repo) {
 			break
 		}
 		for _, o := range objs {
+			if strings.Contains(o.Key, "/dav-txns/changes/") {
+				continue
+			}
 			if len(o.Key) < len("activity-") || o.Key[len(o.Key)-5:] != ".json" {
 				continue
 			}
@@ -359,6 +478,31 @@ func (s *Server) ensureActivitiesLoaded(repoName string, repo *fs.Repo) {
 		next = n
 	}
 
+	// Per-change fragments carry the pending edits; merge them over any
+	// legacy manifest changes (fragments are authoritative).
+	for i := range manifests {
+		pa := &manifests[i]
+		if pa.Txn == nil {
+			continue
+		}
+		frags := loadChangeFragments(ctx, repo, pa.ID)
+		if len(frags) == 0 {
+			continue
+		}
+		index := make(map[string]int, len(pa.Txn.Changes))
+		for j, pc := range pa.Txn.Changes {
+			index[pc.Path] = j
+		}
+		for _, pc := range frags {
+			if j, ok := index[pc.Path]; ok {
+				pa.Txn.Changes[j] = pc
+			} else {
+				index[pc.Path] = len(pa.Txn.Changes)
+				pa.Txn.Changes = append(pa.Txn.Changes, pc)
+			}
+		}
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, pa := range manifests {
@@ -376,6 +520,7 @@ func (s *Server) ensureActivitiesLoaded(repoName string, repo *fs.Repo) {
 					action: actionByName(pc.Action), kind: kindByName(pc.Kind),
 					props: copyMap(pc.Props), copyFromPath: pc.CopyFromPath,
 					copyFromRev: pc.CopyFromRev, baseRev: pc.BaseRev, dataRef: pc.DataRef,
+					data: pc.DataInline, delta: pc.DeltaInline,
 					streamed: pc.Streamed, dataTextRef: pc.DataTextRef, dataTextSize: pc.DataTextSize,
 					dataSHA1: decodeSHA1(pc.DataSHA1), hasSHA1: pc.DataSHA1 != "",
 					dataMD5: decodeMD5(pc.DataMD5), hasMD5: pc.DataMD5 != "",

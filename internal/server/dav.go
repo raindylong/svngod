@@ -722,7 +722,10 @@ func (s *Server) handleCopyMove(w http.ResponseWriter, r *http.Request, res reso
 	actID := strings.TrimPrefix(tx.id, "txn-")
 	s.mu.Unlock()
 	if repoHandle, rok := s.repo(w, res); rok {
-		s.persistActivity(repoHandle, actID)
+		s.persistChange(repoHandle, actID, dres.path)
+		if r.Method == "MOVE" && res.typ == resTxn && res.uuid == dres.uuid {
+			s.persistChange(repoHandle, actID, res.path)
+		}
 	}
 	w.Header().Set("Location", dst)
 	w.WriteHeader(http.StatusCreated)

@@ -3,6 +3,7 @@ package fs
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -100,6 +101,13 @@ func TestConcurrentSamePathCommit(t *testing.T) {
 // for the rest. Skipped when the local RustFS instance is not reachable, so the
 // suite stays green in environments without it.
 func TestConcurrentSamePathCommitS3(t *testing.T) {
+	// NewS3Store tolerates an unreachable endpoint (a mirror must start when
+	// its primary is down), so probe the port to decide whether to skip.
+	if c, derr := net.DialTimeout("tcp", "127.0.0.1:9000", 300*time.Millisecond); derr != nil {
+		t.Skipf("local RustFS not reachable, skipping S3 CAS concurrency test: %v", derr)
+	} else {
+		c.Close()
+	}
 	st, err := store.NewS3Store(store.S3Config{
 		Endpoint:   "127.0.0.1:9000",
 		AccessKey:  "k",

@@ -95,7 +95,7 @@ func (s *fileStore) makeStore() (store.Store, error) {
 		if len(ms) < 2 {
 			return nil, fmt.Errorf("mirror storage requires at least 2 backends (got %d)", len(ms))
 		}
-		return store.NewMirror(ms), nil
+		return store.NewMirror(ms, store.WithMutableOrder(fs.CompareMutable)), nil
 	default:
 		return store.NewFileStore(s.Root)
 	}

@@ -129,7 +129,7 @@ func (o *options) mirrorStore(name string) (store.Store, string, error) {
 	if len(ms) < 2 {
 		return nil, "", fmt.Errorf("--mirror-file requires at least 2 backends (got %d)", len(ms))
 	}
-	return store.NewMirror(ms), "repos/" + name, nil
+	return store.NewMirror(ms, store.WithMutableOrder(fs.CompareMutable)), "repos/" + name, nil
 }
 
 func main() {

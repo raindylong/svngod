@@ -63,7 +63,25 @@ type Repo struct {
 	blockCacheMu sync.Mutex
 	blockCache   map[uint64]*RevBlock
 	blockBytes   int
+
+	// Short-lived HEAD cache: one commit issues several requests (OPTIONS,
+	// PROPFIND, REPORT, CHECKOUT, MERGE), each of which would otherwise read
+	// the current pointer from the object store. Writes that depend on a fresh
+	// answer use HeadFresh/readCurrent; a local commit refreshes the entry.
+	// Revision properties are immutable after commit; reports ask for them
+	// once per node, which on S3 turned `svn ls -R` into hundreds of GETs.
+	revPropsMu sync.Mutex
+	revProps   map[uint64]*RevProps
+
+	headMu  sync.Mutex
+	headRev uint64
+	headAt  time.Time
+	uuidMu  sync.Mutex
+	uuid    string
 }
+
+// headCacheTTL bounds how long a cached HEAD may be served.
+const headCacheTTL = 100 * time.Millisecond
 
 // blockCacheBudget bounds decoded rev blocks held per repository.
 const blockCacheBudget = 64 << 20
@@ -176,12 +194,23 @@ func (r *Repo) Store() store.Store { return r.store }
 
 // UUID returns the repository's immutable uuid string.
 func (r *Repo) UUID() (string, error) {
-	ctx := context.Background()
-	b, err := r.store.Get(ctx, r.keys.UUID(), nil)
+	// The UUID is immutable for the life of a repository; serve it from memory
+	// after the first read (an S3 GET per OPTIONS/REPORT otherwise).
+	r.uuidMu.Lock()
+	u := r.uuid
+	r.uuidMu.Unlock()
+	if u != "" {
+		return u, nil
+	}
+	b, err := r.store.Get(context.Background(), r.keys.UUID(), nil)
 	if err != nil {
 		return "", err
 	}
-	return string(b), nil
+	u = string(b)
+	r.uuidMu.Lock()
+	r.uuid = u
+	r.uuidMu.Unlock()
+	return u, nil
 }
 
 // SetUUID overwrites the repository UUID. Used by dump/load migration so a
@@ -190,7 +219,13 @@ func (r *Repo) SetUUID(u string) error {
 	if u == "" {
 		return errors.New("fs: empty uuid")
 	}
-	return r.store.Put(context.Background(), r.keys.UUID(), []byte(u))
+	if err := r.store.Put(context.Background(), r.keys.UUID(), []byte(u)); err != nil {
+		return err
+	}
+	r.uuidMu.Lock()
+	r.uuid = u
+	r.uuidMu.Unlock()
+	return nil
 }
 
 // ShardSize returns the configured shard size.
@@ -200,21 +235,44 @@ func (r *Repo) ShardSize() uint64 { return r.shardSz }
 
 // Head returns the current HEAD revision.
 func (r *Repo) Head() (uint64, error) {
+	r.headMu.Lock()
+	if !r.headAt.IsZero() && time.Since(r.headAt) < headCacheTTL {
+		rev := r.headRev
+		r.headMu.Unlock()
+		return rev, nil
+	}
+	r.headMu.Unlock()
+	return r.HeadFresh()
+}
+
+// HeadFresh reads the current pointer, bypassing the HEAD cache. Use it when a
+// stale answer could change a write decision (e.g. the base revision of a new
+// transaction).
+func (r *Repo) HeadFresh() (uint64, error) {
 	cur, _, err := r.readCurrent()
-	return cur.Head, err
+	if err != nil {
+		return 0, err
+	}
+	r.setHead(cur.Head)
+	return cur.Head, nil
+}
+
+func (r *Repo) setHead(rev uint64) {
+	r.headMu.Lock()
+	r.headRev = rev
+	r.headAt = time.Now()
+	r.headMu.Unlock()
 }
 
 func (r *Repo) readCurrent() (*Current, string, error) {
 	ctx := context.Background()
-	_, ok, err := r.store.Head(ctx, r.keys.Current())
-	if err != nil {
-		return nil, "", err
-	}
-	if !ok {
-		return nil, "", errors.New("fs: repository not initialized (missing current)")
-	}
+	// A single GET is enough: a missing object reports ErrNotFound. The extra
+	// HEAD doubled the request count for every Head()/commit on S3.
 	b, err := r.store.Get(ctx, r.keys.Current(), nil)
 	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, "", errors.New("fs: repository not initialized (missing current)")
+		}
 		return nil, "", err
 	}
 	cur, err := UnmarshalCurrent(b)
@@ -941,6 +999,7 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 	if _, err := r.store.CAS(ctx, r.keys.Current(), etag, nc.Marshal()); err != nil {
 		return 0, err
 	}
+	r.setHead(N)
 	// invalidate cached HEAD-dependent state
 	r.cache.Clear()
 	// Auto-pack the just-completed shard: when N is the last revision of a
@@ -1443,8 +1502,35 @@ func (r *Repo) CollectTexts(ctx context.Context) (int, error) {
 	return len(victims), nil
 }
 
-// GetRevProps returns a revision's properties (loose or packed).
+// revPropsCacheMax bounds the per-repository revision-property cache.
+const revPropsCacheMax = 4096
+
+// GetRevProps returns a revision's properties (loose or packed). The returned
+// value is shared and must not be mutated.
 func (r *Repo) GetRevProps(rev uint64) (*RevProps, error) {
+	r.revPropsMu.Lock()
+	if rp, ok := r.revProps[rev]; ok {
+		r.revPropsMu.Unlock()
+		return rp, nil
+	}
+	r.revPropsMu.Unlock()
+	rp, err := r.loadRevProps(rev)
+	if err != nil {
+		return nil, err
+	}
+	r.revPropsMu.Lock()
+	if r.revProps == nil {
+		r.revProps = make(map[uint64]*RevProps)
+	}
+	if len(r.revProps) >= revPropsCacheMax {
+		r.revProps = make(map[uint64]*RevProps)
+	}
+	r.revProps[rev] = rp
+	r.revPropsMu.Unlock()
+	return rp, nil
+}
+
+func (r *Repo) loadRevProps(rev uint64) (*RevProps, error) {
 	ctx := context.Background()
 	sh := r.shard(rev)
 	packed, err := r.isPacked(sh)

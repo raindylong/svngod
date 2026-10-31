@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"strings"
 	"sync"
@@ -45,11 +47,44 @@ type MirrorStore struct {
 
 	// repairOnce dedupes concurrent repair runs.
 	repairOnce sync.Mutex
+
+	// mutableOrder orders two values of a mutable key (<0: a older than b).
+	// fs sets it so a rejoining mirror cannot overwrite a newer HEAD pointer
+	// with its stale copy. Without it, values are treated as equal.
+	mutableOrder func(key string, a, b []byte) int
 }
 
-// NewMirror builds a MirrorStore over the given backends and starts the
-// background repair loop.
-func NewMirror(mirrors []Store) *MirrorStore {
+// SetMutableOrder installs the ordering used to reconcile mutable objects
+// (the HEAD pointer) across mirrors during repair.
+func (m *MirrorStore) SetMutableOrder(fn func(key string, a, b []byte) int) {
+	m.mu.Lock()
+	m.mutableOrder = fn
+	m.mu.Unlock()
+}
+
+func (m *MirrorStore) order(key string, a, b []byte) int {
+	m.mu.Lock()
+	fn := m.mutableOrder
+	m.mu.Unlock()
+	if fn == nil {
+		return 0
+	}
+	return fn(key, a, b)
+}
+
+// MirrorOption configures a MirrorStore before its initial repair.
+type MirrorOption func(*MirrorStore)
+
+// WithMutableOrder installs the ordering used to reconcile mutable objects
+// (the HEAD pointer) during repair. It must be supplied before NewMirror's
+// initial alignment pass runs, which is why it is an option.
+func WithMutableOrder(fn func(key string, a, b []byte) int) MirrorOption {
+	return func(m *MirrorStore) { m.mutableOrder = fn }
+}
+
+// NewMirror builds a MirrorStore over the given backends, aligns them, and
+// starts the background repair loop.
+func NewMirror(mirrors []Store, opts ...MirrorOption) *MirrorStore {
 	if len(mirrors) < 2 {
 		panic("MirrorStore requires at least 2 mirrors")
 	}
@@ -63,9 +98,13 @@ func NewMirror(mirrors []Store) *MirrorStore {
 	for i := range m.healthy {
 		m.healthy[i] = true
 	}
-	// Initial alignment pass (cheap when mirrors are already consistent), then
-	// the periodic loop.
-	go func() { m.repair() }()
+	for _, opt := range opts {
+		opt(m)
+	}
+	// Align the mirrors before serving: a mirror that comes back after an
+	// outage may be missing objects or (worse) hold an older HEAD pointer, and
+	// electing it before it is caught up would hide committed revisions.
+	m.repairInternal()
 	go m.repairLoop()
 	return m
 }
@@ -89,9 +128,15 @@ func (m *MirrorStore) Close() {
 func isControlKey(key string) bool {
 	base := key[strings.LastIndex(key, "/")+1:]
 	switch {
-	case base == "current", base == "format", base == "uuid":
+	case base == "current", base == "format", base == "uuid", base == "locks.json":
+		// locks.json is the mutable lock table (dav-locks/locks.json).
 		return true
 	case strings.Contains(key, "/locks/"), strings.Contains(key, "/dav-activities/"):
+		return true
+	case strings.Contains(key, "/dav-txns/") && !strings.Contains(key, "/dav-txns/data/"):
+		// Session manifests are rewritten on every PUT, so a standby may hold
+		// an older copy; start-up recovery must read the primary. The bodies
+		// under dav-txns/data are content addressed and safe anywhere.
 		return true
 	}
 	return false
@@ -113,10 +158,15 @@ func (m *MirrorStore) setHealthy(i int, ok bool) {
 	m.mu.Unlock()
 }
 
-// primary returns the current primary store (first healthy mirror).
+// primary returns the current primary store. The elected mirror stays primary
+// while it is healthy, so a mirror that just finished catching up never starts
+// serving ahead of the one that has been taking writes.
 func (m *MirrorStore) primary() (Store, int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.healthy[m.prim] {
+		return m.mirrors[m.prim], m.prim
+	}
 	for i, h := range m.healthy {
 		if h {
 			m.prim = i
@@ -143,65 +193,42 @@ func (m *MirrorStore) Put(ctx context.Context, key string, data []byte) error {
 		return err
 	}
 	// Best-effort mirror to healthy standbys.
-	for i, s := range m.mirrors {
-		if i == pi || !m.isHealthy(i) {
-			continue
-		}
-		if err := s.Put(ctx, key, data); err != nil {
-			m.markDown(i)
-			fmt.Printf("mirror[%d] standby Put %q failed: %v\n", i, key, err)
-		}
-	}
+	m.mirrorWrites(ctx, pi, func(s Store) error { return s.Put(ctx, key, data) })
 	return nil
 }
 
 func (m *MirrorStore) Get(ctx context.Context, key string, rng *Range) ([]byte, error) {
-	if isControlKey(key) {
-		p, pi := m.primary()
-		b, err := p.Get(ctx, key, rng)
-		if err != nil {
-			m.markDown(pi)
-			// Failover for reads: the primary's control key (e.g. current) is
-			// unavailable, so fall back to a healthy standby mirror so HEAD
-			// lookups still work. Writes are unaffected (Put still fails when
-			// the primary is down, a sane degraded mode).
-			n := len(m.mirrors)
-			for step := 1; step < n; step++ {
-				idx := (pi + step) % n
-				if !m.isHealthy(idx) {
-					continue
-				}
-				bb, e := m.mirrors[idx].Get(ctx, key, rng)
-				if e == nil {
-					return bb, nil
-				}
-				m.markDown(idx)
-			}
-			return nil, err
-		}
-		return b, nil
-	}
-	// Data: round-robin across healthy mirrors starting after the primary.
-	_, pi := m.primary()
-	n := len(m.mirrors)
-	for step := 0; step < n; step++ {
-		idx := (pi + 1 + step) % n
-		if !m.isHealthy(idx) {
-			continue
-		}
-		b, err := m.mirrors[idx].Get(ctx, key, rng)
-		if err == nil {
-			return b, nil
-		}
-		m.markDown(idx)
-	}
-	// Last resort: primary itself.
+	// Read the primary first: it is the only copy guaranteed to have every
+	// object written so far (a standby write is best effort and may still be
+	// in flight). Fall back to standbys without marking them down when they
+	// simply do not have the object yet.
 	p, pi := m.primary()
 	b, err := p.Get(ctx, key, rng)
 	if err == nil {
 		return b, nil
 	}
-	m.markDown(pi)
+	if isControlKey(key) && errors.Is(err, ErrNotFound) {
+		// The primary is authoritative for mutable state: a standby copy is
+		// either the same or stale, so do not fall back to it.
+		return nil, err
+	}
+	if !errors.Is(err, ErrNotFound) {
+		m.markDown(pi)
+	}
+	n := len(m.mirrors)
+	for step := 1; step < n; step++ {
+		idx := (pi + step) % n
+		if !m.isHealthy(idx) {
+			continue
+		}
+		bb, e := m.mirrors[idx].Get(ctx, key, rng)
+		if e == nil {
+			return bb, nil
+		}
+		if !errors.Is(e, ErrNotFound) {
+			m.markDown(idx)
+		}
+	}
 	return nil, err
 }
 
@@ -233,125 +260,125 @@ func (m *MirrorStore) PutFrom(ctx context.Context, key string, r io.Reader, size
 		m.markDown(pi)
 		return err
 	}
-	for i, s := range m.mirrors {
-		if i == pi || !m.isHealthy(i) {
-			continue
-		}
+	m.mirrorWrites(ctx, pi, func(s Store) error {
 		f, oerr := os.Open(tmpName)
 		if oerr != nil {
-			continue
+			return oerr
 		}
-		if perr := s.PutFrom(ctx, key, f, size); perr != nil {
-			m.markDown(i)
-		}
-		f.Close()
-	}
+		defer f.Close()
+		return s.PutFrom(ctx, key, f, size)
+	})
 	return nil
 }
 
-// Exists asks the primary (control objects) or any healthy mirror.
+// Exists asks the primary first, then any healthy standby.
 func (m *MirrorStore) Exists(ctx context.Context, key string) (bool, error) {
-	if isControlKey(key) {
-		p, _ := m.primary()
-		return p.Exists(ctx, key)
+	p, pi := m.primary()
+	ok, err := p.Exists(ctx, key)
+	if err == nil && ok {
+		return true, nil
 	}
-	_, pi := m.primary()
+	if isControlKey(key) && err == nil {
+		return false, nil
+	}
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		m.markDown(pi)
+	}
 	n := len(m.mirrors)
-	for step := 0; step < n; step++ {
-		idx := (pi + 1 + step) % n
+	for step := 1; step < n; step++ {
+		idx := (pi + step) % n
 		if !m.isHealthy(idx) {
 			continue
 		}
-		if ok, err := m.mirrors[idx].Exists(ctx, key); err == nil && ok {
+		ok, e := m.mirrors[idx].Exists(ctx, key)
+		if e == nil && ok {
 			return true, nil
 		}
+		if e != nil && !errors.Is(e, ErrNotFound) {
+			m.markDown(idx)
+		}
 	}
-	p, _ := m.primary()
-	return p.Exists(ctx, key)
+	return false, err
 }
 
-// GetTo streams an object, preferring the same mirror Get would read from.
+// GetTo streams an object from the primary, falling back only when the
+// primary wrote nothing yet (retrying after a partial write would duplicate
+// bytes in w).
 func (m *MirrorStore) GetTo(ctx context.Context, key string, w io.Writer) (int64, error) {
-	if isControlKey(key) {
-		p, pi := m.primary()
-		n, err := p.GetTo(ctx, key, w)
-		if err == nil {
-			return n, nil
-		}
-		m.markDown(pi)
-		for step := 1; step < len(m.mirrors); step++ {
-			idx := (pi + step) % len(m.mirrors)
-			if !m.isHealthy(idx) {
-				continue
-			}
-			if n, e := m.mirrors[idx].GetTo(ctx, key, w); e == nil {
-				return n, nil
-			}
-		}
+	p, pi := m.primary()
+	n, err := p.GetTo(ctx, key, w)
+	if err == nil {
+		return n, nil
+	}
+	if n > 0 {
 		return n, err
 	}
-	_, pi := m.primary()
-	n := len(m.mirrors)
-	for step := 0; step < n; step++ {
-		idx := (pi + 1 + step) % n
-		if !m.isHealthy(idx) {
-			continue
-		}
-		if got, err := m.mirrors[idx].GetTo(ctx, key, w); err == nil {
-			return got, nil
-		}
-		m.markDown(idx)
+	if isControlKey(key) && errors.Is(err, ErrNotFound) {
+		return 0, err
 	}
-	p, pi := m.primary()
-	got, err := p.GetTo(ctx, key, w)
-	if err != nil {
+	if !errors.Is(err, ErrNotFound) {
 		m.markDown(pi)
 	}
-	return got, err
-}
-
-func (m *MirrorStore) Head(ctx context.Context, key string) (string, bool, error) {
-	if isControlKey(key) {
-		p, pi := m.primary()
-		etag, ok, err := p.Head(ctx, key)
-		if err != nil {
-			m.markDown(pi)
-		}
-		return etag, ok, err
-	}
-	_, pi := m.primary()
-	n := len(m.mirrors)
-	for step := 0; step < n; step++ {
-		idx := (pi + 1 + step) % n
+	total := len(m.mirrors)
+	for step := 1; step < total; step++ {
+		idx := (pi + step) % total
 		if !m.isHealthy(idx) {
 			continue
 		}
-		etag, ok, err := m.mirrors[idx].Head(ctx, key)
-		if err == nil {
-			return etag, ok, nil
+		got, e := m.mirrors[idx].GetTo(ctx, key, w)
+		if e == nil {
+			return got, nil
 		}
-		m.markDown(idx)
+		if got > 0 {
+			return got, e
+		}
+		if !errors.Is(e, ErrNotFound) {
+			m.markDown(idx)
+		}
 	}
-	p, pi := m.primary()
-	return p.Head(ctx, key)
+	return n, err
 }
 
+// Head asks the primary first, falling back to standbys.
+func (m *MirrorStore) Head(ctx context.Context, key string) (string, bool, error) {
+	p, pi := m.primary()
+	etag, ok, err := p.Head(ctx, key)
+	if err == nil && ok {
+		return etag, ok, nil
+	}
+	if isControlKey(key) && err == nil {
+		return etag, false, nil
+	}
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		m.markDown(pi)
+	}
+	n := len(m.mirrors)
+	for step := 1; step < n; step++ {
+		idx := (pi + step) % n
+		if !m.isHealthy(idx) {
+			continue
+		}
+		etag, ok, e := m.mirrors[idx].Head(ctx, key)
+		if e == nil && ok {
+			return etag, ok, nil
+		}
+		if e != nil && !errors.Is(e, ErrNotFound) {
+			m.markDown(idx)
+		}
+	}
+	return etag, ok, err
+}
+
+// CreateIfAbsent creates the object on the primary (the only place the lock
+// must be atomic) and overwrites it on standbys: a standby that already holds
+// the same lock object must not be treated as a failure.
 func (m *MirrorStore) CreateIfAbsent(ctx context.Context, key string, data []byte) error {
 	p, pi := m.primary()
 	if err := p.CreateIfAbsent(ctx, key, data); err != nil {
 		m.markDown(pi)
 		return err
 	}
-	// The commit lock only matters on the primary; mirror the object so a
-	// failover sees the same lock, but a standby failure is not fatal.
-	for i, s := range m.mirrors {
-		if i == pi || !m.isHealthy(i) {
-			continue
-		}
-		if err := s.CreateIfAbsent(ctx, key, data); err != nil {
-			m.markDown(i)
-		}
-	}
+	m.mirrorWrites(ctx, pi, func(s Store) error { return s.Put(ctx, key, data) })
 	return nil
 }
 
@@ -364,14 +391,7 @@ func (m *MirrorStore) CAS(ctx context.Context, key string, expectETag string, da
 	}
 	// Standbys mirror the current value unconditionally (their own etag does
 	// not matter; they only serve reads after failover).
-	for i, s := range m.mirrors {
-		if i == pi || !m.isHealthy(i) {
-			continue
-		}
-		if err := s.Put(ctx, key, data); err != nil {
-			m.markDown(i)
-		}
-	}
+	m.mirrorWrites(ctx, pi, func(s Store) error { return s.Put(ctx, key, data) })
 	return newEtag, nil
 }
 
@@ -391,15 +411,28 @@ func (m *MirrorStore) Delete(ctx context.Context, keys []string) error {
 		m.markDown(pi)
 		return err
 	}
+	m.mirrorWrites(ctx, pi, func(s Store) error { return s.Delete(ctx, keys) })
+	return nil
+}
+
+// mirrorWrites fans a standby write out to every healthy mirror in parallel:
+// standbys are best effort, so their latency must not add to the request.
+func (m *MirrorStore) mirrorWrites(ctx context.Context, pi int, fn func(Store) error) {
+	var wg sync.WaitGroup
 	for i, s := range m.mirrors {
 		if i == pi || !m.isHealthy(i) {
 			continue
 		}
-		if err := s.Delete(ctx, keys); err != nil {
-			m.markDown(i)
-		}
+		wg.Add(1)
+		go func(i int, s Store) {
+			defer wg.Done()
+			if err := fn(s); err != nil {
+				m.markDown(i)
+				fmt.Printf("mirror[%d] standby write failed: %v\n", i, err)
+			}
+		}(i, s)
 	}
-	return nil
+	wg.Wait()
 }
 
 // --- self-healing repair ---
@@ -432,58 +465,138 @@ func (m *MirrorStore) repair() {
 }
 
 // repairInternal is one repair pass; callers coordinate with repairOnce.
+//
+// It is deliberately symmetric: every reachable mirror is treated as a source
+// for objects the others lack. Electing one "primary" as the only source was
+// unsafe -- after a failover the returning ex-primary is stale, and copying
+// from it could hide revisions committed on the standby (and overwrite the
+// newer HEAD with its old one).
 func (m *MirrorStore) repairInternal() {
-	p, pi := m.primary()
-	keys, err := listAll(context.Background(), p)
-	if err != nil {
-		return
-	}
-	for i, s := range m.mirrors {
-		if i == pi {
-			continue
-		}
-		if !m.isHealthy(i) {
-			// A down mirror must be fully caught up before re-entering service.
-			if err := m.catchUp(s, p, keys); err != nil {
-				continue // still down; retry next cycle
+	// List every mirror in parallel with its own deadline: one unreachable
+	// backend must not consume the budget of the others (which previously left
+	// all mirrors marked down just because the primary was slow to fail).
+	n := len(m.mirrors)
+	sets := make([]map[string]bool, n)
+	reachable := make([]bool, n)
+	var wg sync.WaitGroup
+	for i := range m.mirrors {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), repairTimeout)
+			defer cancel()
+			ks, err := listAll(ctx, m.mirrors[i])
+			if err != nil {
+				log.Printf("mirror[%d] unreachable during repair: %v", i, err)
+				return
 			}
-			m.setHealthy(i, true)
+			reachable[i] = true
+			set := make(map[string]bool, len(ks))
+			for _, k := range ks {
+				set[k] = true
+			}
+			sets[i] = set
+		}(i)
+	}
+	wg.Wait()
+
+	keys := make(map[string]bool)
+	for i := range sets {
+		for k := range sets[i] {
+			keys[k] = true
+		}
+	}
+	// A mirror with every object is complete; anything missing keeps it out of
+	// service until the background loop has copied the data (a healed mirror
+	// must not serve reads for objects it lacks).
+	need := make([]bool, n)
+	for i := range m.mirrors {
+		need[i] = reachable[i] && len(sets[i]) < len(keys)
+	}
+	failed := make([]bool, n)
+
+	ctx, cancel := context.WithTimeout(context.Background(), repairTimeout)
+	defer cancel()
+	for k := range keys {
+		if isMutableKey(k) {
+			m.reconcileMutable(ctx, k, sets, reachable)
 			continue
 		}
-		// A healthy mirror may still have drifted; repair is cheap to verify.
-		_ = m.catchUp(s, p, keys)
+		var val []byte
+		for i := range m.mirrors {
+			if !reachable[i] || !sets[i][k] {
+				continue
+			}
+			b, err := m.mirrors[i].Get(ctx, k, nil)
+			if err != nil {
+				continue
+			}
+			val = b
+			break
+		}
+		if val == nil {
+			continue
+		}
+		for i := range m.mirrors {
+			if !reachable[i] || sets[i][k] {
+				continue
+			}
+			if ctx.Err() != nil {
+				failed[i] = true
+				continue
+			}
+			if err := m.mirrors[i].Put(ctx, k, val); err != nil {
+				log.Printf("mirror[%d] repair put %q: %v", i, k, err)
+				failed[i] = true
+			}
+		}
+	}
+
+	for i := range m.mirrors {
+		// Complete now when it already had everything, or when everything it
+		// was missing has just been copied successfully.
+		m.setHealthy(i, reachable[i] && !failed[i] && (len(sets[i]) == len(keys) || need[i]))
 	}
 }
 
-// catchUp copies any object present on the primary but missing on dst, and
-// always mirrors mutable objects (current HEAD pointer) since the primary is
-// authoritative for them even when the standby holds an older value.
-func (m *MirrorStore) catchUp(dst, src Store, keys []string) error {
-	ctx := context.Background()
-	for _, k := range keys {
-		if isMutableKey(k) {
-			data, err := src.Get(ctx, k, nil)
-			if err != nil {
-				return err
-			}
-			if err := dst.Put(ctx, k, data); err != nil {
-				return err
-			}
+// reconcileMutable picks the newest value of a mutable key and writes it to
+// every reachable mirror that is missing it or holds an older one.
+func (m *MirrorStore) reconcileMutable(ctx context.Context, k string, sets []map[string]bool, reachable []bool) {
+	var best []byte
+	for i := range m.mirrors {
+		if !reachable[i] || !sets[i][k] {
 			continue
 		}
-		_, exists, err := dst.Head(ctx, k)
-		if err != nil || !exists {
-			data, err := src.Get(ctx, k, nil)
-			if err != nil {
-				return err
-			}
-			if err := dst.Put(ctx, k, data); err != nil {
-				return err
-			}
+		b, err := m.mirrors[i].Get(ctx, k, nil)
+		if err != nil {
+			continue
+		}
+		if best == nil || m.order(k, b, best) > 0 {
+			best = b
 		}
 	}
-	return nil
+	if best == nil {
+		return
+	}
+	for i := range m.mirrors {
+		if !reachable[i] {
+			continue
+		}
+		if sets[i][k] {
+			cur, err := m.mirrors[i].Get(ctx, k, nil)
+			if err == nil && m.order(k, best, cur) <= 0 {
+				continue // already the newest
+			}
+		}
+		if err := m.mirrors[i].Put(ctx, k, best); err != nil {
+			log.Printf("mirror[%d] repair put %q: %v", i, k, err)
+			reachable[i] = false
+		}
+	}
 }
+
+// repairTimeout bounds one repair pass over all mirrors.
+const repairTimeout = 5 * time.Second
 
 // isMutableKey reports whether an object's content must always be mirrored
 // from the primary (the only mutable object today is the HEAD `current`).

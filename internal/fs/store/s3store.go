@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -43,7 +45,18 @@ type S3Store struct {
 // gateway returns stable HEAD ETags. The bucket is created idempotently on
 // first use.
 func NewS3Store(cfg S3Config) (*S3Store, error) {
-	opt := &minio.Options{BucketLookup: minio.BucketLookupAuto, Secure: cfg.UseSSL}
+	// A short dial timeout bounds failover latency: without it a dead primary
+	// costs several seconds of retries on the first request after it goes away.
+	tr := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 2 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	opt := &minio.Options{BucketLookup: minio.BucketLookupAuto, Secure: cfg.UseSSL, Transport: tr}
 	if cfg.Region != "" {
 		opt.Region = cfg.Region
 	}
@@ -56,14 +69,19 @@ func NewS3Store(cfg S3Config) (*S3Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: init s3 client: %w", err)
 	}
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	exists, err := cl.BucketExists(ctx, cfg.Bucket)
+	cancel()
 	if err != nil {
 		// Reverse proxies (nginx in front of RustFS) commonly answer the
 		// bucket-root HEAD probe with a 301 redirect even though object-path
-		// requests work fine. Treat such gateway-level redirects as "bucket
-		// exists" and let the first object write surface a real problem.
-		if merr := minio.ToErrorResponse(err); merr.StatusCode == 301 || merr.StatusCode == 307 || merr.StatusCode == 405 || merr.StatusCode == 403 || merr.StatusCode == 401 {
+		// requests work fine. A transport failure is handled the same way: a
+		// mirror whose primary is down at startup must still come up so the
+		// standby can serve; the first object operation reports a real error.
+		merr := minio.ToErrorResponse(err)
+		if merr.StatusCode == 0 && merr.Code == "" {
+			exists = true
+		} else if merr.StatusCode == 301 || merr.StatusCode == 307 || merr.StatusCode == 405 || merr.StatusCode == 403 || merr.StatusCode == 401 {
 			// Gateway-level redirects and RustFS denying bucket-root HEAD
 			// probes are both compatible with fully-working object-path I/O;
 			// let the first object write surface a real problem.
@@ -95,9 +113,13 @@ func joinKey(a, b string) string {
 
 func (s *S3Store) key(rel string) string { return joinKey(s.prefix, rel) }
 
+// singlePut is used for every object: one PUT up to 5 GiB instead of a
+// multipart upload. svngod's largest object is a 512 MiB text, so multipart
+// only added round trips (and required the gateway to implement it).
+var singlePut = minio.PutObjectOptions{ContentType: "application/octet-stream", PartSize: 5 << 30}
+
 func (s *S3Store) Put(ctx context.Context, key string, data []byte) error {
-	_, err := s.client.PutObject(ctx, s.bucket, s.key(key), bytes.NewReader(data),
-		int64(len(data)), minio.PutObjectOptions{ContentType: "application/octet-stream"})
+	_, err := s.client.PutObject(ctx, s.bucket, s.key(key), bytes.NewReader(data), int64(len(data)), singlePut)
 	return err
 }
 
@@ -129,16 +151,19 @@ func (s *S3Store) Get(ctx context.Context, key string, rng *Range) ([]byte, erro
 }
 
 func (s *S3Store) PutFrom(ctx context.Context, key string, r io.Reader, size int64) error {
-	_, err := s.client.PutObject(ctx, s.bucket, s.key(key), io.LimitReader(r, size), size,
-		minio.PutObjectOptions{ContentType: "application/octet-stream"})
+	_, err := s.client.PutObject(ctx, s.bucket, s.key(key), io.LimitReader(r, size), size, singlePut)
 	return err
+}
+
+func isNotFound(err error) bool {
+	resp := minio.ToErrorResponse(err)
+	return resp.StatusCode == http.StatusNotFound || resp.Code == "NoSuchKey" || resp.Code == "NoSuchBucket"
 }
 
 func (s *S3Store) Exists(ctx context.Context, key string) (bool, error) {
 	_, err := s.client.StatObject(ctx, s.bucket, s.key(key), minio.StatObjectOptions{})
 	if err != nil {
-		resp := minio.ToErrorResponse(err)
-		if resp.StatusCode == http.StatusNotFound || resp.Code == "NoSuchKey" {
+		if isNotFound(err) {
 			return false, nil
 		}
 		return false, err
@@ -207,21 +232,30 @@ func (s *S3Store) CreateIfAbsent(ctx context.Context, key string, data []byte) e
 // gets a 412 and ErrPreconditionFailed. Without the conditional write this was
 // a TOCTOU check and silently dropped a committed revision.
 func (s *S3Store) CAS(ctx context.Context, key string, expectETag string, data []byte) (string, error) {
-	cur, err := s.Get(ctx, key, nil)
+	info, err := s.client.StatObject(ctx, s.bucket, s.key(key), minio.StatObjectOptions{})
 	if err != nil {
-		if errors.Is(err, ErrNotFound) {
+		if isNotFound(err) {
 			return "", ErrNotFound
 		}
 		return "", err
 	}
-	if ContentETag(cur) != expectETag {
-		return "", ErrPreconditionFailed
-	}
-	info, err := s.client.StatObject(ctx, s.bucket, s.key(key), minio.StatObjectOptions{})
-	if err != nil {
-		return "", err
-	}
 	etag := strings.Trim(info.ETag, `"`)
+	// S3 (and MinIO) return the content MD5 as the ETag of a single-part
+	// object, so a matching stat ETag proves the stored bytes are the ones the
+	// caller based its change on and the body does not need to be read again.
+	// Gateways with opaque ETags fall back to reading and hashing the body.
+	if etag != expectETag {
+		cur, gerr := s.Get(ctx, key, nil)
+		if gerr != nil {
+			if errors.Is(gerr, ErrNotFound) {
+				return "", ErrNotFound
+			}
+			return "", gerr
+		}
+		if ContentETag(cur) != expectETag {
+			return "", ErrPreconditionFailed
+		}
+	}
 	opts := minio.PutObjectOptions{ContentType: "application/octet-stream"}
 	opts.SetMatchETag(etag)
 	_, err = s.client.PutObject(ctx, s.bucket, s.key(key), bytes.NewReader(data), int64(len(data)), opts)

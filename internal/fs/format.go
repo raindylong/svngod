@@ -193,3 +193,29 @@ func UnmarshalFormat(b []byte) (*Format, error) {
 	}
 	return f, nil
 }
+
+// CompareMutable orders the values of a mutable mirror key. Only the HEAD
+// pointer (…/current) has a meaningful order: the higher revision (then the
+// later creation time) wins, so a stale mirror cannot roll a repository back
+// when it rejoins and repair reconciles the copies.
+func CompareMutable(key string, a, b []byte) int {
+	if !strings.HasSuffix(key, "/current") {
+		return 0
+	}
+	ca, ea := UnmarshalCurrent(a)
+	cb, eb := UnmarshalCurrent(b)
+	if ea != nil || eb != nil {
+		return bytes.Compare(a, b)
+	}
+	switch {
+	case ca.Head < cb.Head:
+		return -1
+	case ca.Head > cb.Head:
+		return 1
+	case ca.Created < cb.Created:
+		return -1
+	case ca.Created > cb.Created:
+		return 1
+	}
+	return 0
+}

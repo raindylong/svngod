@@ -93,7 +93,8 @@ type Server struct {
 	locks       map[string]*lockEntry // key: repo + "\x00" + path
 	locksLoaded map[string]bool       // repositories whose persisted locks were restored
 	stateLoaded map[string]bool       // repositories whose persisted activities were restored
-	repoCache   map[string]*fs.Repo   // per-name repo singletons (shared r.mu)
+	repoMapMu   sync.Mutex
+	repoCache   map[string]*fs.Repo // per-name repo singletons (shared r.mu)
 }
 
 // New builds a Server.
@@ -314,9 +315,9 @@ func (s *Server) repo(w http.ResponseWriter, res resource) (*fs.Repo, bool) {
 	// Reuse a per-repo singleton so concurrent requests share the Repo's
 	// commit mutex: CommitTxn then serialises cleanly while still committing
 	// disjoint-path changes as interleaved revisions (path-level OOD check).
-	s.mu.Lock()
+	s.repoMapMu.Lock()
 	r := s.repoCache[res.repo]
-	s.mu.Unlock()
+	s.repoMapMu.Unlock()
 	if r != nil {
 		s.ensureLocksLoaded(res.repo, r)
 		s.ensureActivitiesLoaded(res.repo, r)
@@ -331,12 +332,12 @@ func (s *Server) repo(w http.ResponseWriter, res resource) (*fs.Repo, bool) {
 		}
 		return nil, false
 	}
-	s.mu.Lock()
+	s.repoMapMu.Lock()
 	if prev := s.repoCache[res.repo]; prev != nil {
 		ropen = prev
 	}
 	s.repoCache[res.repo] = ropen
-	s.mu.Unlock()
+	s.repoMapMu.Unlock()
 	s.ensureLocksLoaded(res.repo, ropen)
 	s.ensureActivitiesLoaded(res.repo, ropen)
 	return ropen, true

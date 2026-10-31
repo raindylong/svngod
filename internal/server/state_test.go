@@ -283,3 +283,107 @@ func TestDeltaTxnPersistsAcrossServerInstances(t *testing.T) {
 		t.Fatal("content mismatch after restart")
 	}
 }
+
+// TestFragmentsRestoreAllChangeKinds stages an add, a mkdir, a delete and a
+// property change in one transaction, restarts the server, and checks that
+// every change survives (session state is per-change fragments, not a
+// monolithic manifest).
+func TestFragmentsRestoreAllChangeKinds(t *testing.T) {
+	st := store.NewMemoryStore()
+	repo0, err := fs.CreateRepo(st, "frag", 4096, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo0.CommitTxn(0, []fs.Change{
+		{Path: "/keep.txt", Action: fs.ActionAdd, Kind: fs.KindFile, Data: []byte("keep")},
+		{Path: "/gone.txt", Action: fs.ActionAdd, Kind: fs.KindFile, Data: []byte("gone")},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	newServer := func() (*httptest.Server, *fs.Repo) {
+		repo, err := fs.OpenRepo(st, "frag")
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv := New(Config{
+			BasePath: "/svn",
+			OpenRepo: func(name string) (*fs.Repo, error) {
+				if name != "frag" {
+					return nil, fs.ErrRepoNotFound
+				}
+				return repo, nil
+			},
+		})
+		return httptest.NewServer(srv.Handler()), repo
+	}
+
+	ts1, _ := newServer()
+	base := ts1.URL + "/svn/frag"
+	resp := doRequest(t, "MKACTIVITY", base+"/!svn/act/u-frag", "", "", "", nil)
+	if resp.StatusCode != 201 {
+		t.Fatalf("MKACTIVITY=%d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	checkout := `<?xml version="1.0"?><D:checkout xmlns:D="DAV:"><D:activity-set><D:href>` +
+		base + `/!svn/act/u-frag</D:href></D:activity-set></D:checkout>`
+	resp = doRequest(t, "CHECKOUT", base+"/!svn/vcc/default", checkout, "", "", nil)
+	if resp.StatusCode != 201 {
+		t.Fatalf("CHECKOUT=%d", resp.StatusCode)
+	}
+	txn := strings.TrimSuffix(resp.Header.Get("Location"), "/")
+	resp.Body.Close()
+
+	resp = doRequest(t, "PUT", txn+"/new.txt", "hello new", "", "", nil)
+	if resp.StatusCode != 201 {
+		t.Fatalf("PUT=%d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	resp = doRequest(t, "MKCOL", txn+"/newdir", "", "", "", nil)
+	if resp.StatusCode != 201 {
+		t.Fatalf("MKCOL=%d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	resp = doRequest(t, "DELETE", txn+"/gone.txt", "", "", "", nil)
+	if resp.StatusCode != 204 {
+		t.Fatalf("DELETE=%d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	pp := `<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:" xmlns:C="http://subversion.tigris.org/xmlns/custom/">` +
+		`<D:set><D:prop><C:flag>on</C:flag></D:prop></D:set></D:propertyupdate>`
+	resp = doRequest(t, "PROPPATCH", txn+"/keep.txt", pp, "", "", nil)
+	if resp.StatusCode != 207 {
+		t.Fatalf("PROPPATCH=%d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	ts1.Close()
+	ts2, repo2 := newServer()
+	defer ts2.Close()
+	base2 := ts2.URL + "/svn/frag"
+	merge := `<?xml version="1.0"?><D:merge xmlns:D="DAV:"><D:source><D:href>` +
+		base2 + `/!svn/act/u-frag</D:href></D:source></D:merge>`
+	resp = doRequest(t, "MERGE", base2+"/!svn/vcc/default", merge, "", "", nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("MERGE after restart=%d body=%s", resp.StatusCode, bodyOf(t, resp))
+	}
+	resp.Body.Close()
+
+	if nr, err := repo2.Resolve(2, "/new.txt"); err != nil {
+		t.Fatalf("new.txt: %v", err)
+	} else if txt, _ := repo2.GetText(nr.Node); string(txt) != "hello new" {
+		t.Fatalf("new.txt content=%q", txt)
+	}
+	if nr, err := repo2.Resolve(2, "/newdir"); err != nil || nr.Kind != fs.KindDir {
+		t.Fatalf("newdir: nr=%v err=%v", nr, err)
+	}
+	if _, err := repo2.Resolve(2, "/gone.txt"); err == nil {
+		t.Fatal("gone.txt still present after delete")
+	}
+	nr, err := repo2.Resolve(2, "/keep.txt")
+	if err != nil {
+		t.Fatalf("keep.txt: %v", err)
+	}
+	if nr.Props["flag"] != "on" {
+		t.Fatalf("keep.txt props=%v", nr.Props)
+	}
+}
