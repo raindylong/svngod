@@ -43,6 +43,18 @@ func (r *Repo) storeChunkedReader(ctx context.Context, rd io.Reader) ([]byte, in
 		go func() {
 			defer wg.Done()
 			for j := range jobs {
+				ok, err := r.store.Exists(ctx, j.key)
+				if err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					errMu.Unlock()
+					continue
+				}
+				if ok {
+					continue
+				}
 				if err := r.store.Put(ctx, j.key, j.data); err != nil {
 					errMu.Lock()
 					if firstErr == nil {
@@ -58,19 +70,13 @@ func (r *Repo) storeChunkedReader(ctx context.Context, rd io.Reader) ([]byte, in
 	err := cdc.Split(rd, func(data []byte) error {
 		sum := sha256.Sum256(data)
 		ref := cdc.Ref{Size: uint32(len(data)), Hash: sum}
-		key := r.chunkKey(ref)
 		refs = append(refs, ref)
 		total += int64(len(data))
-		ok, eerr := r.store.Exists(ctx, key)
-		if eerr != nil {
-			return eerr
-		}
-		if ok {
-			return nil
-		}
+		// Existence check and write both happen on the pool: on S3 a HEAD
+		// costs a round trip and doing it inline serialised the whole upload.
 		cp := append([]byte(nil), data...)
 		select {
-		case jobs <- job{key: key, data: cp}:
+		case jobs <- job{key: r.chunkKey(ref), data: cp}:
 			return nil
 		case <-ctx.Done():
 			return ctx.Err()

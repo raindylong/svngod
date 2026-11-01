@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"svngod/internal/cdc"
@@ -331,34 +332,27 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 			for _, h := range bc.Missing {
 				missing[strings.ToLower(h)] = true
 			}
+			var missingBytes int64
 			for _, ref := range refs {
-				hexh := cdc.HashHex(ref)
-				if missing[hexh] {
-					data := make([]byte, ref.Size)
-					if _, rerr := io.ReadFull(r.Body, data); rerr != nil {
-						http.Error(w, "short chunk", http.StatusBadRequest)
-						return
-					}
-					chunkBytes += int64(ref.Size)
-					if chunkBytes > maxBundleTotal {
-						http.Error(w, "bundle chunks too large", http.StatusRequestEntityTooLarge)
-						return
-					}
-					if sum := sha256.Sum256(data); sum != ref.Hash {
-						http.Error(w, "chunk checksum mismatch", http.StatusBadRequest)
-						return
-					}
-					if err := repo.Store().Put(ctx, repo.Keys().Chunk(hexh), data); err != nil {
-						http.Error(w, err.Error(), http.StatusInternalServerError)
-						return
-					}
-					continue
+				if missing[cdc.HashHex(ref)] {
+					missingBytes += int64(ref.Size)
 				}
-				ok, eerr := repo.Store().Exists(ctx, repo.Keys().Chunk(hexh))
-				if eerr != nil || !ok {
+			}
+			chunkBytes += missingBytes
+			if chunkBytes > maxBundleTotal {
+				http.Error(w, "bundle chunks too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			if err := storeChunksParallel(ctx, repo, refs, missing, r.Body); err != nil {
+				switch {
+				case errors.Is(err, errBundleChunkMissing):
 					writeBundleError(w, http.StatusConflict, "chunk-missing", "a chunk disappeared; retry the upload")
-					return
+				case errors.Is(err, errBundleChunkStore):
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+				default:
+					http.Error(w, "chunk upload: "+err.Error(), http.StatusBadRequest)
 				}
+				return
 			}
 			ch.ChunkManifest = cdc.Marshal(refs)
 			ch.ChunkTotal = bc.ChunkTotal
@@ -574,26 +568,118 @@ func (s *Server) handleBundleChunks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := context.Background()
-	missing := make([]string, 0)
+	// Existence checks are round trips on object storage; run them on a
+	// bounded pool instead of serialising hundreds of HEADs.
+	valid := make([]string, 0, len(req.Hashes))
 	for _, h := range req.Hashes {
 		h = strings.ToLower(h)
-		if len(h) != 64 || strings.Trim(h, "0123456789abcdef") != "" {
-			continue
+		if len(h) == 64 && strings.Trim(h, "0123456789abcdef") == "" {
+			valid = append(valid, h)
 		}
-		ok, eerr := repo.Store().Exists(ctx, repo.Keys().Chunk(h))
-		if eerr != nil {
-			http.Error(w, eerr.Error(), http.StatusInternalServerError)
-			return
-		}
-		if !ok {
-			missing = append(missing, h)
-		}
+	}
+	var mu sync.Mutex
+	missing := make([]string, 0)
+	var firstErr error
+	const workers = 16
+	ch := make(chan string, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for h := range ch {
+				ok, eerr := repo.Store().Exists(ctx, repo.Keys().Chunk(h))
+				mu.Lock()
+				if eerr != nil && firstErr == nil {
+					firstErr = eerr
+				}
+				if eerr == nil && !ok {
+					missing = append(missing, h)
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	for _, h := range valid {
+		ch <- h
+	}
+	close(ch)
+	wg.Wait()
+	if firstErr != nil {
+		http.Error(w, firstErr.Error(), http.StatusInternalServerError)
+		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"missing": missing})
 }
 
-// writeBundleError returns a machine-readable error so the client can tell an
+var (
+	errBundleChunkMissing = errors.New("bundle: chunk missing")
+	errBundleChunkStore   = errors.New("bundle: chunk store")
+)
+
+// storeChunksParallel reads the missing chunks from body in manifest order
+// and writes them on a small pool; non-missing chunks must already exist.
+func storeChunksParallel(ctx context.Context, repo *fs.Repo, refs []cdc.Ref, missing map[string]bool, body io.Reader) error {
+	const workers = 8
+	type job struct {
+		key  string
+		data []byte
+	}
+	jobs := make(chan job, workers)
+	var wg sync.WaitGroup
+	var firstErr error
+	var mu sync.Mutex
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				if err := repo.Store().Put(ctx, j.key, j.data); err != nil {
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf("%w: %v", errBundleChunkStore, err)
+					}
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+	for _, ref := range refs {
+		hexh := cdc.HashHex(ref)
+		if missing[hexh] {
+			data := make([]byte, ref.Size)
+			if _, rerr := io.ReadFull(body, data); rerr != nil {
+				close(jobs)
+				wg.Wait()
+				return fmt.Errorf("short chunk: %w", rerr)
+			}
+			if sum := sha256.Sum256(data); sum != ref.Hash {
+				close(jobs)
+				wg.Wait()
+				return errors.New("chunk checksum mismatch")
+			}
+			jobs <- job{key: repo.Keys().Chunk(hexh), data: data}
+			continue
+		}
+		ok, eerr := repo.Store().Exists(ctx, repo.Keys().Chunk(hexh))
+		if eerr != nil {
+			close(jobs)
+			wg.Wait()
+			return fmt.Errorf("%w: %v", errBundleChunkStore, eerr)
+		}
+		if !ok {
+			close(jobs)
+			wg.Wait()
+			return errBundleChunkMissing
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	return firstErr
+}
+
+// writeBundleError returns a machine-readable error so the client can tell an// writeBundleError returns a machine-readable error so the client can tell an
 // out-of-date conflict (do not retry; re-run after updating) from a transient
 // failure or a concurrent upload with the same token (retry).
 func writeBundleError(w http.ResponseWriter, status int, code, msg string) {
