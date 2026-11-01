@@ -641,3 +641,39 @@ func TestRevPropChangeHookCanReject(t *testing.T) {
 		t.Fatalf("log changed despite rejection: %q", rp.Props["svn:log"])
 	}
 }
+
+func TestMetricsMirrorStatus(t *testing.T) {
+	a, b := store.NewMemoryStore(), store.NewMemoryStore()
+	ms := store.NewMirror([]store.Store{a, b})
+	defer ms.Close()
+	repo, err := fs.CreateRepo(ms, "demo", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := New(Config{
+		BasePath: "/svn",
+		OpenRepo: func(name string) (*fs.Repo, error) {
+			if name == "demo" {
+				return repo, nil
+			}
+			return nil, fs.ErrRepoNotFound
+		},
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	// Populate the server's repo cache (the response itself does not matter).
+	http.Get(ts.URL + "/svn/demo")
+	resp, err := http.Get(ts.URL + "/_metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bts, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	body := string(bts)
+	if !strings.Contains(body, `svngod_mirror_healthy{repo="demo",replica="0"} 1`) {
+		t.Fatalf("mirror metric missing:\n%s", body)
+	}
+	if !strings.Contains(body, `svngod_mirror_primary{repo="demo",replica="0"} 1`) {
+		t.Fatalf("primary metric missing:\n%s", body)
+	}
+}

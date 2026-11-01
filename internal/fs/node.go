@@ -77,6 +77,12 @@ type tnode struct {
 	deltaTotal    uint64
 	chunkManifest []byte
 	chunkTotal    uint64
+	// Directory paging (repositories created with DirBuckets). pagedRef is
+	// this node's table object; prior* describe the base revision so a commit
+	// can rewrite only the changed buckets.
+	pagedRef      string
+	priorTableRef string
+	priorChildren map[string]*tnode
 	baseText      []byte // previous file text captured during this commit (delta base)
 	children      map[string]*tnode
 	copyFrom      *NodeID
@@ -156,8 +162,15 @@ func (r *Repo) ensureDir(t *tnode) error {
 	if err != nil {
 		return err
 	}
-	t.children = make(map[string]*tnode, len(nr.Children))
-	for _, c := range nr.Children {
+	children, err := r.dirChildren(nr)
+	if err != nil {
+		return err
+	}
+	t.children = make(map[string]*tnode, len(children))
+	if nr.Kind == KindDir && nr.TextRep == TextRepExternal {
+		t.pagedRef = nr.TextRef
+	}
+	for _, c := range children {
 		ct, err := r.loadNode(c.ID)
 		if err != nil {
 			return err

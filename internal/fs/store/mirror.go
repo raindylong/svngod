@@ -61,6 +61,53 @@ type MirrorStore struct {
 	controlKey   string
 	ackedCurrent []byte
 	fenced       bool
+
+	// Replication status, for /_metrics and operators.
+	lastSuccess []time.Time
+	lastErr     []string
+	repairing   map[string]bool
+}
+
+// ReplicaStatus is a snapshot of one mirror's health.
+type ReplicaStatus struct {
+	Index       int
+	Healthy     bool
+	Primary     bool
+	LastSuccess time.Time
+	LastError   string
+}
+
+// Status returns a snapshot of every mirror's health and last successful
+// write, so a scrape can show replication lag.
+func (m *MirrorStore) Status() []ReplicaStatus {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]ReplicaStatus, len(m.mirrors))
+	for i := range m.mirrors {
+		out[i] = ReplicaStatus{Index: i, Healthy: m.healthy[i], Primary: i == m.prim}
+		if i < len(m.lastSuccess) {
+			out[i].LastSuccess = m.lastSuccess[i]
+			out[i].LastError = m.lastErr[i]
+		}
+	}
+	return out
+}
+
+func (m *MirrorStore) noteWrite(i int) {
+	m.mu.Lock()
+	if i < len(m.lastSuccess) {
+		m.lastSuccess[i] = time.Now()
+		m.lastErr[i] = ""
+	}
+	m.mu.Unlock()
+}
+
+func (m *MirrorStore) noteError(i int, err error) {
+	m.mu.Lock()
+	if i < len(m.lastErr) && err != nil {
+		m.lastErr[i] = err.Error()
+	}
+	m.mu.Unlock()
 }
 
 // SetMutableOrder installs the ordering used to reconcile mutable objects
@@ -98,11 +145,14 @@ func NewMirror(mirrors []Store, opts ...MirrorOption) *MirrorStore {
 		panic("MirrorStore requires at least 2 mirrors")
 	}
 	m := &MirrorStore{
-		mirrors: mirrors,
-		healthy: make([]bool, len(mirrors)),
-		prim:    0,
-		stop:    make(chan struct{}),
-		done:    make(chan struct{}),
+		mirrors:     mirrors,
+		healthy:     make([]bool, len(mirrors)),
+		lastSuccess: make([]time.Time, len(mirrors)),
+		lastErr:     make([]string, len(mirrors)),
+		repairing:   map[string]bool{},
+		prim:        0,
+		stop:        make(chan struct{}),
+		done:        make(chan struct{}),
 	}
 	for i := range m.healthy {
 		m.healthy[i] = true
@@ -281,6 +331,7 @@ func (m *MirrorStore) writePrimary(fn func(Store) error) (int, error) {
 	}
 	err := fn(p)
 	if err == nil {
+		m.noteWrite(pi)
 		return pi, nil
 	}
 	if errors.Is(err, ErrPreconditionFailed) || errors.Is(err, ErrNotFound) {
@@ -294,11 +345,13 @@ func (m *MirrorStore) writePrimary(fn func(Store) error) (int, error) {
 			continue
 		}
 		if e := fn(m.mirrors[idx]); e == nil {
+			m.noteWrite(idx)
 			return idx, nil
 		} else if errors.Is(e, ErrPreconditionFailed) || errors.Is(e, ErrNotFound) {
 			return idx, e
 		} else {
 			m.markDown(idx)
+			m.noteError(idx, e)
 			err = e
 		}
 	}
@@ -413,6 +466,9 @@ func (m *MirrorStore) Get(ctx context.Context, key string, rng *Range) ([]byte, 
 		}
 		bb, e := m.mirrors[idx].Get(ctx, key, rng)
 		if e == nil {
+			if rng == nil && !isControlKey(key) {
+				go m.repairKey(idx, key)
+			}
 			return bb, nil
 		}
 		if !errors.Is(e, ErrNotFound) {
@@ -648,11 +704,49 @@ func (m *MirrorStore) mirrorWrites(ctx context.Context, pi int, fn func(Store) e
 			defer wg.Done()
 			if err := fn(s); err != nil {
 				m.markDown(i)
+				m.noteError(i, err)
 				fmt.Printf("mirror[%d] standby write failed: %v\n", i, err)
+			} else {
+				m.noteWrite(i)
 			}
 		}(i, s)
 	}
 	wg.Wait()
+}
+
+// repairKey copies one object from the mirror that served it back to the
+// others, so a standby that answered a read heals the primary immediately
+// instead of waiting for the periodic full repair. Only full, reasonably
+// small objects are repaired: a ranged read would copy a partial object and
+// huge texts are left to the streaming repair pass.
+func (m *MirrorStore) repairKey(src int, key string) {
+	const maxRepairObject = 16 << 20
+	m.mu.Lock()
+	if m.repairing[key] {
+		m.mu.Unlock()
+		return
+	}
+	m.repairing[key] = true
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		delete(m.repairing, key)
+		m.mu.Unlock()
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	b, err := m.mirrors[src].Get(ctx, key, &Range{Offset: 0, Length: maxRepairObject + 1})
+	if err != nil || len(b) > maxRepairObject {
+		return
+	}
+	for i := range m.mirrors {
+		if i == src {
+			continue
+		}
+		if err := m.mirrors[i].Put(ctx, key, b); err == nil {
+			m.noteWrite(i)
+		}
+	}
 }
 
 // --- self-healing repair ---

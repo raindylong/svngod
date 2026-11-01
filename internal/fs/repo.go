@@ -49,6 +49,7 @@ type Repo struct {
 	shardSz     uint64
 	maxDelta    uint64
 	chunkParams cdc.Params
+	dirBuckets  bool
 
 	mu    sync.Mutex
 	cache *cache.LRU
@@ -128,6 +129,11 @@ func CreateRepo(st store.Store, prefix string, shardSize, maxDelta uint64) (*Rep
 
 // CreateRepoParams writes a fresh repository with an explicit chunk profile.
 func CreateRepoParams(st store.Store, prefix string, shardSize, maxDelta uint64, chunks cdc.Params) (*Repo, error) {
+	return CreateRepoFull(st, prefix, shardSize, maxDelta, chunks, false)
+}
+
+// CreateRepoFull also selects whether large directories are paged.
+func CreateRepoFull(st store.Store, prefix string, shardSize, maxDelta uint64, chunks cdc.Params, dirBuckets bool) (*Repo, error) {
 	chunks = chunks.Normalize()
 	if shardSize == 0 {
 		shardSize = 4096
@@ -140,6 +146,7 @@ func CreateRepoParams(st store.Store, prefix string, shardSize, maxDelta uint64,
 	format := &Format{
 		Version: 1, ShardSize: shardSize, MaxDeltaChain: maxDelta,
 		ChunkMin: uint64(chunks.Min), ChunkMax: uint64(chunks.Max), ChunkMask: chunks.Mask,
+		DirBuckets: dirBuckets,
 	}
 	if err := st.Put(ctx, keys.Format(), format.Marshal()); err != nil {
 		return nil, err
@@ -167,10 +174,22 @@ func CreateRepoParams(st store.Store, prefix string, shardSize, maxDelta uint64,
 	wireMirrorControl(st, keys)
 	return &Repo{
 		store: st, keys: keys, shardSz: shardSize, maxDelta: maxDelta,
-		chunkParams: chunks,
-		cache:       cache.New(1 << 16), nodeCache: make(map[cache.Key]*NodeRev),
+		chunkParams: chunks, dirBuckets: dirBuckets,
+		cache: cache.New(1 << 16), nodeCache: make(map[cache.Key]*NodeRev),
 	}, nil
 }
+
+// ReplicaStatus reports mirror health when the repository is backed by a
+// MirrorStore (nil otherwise).
+func (r *Repo) ReplicaStatus() []store.ReplicaStatus {
+	if ms, ok := r.store.(*store.MirrorStore); ok {
+		return ms.Status()
+	}
+	return nil
+}
+
+// DirBucketsEnabled reports whether large directories are stored as buckets.
+func (r *Repo) DirBucketsEnabled() bool { return r.dirBuckets }
 
 // ChunkParams returns the repository's content-defined chunking profile.
 func (r *Repo) ChunkParams() cdc.Params { return r.chunkParams }
@@ -197,8 +216,8 @@ func OpenRepo(st store.Store, prefix string) (*Repo, error) {
 	wireMirrorControl(st, keys)
 	return &Repo{
 		store: st, keys: keys, shardSz: f.ShardSize, maxDelta: f.MaxDeltaChain,
-		chunkParams: cp,
-		cache:       cache.New(1 << 16), nodeCache: make(map[cache.Key]*NodeRev),
+		chunkParams: cp, dirBuckets: f.DirBuckets,
+		cache: cache.New(1 << 16), nodeCache: make(map[cache.Key]*NodeRev),
 	}, nil
 }
 
@@ -756,7 +775,16 @@ func (r *Repo) Resolve(rev uint64, path string) (*NodeRev, error) {
 			return nil, ErrPathNotFound
 		}
 		var next *NodeID
-		if cur.ByName != nil {
+		if cur.TextRep == TextRepExternal {
+			c, ok, derr := r.dirChild(cur, seg)
+			if derr != nil {
+				return nil, derr
+			}
+			if ok {
+				cc := c.ID
+				next = &cc
+			}
+		} else if cur.ByName != nil {
 			if c, ok := cur.ByName[seg]; ok {
 				cc := c.ID
 				next = &cc
@@ -790,8 +818,12 @@ func (r *Repo) ListDir(rev uint64, path string) ([]NodeInfo, error) {
 	if nr.Kind != KindDir {
 		return nil, errors.New("fs: not a directory")
 	}
-	out := make([]NodeInfo, 0, len(nr.Children))
-	for _, c := range nr.Children {
+	children, err := r.dirChildren(nr)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]NodeInfo, 0, len(children))
+	for _, c := range children {
 		cnr, err := r.GetNodeRev(c.ID)
 		if err != nil {
 			return nil, err
@@ -1121,12 +1153,23 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 			if err := r.ensureDir(t); err != nil {
 				return 0, err
 			}
-			for name, c := range t.children {
-				cid := c.id
-				if c.dirty {
-					cid = NodeID{Rev: N, ID: c.newID}
+			if r.dirBuckets && len(t.children) > dirBucketThreshold {
+				ref, size, werr := r.writeDirBuckets(ctx, t, N)
+				if werr != nil {
+					return 0, werr
 				}
-				nr.Children = append(nr.Children, Child{Name: name, ID: cid})
+				nr.TextRep = TextRepExternal
+				nr.TextRef = ref
+				nr.TextSize = uint64(size)
+				nr.Children = nil
+			} else {
+				for name, c := range t.children {
+					cid := c.id
+					if c.dirty {
+						cid = NodeID{Rev: N, ID: c.newID}
+					}
+					nr.Children = append(nr.Children, Child{Name: name, ID: cid})
+				}
 			}
 		}
 		nodes = append(nodes, nr)
@@ -1257,6 +1300,40 @@ func (r *Repo) VerifyRange(from, to uint64, texts bool) ([]VerifyIssue, error) {
 			nr, nerr := r.GetNodeRev(nid)
 			if nerr != nil {
 				issues = append(issues, VerifyIssue{Rev: rev, Err: nerr})
+				continue
+			}
+			if nr.Kind == KindDir {
+				if nr.TextRep != TextRepExternal || nr.TextRef == "" {
+					continue
+				}
+				table, terr := r.dirTableOf(nr)
+				if terr != nil {
+					issues = append(issues, VerifyIssue{Rev: rev, Err: terr})
+					continue
+				}
+				refs := append([]string{nr.TextRef}, table.Refs[:]...)
+				for _, ref := range refs {
+					if ref == "" {
+						continue
+					}
+					key := r.keys.Dir(ref)
+					ok, eerr := r.store.Exists(ctx, key)
+					if eerr != nil || !ok {
+						issues = append(issues, VerifyIssue{Rev: rev, Err: fmt.Errorf("dir object %s missing", ref)})
+						continue
+					}
+					if texts {
+						b, gerr := r.store.Get(ctx, key, nil)
+						if gerr != nil {
+							issues = append(issues, VerifyIssue{Rev: rev, Err: gerr})
+							continue
+						}
+						sum := sha256.Sum256(b)
+						if hex.EncodeToString(sum[:]) != ref {
+							issues = append(issues, VerifyIssue{Rev: rev, Err: fmt.Errorf("dir object %s checksum mismatch", ref)})
+						}
+					}
+				}
 				continue
 			}
 			if nr.Kind != KindFile {
@@ -1426,6 +1503,9 @@ func (r *Repo) applyChange(root *tnode, ch *Change) error {
 				t.base = old.base
 				t.copyFrom = old.copyFrom
 				t.copyFromPath = old.copyFromPath
+				t.pagedRef = old.pagedRef
+				t.priorTableRef = old.pagedRef
+				t.priorChildren = old.children
 				for n, c := range old.children {
 					t.children[n] = c
 				}
@@ -1739,6 +1819,7 @@ func (r *Repo) CollectTexts(ctx context.Context) (int, error) {
 	}
 	refs := map[string]bool{}
 	chunkRefs := map[string]bool{}
+	dirRefs := map[string]bool{}
 	for rev := uint64(0); rev <= head; rev++ {
 		rb, err := r.readBlock(rev)
 		if err != nil {
@@ -1749,13 +1830,23 @@ func (r *Repo) CollectTexts(ctx context.Context) (int, error) {
 			if err != nil {
 				return 0, err
 			}
-			if nr.TextRep == TextRepExternal && nr.TextRef != "" {
+			if nr.Kind == KindFile && nr.TextRep == TextRepExternal && nr.TextRef != "" {
 				refs[nr.TextRef] = true
 			}
-			if nr.TextRep == TextRepChunked {
+			if nr.Kind == KindFile && nr.TextRep == TextRepChunked {
 				if crefs, err := cdc.Parse(nr.Text); err == nil {
 					for _, ref := range crefs {
 						chunkRefs[cdc.HashHex(ref)] = true
+					}
+				}
+			}
+			if nr.Kind == KindDir && nr.TextRep == TextRepExternal && nr.TextRef != "" {
+				dirRefs[nr.TextRef] = true
+				if table, terr := r.dirTableOf(nr); terr == nil && table != nil {
+					for _, ref := range table.Refs {
+						if ref != "" {
+							dirRefs[ref] = true
+						}
 					}
 				}
 			}
@@ -1790,6 +1881,24 @@ func (r *Repo) CollectTexts(ctx context.Context) (int, error) {
 		for _, o := range objs {
 			ref := strings.TrimPrefix(o.Key, chunkPrefix)
 			if !chunkRefs[ref] {
+				victims = append(victims, o.Key)
+			}
+		}
+		if n == "" {
+			break
+		}
+		next = n
+	}
+	dirPrefix := r.keys.Prefix + "/dirs/"
+	next = ""
+	for {
+		objs, n, err := r.store.ListPrefix(ctx, dirPrefix, next, 500)
+		if err != nil {
+			return 0, err
+		}
+		for _, o := range objs {
+			ref := strings.TrimPrefix(o.Key, dirPrefix)
+			if !dirRefs[ref] {
 				victims = append(victims, o.Key)
 			}
 		}

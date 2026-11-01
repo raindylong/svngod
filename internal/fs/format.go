@@ -192,6 +192,9 @@ type Format struct {
 	ChunkMin  uint64
 	ChunkMax  uint64
 	ChunkMask uint64
+	// DirBuckets enables paged child lists for large directories. Repositories
+	// created without it keep children inline forever.
+	DirBuckets bool
 }
 
 // Marshal serializes format.
@@ -207,6 +210,9 @@ func (f *Format) Marshal() []byte {
 	}
 	if f.ChunkMask != 0 {
 		out += "\nCHUNK_MASK=" + strconv.FormatUint(f.ChunkMask, 10)
+	}
+	if f.DirBuckets {
+		out += "\nDIR_BUCKETS=1"
 	}
 	return []byte(out + "\n")
 }
@@ -240,6 +246,8 @@ func UnmarshalFormat(b []byte) (*Format, error) {
 			f.ChunkMax = v
 		case "CHUNK_MASK":
 			f.ChunkMask = v
+		case "DIR_BUCKETS":
+			f.DirBuckets = v == 1
 		}
 	}
 	return f, nil

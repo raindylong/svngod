@@ -45,6 +45,7 @@ type options struct {
 	fromRev    uint64
 	toRev      uint64
 	chunkAvg   uint64
+	dirBuckets bool
 }
 
 // mirrorEntry is one backend in a --mirror-file JSON array (same shape as the
@@ -168,6 +169,7 @@ func main() {
 		fs.Uint64Var(&shardSize, "shard-size", defaultShardSize, "revisions per shard (packing granularity)")
 		fs.Uint64Var(&maxDelta, "max-delta", defaultMaxDelta, "maximum text delta chain length")
 		fs.Uint64Var(&o.chunkAvg, "chunk-avg", 1<<20, "target average chunk size in bytes (0 keeps 1 MiB)")
+		fs.BoolVar(&o.dirBuckets, "dir-buckets", false, "page directories with more than 1024 children into 16 buckets")
 	}
 	if cmd == "dump" {
 		fs.StringVar(&output, "output", "", "write dump to file (default stdout)")
@@ -221,7 +223,7 @@ func doCreate(o *options, repoName string, shardSize, maxDelta uint64) {
 	if err != nil {
 		fatal(err)
 	}
-	repo, err := fs.CreateRepoParams(st, prefix, shardSize, maxDelta, chunkParamsFor(o.chunkAvg))
+	repo, err := fs.CreateRepoFull(st, prefix, shardSize, maxDelta, chunkParamsFor(o.chunkAvg), o.dirBuckets)
 	if err != nil {
 		fatal(err)
 	}

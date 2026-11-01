@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 )
 
 // mirrorFixtures holds two FileStores as stand-in "primary S3" and "standby
@@ -150,5 +151,61 @@ func TestMirrorFailoverFencesStaleHead(t *testing.T) {
 	}
 	if got, _ := m.Get(ctx, key, nil); string(got) != "head=2" {
 		t.Fatalf("head after write = %q", got)
+	}
+}
+
+func TestMirrorReadRepair(t *testing.T) {
+	ctx := context.Background()
+	a, b := NewMemoryStore(), NewMemoryStore()
+	m := NewMirror([]Store{a, b})
+	defer m.Close()
+	key := "repos/x/objects/1"
+	if err := m.Put(ctx, key, []byte("payload")); err != nil {
+		t.Fatal(err)
+	}
+	// The primary lost the object; the standby still has it.
+	if err := a.Delete(ctx, []string{key}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.Get(ctx, key, nil)
+	if err != nil || string(got) != "payload" {
+		t.Fatalf("Get=%q err=%v", got, err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, ok, _ := a.Head(ctx, key); ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("primary was not healed by read repair")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestMirrorStatusReportsHealth(t *testing.T) {
+	ctx := context.Background()
+	a, b := NewMemoryStore(), NewMemoryStore()
+	m := NewMirror([]Store{a, b})
+	defer m.Close()
+	if err := m.Put(ctx, "repos/x/objects/2", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	st := m.Status()
+	if len(st) != 2 {
+		t.Fatalf("statuses=%d", len(st))
+	}
+	for i := range st {
+		if !st[i].Healthy || st[i].LastSuccess.IsZero() {
+			t.Fatalf("replica %d status=%+v", i, st[i])
+		}
+	}
+	if !st[0].Primary {
+		t.Fatal("replica 0 should be primary")
+	}
+	m.markDown(1)
+	st = m.Status()
+	if st[1].Healthy {
+		t.Fatal("replica 1 still healthy after markDown")
 	}
 }

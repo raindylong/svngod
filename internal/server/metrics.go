@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"svngod/internal/fs"
 )
 
 // metrics is the server's aggregate observability state. Labels are limited
@@ -113,6 +115,53 @@ func (s *Server) serveMetrics(w http.ResponseWriter) {
 	b.WriteString("# HELP svngod_bundle_replays_total Bundle retries answered from an existing record.\n")
 	b.WriteString("# TYPE svngod_bundle_replays_total counter\n")
 	fmt.Fprintf(&b, "svngod_bundle_replays_total %d\n", m.bundleReplays.Load())
+
+	// Mirror replication health/lag, for repositories backed by a mirror.
+	s.repoMapMu.Lock()
+	repos := make(map[string]*fs.Repo, len(s.repoCache))
+	for k, v := range s.repoCache {
+		repos[k] = v
+	}
+	s.repoMapMu.Unlock()
+	names := make([]string, 0, len(repos))
+	for k := range repos {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	wroteMirror := false
+	for _, name := range names {
+		statuses := repos[name].ReplicaStatus()
+		if len(statuses) == 0 {
+			continue
+		}
+		if !wroteMirror {
+			b.WriteString("# HELP svngod_mirror_healthy Whether a mirror replica is currently reachable.\n")
+			b.WriteString("# TYPE svngod_mirror_healthy gauge\n")
+			b.WriteString("# HELP svngod_mirror_primary Whether this replica is the elected writer.\n")
+			b.WriteString("# TYPE svngod_mirror_primary gauge\n")
+			b.WriteString("# HELP svngod_mirror_last_write_seconds Seconds since the last successful write (-1 unknown).\n")
+			b.WriteString("# TYPE svngod_mirror_last_write_seconds gauge\n")
+			wroteMirror = true
+		}
+		for _, st := range statuses {
+			idx := fmt.Sprint(st.Index)
+			healthy := 0
+			if st.Healthy {
+				healthy = 1
+			}
+			primary := 0
+			if st.Primary {
+				primary = 1
+			}
+			age := -1.0
+			if !st.LastSuccess.IsZero() {
+				age = time.Since(st.LastSuccess).Seconds()
+			}
+			fmt.Fprintf(&b, "svngod_mirror_healthy{repo=%q,replica=%q} %d\n", escapeLabel(name), idx, healthy)
+			fmt.Fprintf(&b, "svngod_mirror_primary{repo=%q,replica=%q} %d\n", escapeLabel(name), idx, primary)
+			fmt.Fprintf(&b, "svngod_mirror_last_write_seconds{repo=%q,replica=%q} %.3f\n", escapeLabel(name), idx, age)
+		}
+	}
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	io.WriteString(w, b.String())

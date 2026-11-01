@@ -62,6 +62,9 @@ func (k *Keys) Text(ref string) string { return k.p("texts", ref) }
 // Chunk returns the key of one content-defined chunk (hex sha256).
 func (k *Keys) Chunk(hash string) string { return k.p("chunks", hash) }
 
+// Dir returns the key of a large-directory table or bucket object.
+func (k *Keys) Dir(hash string) string { return k.p("dirs", hash) }
+
 // CommitLock returns the commit-lock object key.
 func (k *Keys) CommitLock() string { return k.p("locks", "commit") }
 
