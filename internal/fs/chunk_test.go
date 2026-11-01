@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"testing"
 
+	"svngod/internal/cdc"
 	"svngod/internal/fs/store"
 )
 
@@ -112,7 +113,7 @@ func TestChunkedRangeAndVerify(t *testing.T) {
 	}
 	for _, c := range []struct{ off, length int64 }{
 		{0, 100},
-		{chunkMin - 10, 32},
+		{cdc.Min - 10, 32},
 		{3 << 20, 2 << 20},
 		{int64(len(data)) - 7, 7},
 	} {

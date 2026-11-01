@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"svngod/internal/cdc"
 	"svngod/internal/fs"
 	"svngod/internal/svndiff"
 )
@@ -580,7 +581,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 	// text in memory and storing a full copy.
 	if isSvndiff && (r.ContentLength < 0 || r.ContentLength > putStreamThreshold ||
 		baseLen > putStreamThreshold) {
-		if baseLen > fs.ChunkThreshold || r.ContentLength > fs.ChunkThreshold {
+		if baseLen > cdc.Threshold || r.ContentLength > cdc.Threshold {
 			// Large target: decode straight into chunk storage. This removes
 			// the 1 GiB temp file (and its re-read) from a large edit.
 			manifest, total, csum, csha, cerr := decodeDeltaToChunks(repo, baseLen, baseSrc, r.Body, maxPutBody)
@@ -648,7 +649,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 			// (a chain would make reads and later uploads progressively slower).
 			size := st.Size()
 			useDelta := false
-			if size > putStreamThreshold && size <= fs.ChunkThreshold && !isNew && baseNode != nil {
+			if size > putStreamThreshold && size <= cdc.Threshold && !isNew && baseNode != nil {
 				clientOK := deltaBuf.Len() > 0 && sink.ok() &&
 					deltaBuf.Len() <= deltaInlineCap && int64(deltaBuf.Len()) < size/2
 				// A chain (base is itself a delta) is fine up to the repository's
@@ -691,7 +692,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 			}
 			if !useDelta {
 				if size > putStreamThreshold {
-					if size > fs.ChunkThreshold {
+					if size > cdc.Threshold {
 						f, oerr := os.Open(outPath)
 						if oerr != nil {
 							http.Error(w, oerr.Error(), http.StatusInternalServerError)
@@ -738,7 +739,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 		return
 	} else if bodyFile != "" {
 		fi, serr := os.Stat(bodyFile)
-		if serr == nil && fi.Size() > fs.ChunkThreshold {
+		if serr == nil && fi.Size() > cdc.Threshold {
 			f, oerr := os.Open(bodyFile)
 			if oerr != nil {
 				os.Remove(bodyFile)

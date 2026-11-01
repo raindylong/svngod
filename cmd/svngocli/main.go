@@ -19,6 +19,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/md5"
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/tls"
@@ -37,6 +38,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"svngod/internal/cdc"
 )
 
 var errOutOfDate = errors.New("target changed on the server")
@@ -312,12 +315,17 @@ func runSvnOutput(args []string) ([]byte, error) {
 // --- bulk upload (svngod bundle channel) ---
 
 type bundleChange struct {
-	Path    string            `json:"path"`
-	Action  string            `json:"action"`
-	Kind    string            `json:"kind"`
-	BaseRev uint64            `json:"baseRev,omitempty"`
-	Props   map[string]string `json:"props,omitempty"`
-	TextLen int64             `json:"textLen,omitempty"`
+	Path       string            `json:"path"`
+	Action     string            `json:"action"`
+	Kind       string            `json:"kind"`
+	BaseRev    uint64            `json:"baseRev,omitempty"`
+	Props      map[string]string `json:"props,omitempty"`
+	TextLen    int64             `json:"textLen,omitempty"`
+	Chunks     []bundleChunkRef  `json:"chunks,omitempty"`
+	Missing    []string          `json:"missing,omitempty"`
+	ChunkTotal uint64            `json:"chunkTotal,omitempty"`
+	MD5        string            `json:"md5,omitempty"`
+	SHA1       string            `json:"sha1,omitempty"`
 }
 
 type bundleHeader struct {
@@ -327,13 +335,24 @@ type bundleHeader struct {
 	Changes []bundleChange `json:"changes"`
 }
 
+type bundleChunkRef struct {
+	Hash string `json:"h"`
+	Size uint32 `json:"n"`
+}
+
 type uploadFile struct {
 	local    string // absolute path on disk
 	repoPath string // "/dir/file"
 	size     int64
 	sum      [32]byte          // sha256, also part of the idempotency token
 	sha1     [20]byte          // server node checksum, used to skip unchanged files
+	md5      [16]byte          // full-text md5, required for chunked changes
 	props    map[string]string // binary files get svn:mime-type like svn import
+	// Large files are split locally with the shared CDC package; refs is the
+	// manifest and missingSet the chunks the server lacks.
+	chunked    bool
+	refs       []cdc.Ref
+	missingSet map[string]bool
 }
 
 func cmdUpload(args []string) int {
@@ -399,7 +418,7 @@ func cmdUpload(args []string) int {
 		fmt.Fprintf(os.Stderr, "svngocli: %v\n", err)
 		return 1
 	}
-	head, bundleOK, statOK, err := probeBundle(repoRoot, user, pass)
+	head, bundleOK, statOK, chunksOK, err := probeBundle(repoRoot, user, pass)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "svngocli: %v\n", err)
 		return 1
@@ -450,11 +469,23 @@ func cmdUpload(args []string) int {
 		if rerr != nil {
 			return rerr
 		}
+		rp := joinRepoPath(targetPath, filepath.ToSlash(rel))
+		if chunksOK && fi.Size() > cdc.Threshold {
+			sum, sha, msum, refs, serr := scanChunkedFile(p)
+			if serr != nil {
+				return serr
+			}
+			fmt.Fprintf(digest, "%s\x00%d\x00%x\x00", rp, fi.Size(), sum)
+			files = append(files, uploadFile{
+				local: p, repoPath: rp, size: fi.Size(), sum: sum, sha1: sha,
+				md5: msum, props: sniffProps(p), chunked: true, refs: refs,
+			})
+			return nil
+		}
 		sum, sha, serr := hashFileSums(p)
 		if serr != nil {
 			return serr
 		}
-		rp := joinRepoPath(targetPath, filepath.ToSlash(rel))
 		fmt.Fprintf(digest, "%s\x00%d\x00%x\x00", rp, fi.Size(), sum)
 		files = append(files, uploadFile{local: p, repoPath: rp, size: fi.Size(), sum: sum, sha1: sha, props: sniffProps(p)})
 		return nil
@@ -490,8 +521,64 @@ func cmdUpload(args []string) int {
 		}
 	}
 
+	// Ask which chunks the repository already has, so a changed large file
+	// only sends the new ones. On failure, fall back to sending full texts.
+	if chunksOK {
+		uniq := map[string]bool{}
+		for _, f := range files {
+			for _, r := range f.refs {
+				uniq[hex.EncodeToString(r.Hash[:])] = true
+			}
+		}
+		if len(uniq) > 0 {
+			hashes := make([]string, 0, len(uniq))
+			for h := range uniq {
+				hashes = append(hashes, h)
+			}
+			missing, cerr := fetchMissingChunks(repoRoot, hashes, user, pass)
+			if cerr != nil {
+				for i := range files {
+					files[i].chunked = false
+					files[i].refs = nil
+				}
+			} else {
+				for i := range files {
+					if !files[i].chunked {
+						continue
+					}
+					set := map[string]bool{}
+					for _, r := range files[i].refs {
+						h := hex.EncodeToString(r.Hash[:])
+						if missing[h] {
+							set[h] = true
+						}
+					}
+					files[i].missingSet = set
+				}
+			}
+		}
+	}
+
 	changes := make([]bundleChange, 0, len(files)+len(skippedPaths))
 	for _, f := range files {
+		if f.chunked && len(f.refs) > 0 {
+			chunks := make([]bundleChunkRef, len(f.refs))
+			missing := make([]string, 0)
+			for i, r := range f.refs {
+				h := hex.EncodeToString(r.Hash[:])
+				chunks[i] = bundleChunkRef{Hash: h, Size: r.Size}
+				if f.missingSet[h] {
+					missing = append(missing, h)
+				}
+			}
+			changes = append(changes, bundleChange{
+				Path: f.repoPath, Action: "put", Kind: "file", BaseRev: head,
+				Chunks: chunks, Missing: missing, ChunkTotal: uint64(f.size),
+				MD5: hex.EncodeToString(f.md5[:]), SHA1: hex.EncodeToString(f.sha1[:]),
+				Props: f.props,
+			})
+			continue
+		}
 		changes = append(changes, bundleChange{Path: f.repoPath, Action: "put", Kind: "file", BaseRev: head, TextLen: f.size, Props: f.props})
 	}
 	// Skipped files are still checked at commit time: if one changed after
@@ -667,32 +754,33 @@ func parentURL(u string) string {
 }
 
 // probeBundle negotiates the bulk channel and returns the repository HEAD.
-func probeBundle(repoRoot, user, pass string) (uint64, bool, bool, error) {
+func probeBundle(repoRoot, user, pass string) (uint64, bool, bool, bool, error) {
 	req, err := http.NewRequest("OPTIONS", strings.TrimSuffix(repoRoot, "/")+"/", nil)
 	if err != nil {
-		return 0, false, false, err
+		return 0, false, false, false, err
 	}
 	setAuth(req, user, pass)
 	req.Header.Set("User-Agent", "svngocli/"+version)
 	resp, err := httpClient().Do(req)
 	if err != nil {
-		return 0, false, false, err
+		return 0, false, false, false, err
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode == http.StatusUnauthorized {
-		return 0, false, false, fmt.Errorf("authentication required (use --username/--password)")
+		return 0, false, false, false, fmt.Errorf("authentication required (use --username/--password)")
 	}
 	var head uint64
 	fmt.Sscanf(resp.Header.Get("SVN-Youngest-Rev"), "%d", &head)
 	ok := resp.Header.Get("X-Svngod-Bundle") == "1"
 	statOK := resp.Header.Get("X-Svngod-Stat") == "1"
+	chunksOK := resp.Header.Get("X-Svngod-Chunks") == "1"
 	if head == 0 {
 		if out, err := runSvnOutput([]string{"info", "--show-item", "revision", "--non-interactive", repoRoot + "@HEAD"}); err == nil {
 			fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &head)
 		}
 	}
-	return head, ok, statOK, nil
+	return head, ok, statOK, chunksOK, nil
 }
 
 // missingOnServer lists the server tree under target and returns repo paths
@@ -731,6 +819,87 @@ func missingOnServer(targetURL, targetPath string, files []uploadFile, user, pas
 
 // buildBundleFile writes the framed bundle to a temp file. The file is kept
 // (seekable) so the POST can be retried without rebuilding.
+// scanChunkedFile hashes a large file and computes its CDC manifest in one
+// pass: the same reader feeds the full-text hashes and the chunker.
+func scanChunkedFile(p string) ([32]byte, [20]byte, [16]byte, []cdc.Ref, error) {
+	var sum [32]byte
+	var sha [20]byte
+	var msum [16]byte
+	f, err := os.Open(p)
+	if err != nil {
+		return sum, sha, msum, nil, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	h1 := sha1.New()
+	h2 := md5.New()
+	var refs []cdc.Ref
+	err = cdc.Split(io.TeeReader(f, io.MultiWriter(h, h1, h2)), func(data []byte) error {
+		refs = append(refs, cdc.Ref{Size: uint32(len(data)), Hash: sha256.Sum256(data)})
+		return nil
+	})
+	if err != nil {
+		return sum, sha, msum, nil, err
+	}
+	copy(sum[:], h.Sum(nil))
+	copy(sha[:], h1.Sum(nil))
+	copy(msum[:], h2.Sum(nil))
+	return sum, sha, msum, refs, nil
+}
+
+// writeMissingChunks writes exactly the chunks the server lacks, re-splitting
+// the local file so no chunk bytes are kept in memory.
+func writeMissingChunks(w io.Writer, f uploadFile) error {
+	in, err := os.Open(f.local)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	return cdc.Split(in, func(data []byte) error {
+		sum := sha256.Sum256(data)
+		h := hex.EncodeToString(sum[:])
+		if !f.missingSet[h] {
+			return nil
+		}
+		_, werr := w.Write(data)
+		return werr
+	})
+}
+
+// fetchMissingChunks returns the set of hashes the repository does not have.
+func fetchMissingChunks(repoRoot string, hashes []string, user, pass string) (map[string]bool, error) {
+	body, err := json.Marshal(map[string]interface{}{"hashes": hashes})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest("POST", strings.TrimSuffix(repoRoot, "/")+"/!svngod/chunks", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "svngocli/"+version)
+	setAuth(req, user, pass)
+	resp, err := httpClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("chunks: server returned %d", resp.StatusCode)
+	}
+	var out struct {
+		Missing []string `json:"missing"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<20)).Decode(&out); err != nil {
+		return nil, err
+	}
+	set := make(map[string]bool, len(out.Missing))
+	for _, h := range out.Missing {
+		set[strings.ToLower(h)] = true
+	}
+	return set, nil
+}
+
 func buildBundleFile(hdr bundleHeader, files []uploadFile) (string, error) {
 	tmp, err := os.CreateTemp("", "svngocli-bundle-")
 	if err != nil {
@@ -760,6 +929,13 @@ func buildBundleFile(hdr bundleHeader, files []uploadFile) (string, error) {
 		return "", err
 	}
 	for _, f := range files {
+		if f.chunked && len(f.refs) > 0 {
+			if werr := writeMissingChunks(tmp, f); werr != nil {
+				cleanup()
+				return "", werr
+			}
+			continue
+		}
 		in, oerr := os.Open(f.local)
 		if oerr != nil {
 			cleanup()

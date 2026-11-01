@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"svngod/internal/cache"
+	"svngod/internal/cdc"
 	"svngod/internal/fs/store"
 	"svngod/internal/svndiff"
 )
@@ -555,7 +556,7 @@ func (r *Repo) StreamText(id NodeID, w io.Writer) (uint64, error) {
 		}
 		return cw.n, nil
 	case TextRepChunked:
-		refs, perr := parseChunkManifest(nr.Text)
+		refs, perr := cdc.Parse(nr.Text)
 		if perr != nil {
 			return 0, perr
 		}
@@ -598,11 +599,11 @@ func (r *Repo) TextSizeOf(nr *NodeRev) (int64, error) {
 		n, err := r.StreamText(nr.Node, io.Discard)
 		return int64(n), err
 	case TextRepChunked:
-		refs, err := parseChunkManifest(nr.Text)
+		refs, err := cdc.Parse(nr.Text)
 		if err != nil {
 			return 0, err
 		}
-		return int64(manifestSize(refs)), nil
+		return int64(cdc.Size(refs)), nil
 	}
 	return 0, errors.New("fs: bad text rep")
 }
@@ -611,7 +612,7 @@ func (r *Repo) TextSizeOf(nr *NodeRev) (int64, error) {
 // with a ranged object request, so a Range GET does not materialize the file.
 func (r *Repo) ReadTextRange(nr *NodeRev, off, length int64) ([]byte, error) {
 	if nr.TextRep == TextRepChunked {
-		refs, err := parseChunkManifest(nr.Text)
+		refs, err := cdc.Parse(nr.Text)
 		if err != nil {
 			return nil, err
 		}
@@ -679,7 +680,7 @@ func (r *Repo) GetText(id NodeID) ([]byte, error) {
 			return nil, err
 		}
 	case TextRepChunked:
-		refs, perr := parseChunkManifest(nr.Text)
+		refs, perr := cdc.Parse(nr.Text)
 		if perr != nil {
 			return nil, perr
 		}
@@ -956,7 +957,7 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 				nodes = append(nodes, nr)
 				continue
 			}
-			if len(t.data) > ChunkThreshold {
+			if len(t.data) > cdc.Threshold {
 				manifest, total, cerr := r.storeChunkedReader(ctx, bytes.NewReader(t.data))
 				if cerr != nil {
 					return 0, cerr
@@ -991,7 +992,7 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 				continue
 			}
 			if t.dataFile != "" {
-				if st, serr := os.Stat(t.dataFile); serr == nil && st.Size() > ChunkThreshold {
+				if st, serr := os.Stat(t.dataFile); serr == nil && st.Size() > cdc.Threshold {
 					f, oerr := os.Open(t.dataFile)
 					if oerr != nil {
 						return 0, oerr
@@ -1235,7 +1236,7 @@ func (r *Repo) VerifyRange(from, to uint64, texts bool) ([]VerifyIssue, error) {
 				continue
 			}
 			if nr.TextRep == TextRepChunked {
-				refs, perr := parseChunkManifest(nr.Text)
+				refs, perr := cdc.Parse(nr.Text)
 				if perr != nil {
 					issues = append(issues, VerifyIssue{Rev: rev, Err: perr})
 					continue
@@ -1244,10 +1245,10 @@ func (r *Repo) VerifyRange(from, to uint64, texts bool) ([]VerifyIssue, error) {
 				bad := false
 				for _, ref := range refs {
 					sum += uint64(ref.Size)
-					key := r.keys.Chunk(chunkKeyHash(ref))
+					key := r.keys.Chunk(cdc.HashHex(ref))
 					ok, eerr := r.store.Exists(ctx, key)
 					if eerr != nil || !ok {
-						issues = append(issues, VerifyIssue{Rev: rev, Err: fmt.Errorf("chunk %s missing", chunkKeyHash(ref))})
+						issues = append(issues, VerifyIssue{Rev: rev, Err: fmt.Errorf("chunk %s missing", cdc.HashHex(ref))})
 						bad = true
 						continue
 					}
@@ -1261,7 +1262,7 @@ func (r *Repo) VerifyRange(from, to uint64, texts bool) ([]VerifyIssue, error) {
 						continue
 					}
 					if uint32(len(b)) != ref.Size || sha256.Sum256(b) != ref.Hash {
-						issues = append(issues, VerifyIssue{Rev: rev, Err: fmt.Errorf("chunk %s checksum mismatch", chunkKeyHash(ref))})
+						issues = append(issues, VerifyIssue{Rev: rev, Err: fmt.Errorf("chunk %s checksum mismatch", cdc.HashHex(ref))})
 						bad = true
 					}
 				}
@@ -1724,9 +1725,9 @@ func (r *Repo) CollectTexts(ctx context.Context) (int, error) {
 				refs[nr.TextRef] = true
 			}
 			if nr.TextRep == TextRepChunked {
-				if crefs, err := parseChunkManifest(nr.Text); err == nil {
+				if crefs, err := cdc.Parse(nr.Text); err == nil {
 					for _, ref := range crefs {
-						chunkRefs[chunkKeyHash(ref)] = true
+						chunkRefs[cdc.HashHex(ref)] = true
 					}
 				}
 			}

@@ -210,6 +210,10 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.handleBundleStat(w, r)
 		return
 	}
+	if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/!svngod/chunks") {
+		s.handleBundleChunks(w, r)
+		return
+	}
 	ctx := r.Context()
 	res := parseResource(s.cfg.BasePath, r.URL.Path)
 

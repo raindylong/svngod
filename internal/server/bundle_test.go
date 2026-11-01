@@ -3,7 +3,9 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -20,12 +22,22 @@ import (
 )
 
 type testBundleChange struct {
-	Path    string            `json:"path"`
-	Action  string            `json:"action"`
-	Kind    string            `json:"kind"`
-	BaseRev uint64            `json:"baseRev,omitempty"`
-	Props   map[string]string `json:"props,omitempty"`
-	TextLen int64             `json:"textLen,omitempty"`
+	Path       string            `json:"path"`
+	Action     string            `json:"action"`
+	Kind       string            `json:"kind"`
+	BaseRev    uint64            `json:"baseRev,omitempty"`
+	Props      map[string]string `json:"props,omitempty"`
+	TextLen    int64             `json:"textLen,omitempty"`
+	Chunks     []testBundleChunk `json:"chunks,omitempty"`
+	Missing    []string          `json:"missing,omitempty"`
+	ChunkTotal uint64            `json:"chunkTotal,omitempty"`
+	MD5        string            `json:"md5,omitempty"`
+	SHA1       string            `json:"sha1,omitempty"`
+}
+
+type testBundleChunk struct {
+	Hash string `json:"h"`
+	Size uint32 `json:"n"`
 }
 
 type testBundle struct {
@@ -371,5 +383,81 @@ func TestBundleCheckChangeRejectsStaleBase(t *testing.T) {
 	got, _ := repo.GetText(nr.Node)
 	if string(got) != "a2" {
 		t.Fatalf("/a.txt changed to %q", got)
+	}
+}
+
+func TestBundleChunkedChange(t *testing.T) {
+	ts, repo := newBundleTestServer(t)
+	defer ts.Close()
+	data := []byte("hello world")
+	sum := sha256.Sum256(data)
+	h := hex.EncodeToString(sum[:])
+	md5sum := md5.Sum(data)
+	sha1sum := sha1.Sum(data)
+
+	// Chunk query before upload: the chunk must be reported missing.
+	q, _ := json.Marshal(map[string]interface{}{"hashes": []string{h}})
+	resp, err := http.Post(ts.URL+"/svn/bun/!svngod/chunks", "application/json", bytes.NewReader(q))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var qout struct {
+		Missing []string `json:"missing"`
+	}
+	json.NewDecoder(resp.Body).Decode(&qout)
+	resp.Body.Close()
+	if len(qout.Missing) != 1 || qout.Missing[0] != h {
+		t.Fatalf("missing=%v, want [%s]", qout.Missing, h)
+	}
+
+	mkBody := func(token string, path string, missing []string, payload string) []byte {
+		hdr := &testBundle{Token: token, Message: "chunked", Changes: []testBundleChange{{
+			Path: path, Action: "put", Kind: "file", Chunks: []testBundleChunk{{Hash: h, Size: uint32(len(data))}},
+			Missing: missing, ChunkTotal: uint64(len(data)),
+			MD5: hex.EncodeToString(md5sum[:]), SHA1: hex.EncodeToString(sha1sum[:]),
+		}}}
+		hb, _ := json.Marshal(hdr)
+		var buf bytes.Buffer
+		buf.WriteString(bundleMagic)
+		var sz [8]byte
+		binary.BigEndian.PutUint64(sz[:], uint64(len(hb)))
+		buf.Write(sz[:])
+		buf.Write(hb)
+		buf.WriteString(payload)
+		return buf.Bytes()
+	}
+
+	code, out := postBundle(t, ts, mkBody(strings.Repeat("f6", 16), "/f.txt", []string{h}, string(data)))
+	if code != http.StatusOK {
+		t.Fatalf("chunked upload status=%d out=%v", code, out)
+	}
+	nr, err := repo.Resolve(1, "/f.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nr.TextRep != fs.TextRepChunked {
+		t.Fatalf("rep=%d, want chunked", nr.TextRep)
+	}
+	got, _ := repo.GetText(nr.Node)
+	if string(got) != string(data) {
+		t.Fatalf("text=%q", got)
+	}
+	if ok, _ := repo.Store().Exists(context.Background(), repo.Keys().Chunk(h)); !ok {
+		t.Fatal("chunk not stored")
+	}
+
+	// A second file referencing the same, now present chunk sends no bytes.
+	code, out = postBundle(t, ts, mkBody(strings.Repeat("a7", 16), "/g.txt", nil, ""))
+	if code != http.StatusOK {
+		t.Fatalf("dedupe upload status=%d out=%v", code, out)
+	}
+	head, _ := repo.HeadFresh()
+	if head != 2 {
+		t.Fatalf("head=%d", head)
+	}
+	nr, _ = repo.Resolve(2, "/g.txt")
+	got, _ = repo.GetText(nr.Node)
+	if string(got) != string(data) {
+		t.Fatalf("deduped text=%q", got)
 	}
 }

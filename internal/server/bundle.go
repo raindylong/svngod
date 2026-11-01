@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"svngod/internal/cdc"
 	"svngod/internal/fs"
 	"svngod/internal/fs/store"
 )
@@ -45,11 +47,24 @@ const (
 
 type bundleChange struct {
 	Path    string            `json:"path"`
-	Action  string            `json:"action"` // put | add | modify | delete
+	Action  string            `json:"action"` // put | add | modify | delete | check
 	Kind    string            `json:"kind"`   // file | dir
 	BaseRev uint64            `json:"baseRev,omitempty"`
 	Props   map[string]string `json:"props,omitempty"`
 	TextLen int64             `json:"textLen,omitempty"`
+	// Chunked upload: Chunks is the full ordered manifest, Missing lists the
+	// hashes whose bytes follow the header (in manifest order). MD5/SHA1 are
+	// the full text checksums, required so reads can verify the text.
+	Chunks     []bundleChunk `json:"chunks,omitempty"`
+	Missing    []string      `json:"missing,omitempty"`
+	ChunkTotal uint64        `json:"chunkTotal,omitempty"`
+	MD5        string        `json:"md5,omitempty"`
+	SHA1       string        `json:"sha1,omitempty"`
+}
+
+type bundleChunk struct {
+	Hash string `json:"h"`
+	Size uint32 `json:"n"`
 }
 
 type bundleHeader struct {
@@ -243,6 +258,7 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	var total int64
+	var chunkBytes int64
 	for i := range hdr.Changes {
 		bc := &hdr.Changes[i]
 		path, perr := cleanBundlePath(bc.Path)
@@ -279,8 +295,79 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 		if ch.BaseRev == 0 && action != fs.ActionAdd {
 			ch.BaseRev = base
 		}
-		if bc.TextLen > 0 {
-			if bc.TextLen > fs.ChunkThreshold && kind == fs.KindFile {
+		if len(bc.Chunks) > 0 {
+			// Chunked upload: the header carries the full manifest and the
+			// hashes whose bytes follow. The server re-checks each hash and
+			// stores only what it lacks.
+			if kind != fs.KindFile || action == fs.ActionDelete || bc.TextLen != 0 {
+				http.Error(w, "chunked change must be a file put", http.StatusBadRequest)
+				return
+			}
+			if len(bc.MD5) != 32 || len(bc.SHA1) != 40 {
+				http.Error(w, "chunked change requires md5 and sha1", http.StatusBadRequest)
+				return
+			}
+			md5sum, merr := hex.DecodeString(strings.ToLower(bc.MD5))
+			shaSum, serr := hex.DecodeString(strings.ToLower(bc.SHA1))
+			if merr != nil || serr != nil || len(md5sum) != 16 || len(shaSum) != 20 {
+				http.Error(w, "bad chunked checksums", http.StatusBadRequest)
+				return
+			}
+			refs := make([]cdc.Ref, len(bc.Chunks))
+			for i, c := range bc.Chunks {
+				hb, herr := hex.DecodeString(strings.ToLower(c.Hash))
+				if herr != nil || len(hb) != cdc.HashLen || c.Size == 0 || c.Size > cdc.Max {
+					http.Error(w, "bad chunk entry", http.StatusBadRequest)
+					return
+				}
+				copy(refs[i].Hash[:], hb)
+				refs[i].Size = c.Size
+			}
+			if cdc.Size(refs) != bc.ChunkTotal {
+				http.Error(w, "chunk total mismatch", http.StatusBadRequest)
+				return
+			}
+			missing := make(map[string]bool, len(bc.Missing))
+			for _, h := range bc.Missing {
+				missing[strings.ToLower(h)] = true
+			}
+			for _, ref := range refs {
+				hexh := cdc.HashHex(ref)
+				if missing[hexh] {
+					data := make([]byte, ref.Size)
+					if _, rerr := io.ReadFull(r.Body, data); rerr != nil {
+						http.Error(w, "short chunk", http.StatusBadRequest)
+						return
+					}
+					chunkBytes += int64(ref.Size)
+					if chunkBytes > maxBundleTotal {
+						http.Error(w, "bundle chunks too large", http.StatusRequestEntityTooLarge)
+						return
+					}
+					if sum := sha256.Sum256(data); sum != ref.Hash {
+						http.Error(w, "chunk checksum mismatch", http.StatusBadRequest)
+						return
+					}
+					if err := repo.Store().Put(ctx, repo.Keys().Chunk(hexh), data); err != nil {
+						http.Error(w, err.Error(), http.StatusInternalServerError)
+						return
+					}
+					continue
+				}
+				ok, eerr := repo.Store().Exists(ctx, repo.Keys().Chunk(hexh))
+				if eerr != nil || !ok {
+					writeBundleError(w, http.StatusConflict, "chunk-missing", "a chunk disappeared; retry the upload")
+					return
+				}
+			}
+			ch.ChunkManifest = cdc.Marshal(refs)
+			ch.ChunkTotal = bc.ChunkTotal
+			copy(ch.DataMD5[:], md5sum)
+			ch.HasMD5 = true
+			copy(ch.DataSHA1[:], shaSum)
+			ch.HasSHA1 = true
+		} else if bc.TextLen > 0 {
+			if bc.TextLen > cdc.Threshold && kind == fs.KindFile {
 				// Split the request stream directly into chunks: no temp file
 				// and no second full read for a multi-gigabyte upload.
 				h := md5.New()
@@ -447,7 +534,66 @@ func (s *Server) handleBundleStat(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"files": out})
 }
 
-// writeBundleError returns a machine-readable error so the client can tell an// writeBundleError returns a machine-readable error so the client can tell an
+// chunkQuery asks which chunk objects the repository already has.
+type chunkQuery struct {
+	Hashes []string `json:"hashes"`
+}
+
+// handleBundleChunks answers POST <repo>/!svngod/chunks with the subset the
+// repository lacks, so a client uploads only new chunks of a changed file.
+func (s *Server) handleBundleChunks(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "chunks endpoint accepts POST", http.StatusMethodNotAllowed)
+		return
+	}
+	rest := strings.TrimPrefix(r.URL.Path, strings.TrimSuffix(s.cfg.BasePath, "/")+"/")
+	name := strings.SplitN(rest, "/", 2)[0]
+	if name == "" {
+		http.Error(w, "repository missing", http.StatusBadRequest)
+		return
+	}
+	repo, ok := s.repo(w, resource{repo: name})
+	if !ok {
+		return
+	}
+	if _, ok := s.authenticate(w, r, name); !ok {
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 64<<20))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var req chunkQuery
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "bad chunk query", http.StatusBadRequest)
+		return
+	}
+	if len(req.Hashes) > maxBundleChanges {
+		http.Error(w, "too many chunks", http.StatusBadRequest)
+		return
+	}
+	ctx := context.Background()
+	missing := make([]string, 0)
+	for _, h := range req.Hashes {
+		h = strings.ToLower(h)
+		if len(h) != 64 || strings.Trim(h, "0123456789abcdef") != "" {
+			continue
+		}
+		ok, eerr := repo.Store().Exists(ctx, repo.Keys().Chunk(h))
+		if eerr != nil {
+			http.Error(w, eerr.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			missing = append(missing, h)
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"missing": missing})
+}
+
+// writeBundleError returns a machine-readable error so the client can tell an
 // out-of-date conflict (do not retry; re-run after updating) from a transient
 // failure or a concurrent upload with the same token (retry).
 func writeBundleError(w http.ResponseWriter, status int, code, msg string) {
