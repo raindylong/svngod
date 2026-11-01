@@ -610,13 +610,8 @@ func cmdUpload(args []string) int {
 		return 0
 	}
 
-	body, err := buildBundleFile(bundleHeader{Token: token, BaseRev: head, Message: msg, Changes: changes}, files)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "svngocli: %v\n", err)
-		return 1
-	}
-	defer os.Remove(body)
-	rev, replayed, err := postBundle(repoRoot, body, user, pass)
+	hdr := bundleHeader{Token: token, BaseRev: head, Message: msg, Changes: changes}
+	rev, replayed, err := postBundle(repoRoot, hdr, files, user, pass)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "svngocli: upload failed: %v\n", err)
 		return 1
@@ -900,83 +895,71 @@ func fetchMissingChunks(repoRoot string, hashes []string, user, pass string) (ma
 	return set, nil
 }
 
-func buildBundleFile(hdr bundleHeader, files []uploadFile) (string, error) {
-	tmp, err := os.CreateTemp("", "svngocli-bundle-")
-	if err != nil {
-		return "", err
-	}
-	cleanup := func() {
-		tmp.Close()
-		os.Remove(tmp.Name())
-	}
+// writeBundle emits the bundle header followed by each file's bytes (or just
+// the missing chunks of a chunked file) directly to w.
+func writeBundle(w io.Writer, hdr bundleHeader, files []uploadFile) error {
 	hj, err := json.Marshal(hdr)
 	if err != nil {
-		cleanup()
-		return "", err
+		return err
 	}
 	var sz [8]byte
 	binary.BigEndian.PutUint64(sz[:], uint64(len(hj)))
-	if _, err := tmp.WriteString(bundleMagic); err != nil {
-		cleanup()
-		return "", err
+	if _, err := io.WriteString(w, bundleMagic); err != nil {
+		return err
 	}
-	if _, err := tmp.Write(sz[:]); err != nil {
-		cleanup()
-		return "", err
+	if _, err := w.Write(sz[:]); err != nil {
+		return err
 	}
-	if _, err := tmp.Write(hj); err != nil {
-		cleanup()
-		return "", err
+	if _, err := w.Write(hj); err != nil {
+		return err
 	}
 	for _, f := range files {
 		if f.chunked && len(f.refs) > 0 {
-			if werr := writeMissingChunks(tmp, f); werr != nil {
-				cleanup()
-				return "", werr
+			if werr := writeMissingChunks(w, f); werr != nil {
+				return werr
 			}
 			continue
 		}
 		in, oerr := os.Open(f.local)
 		if oerr != nil {
-			cleanup()
-			return "", oerr
+			return oerr
 		}
-		n, cerr := io.CopyN(tmp, in, f.size)
+		h := sha256.New()
+		n, cerr := io.CopyN(io.MultiWriter(w, h), in, f.size)
 		in.Close()
 		if cerr != nil || n != f.size {
-			cleanup()
-			return "", fmt.Errorf("read %s: copied %d/%d (%v)", f.local, n, f.size, cerr)
+			return fmt.Errorf("read %s: copied %d/%d (%v)", f.local, n, f.size, cerr)
+		}
+		if !bytes.Equal(h.Sum(nil), f.sum[:]) {
+			return fmt.Errorf("%s changed during upload; re-run the upload", f.local)
 		}
 	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmp.Name())
-		return "", err
-	}
-	return tmp.Name(), nil
+	return nil
 }
 
-// postBundle sends the file with retries; the token makes repeats idempotent.
-func postBundle(repoRoot, bodyPath, user, pass string) (uint64, bool, error) {
+// postBundle streams the bundle with retries; the token makes repeats
+// idempotent. Every attempt rebuilds the stream from the local files, so the
+// client never spools a multi-gigabyte body to disk.
+func postBundle(repoRoot string, hdr bundleHeader, files []uploadFile, user, pass string) (uint64, bool, error) {
 	endpoint := strings.TrimSuffix(repoRoot, "/") + "/!svngod/bundle"
 	backoff := time.Second
 	var lastErr error
 	for attempt := 0; attempt < 5; attempt++ {
-		f, err := os.Open(bodyPath)
-		if err != nil {
-			return 0, false, err
-		}
-		fi, _ := f.Stat()
-		req, rerr := http.NewRequest("POST", endpoint, f)
+		pr, pw := io.Pipe()
+		go func() {
+			pw.CloseWithError(writeBundle(pw, hdr, files))
+		}()
+		req, rerr := http.NewRequest("POST", endpoint, pr)
 		if rerr != nil {
-			f.Close()
+			pr.Close()
 			return 0, false, rerr
 		}
-		req.ContentLength = fi.Size()
+		req.ContentLength = -1 // chunked request body
 		req.Header.Set("Content-Type", "application/x-svngod-bundle")
 		req.Header.Set("User-Agent", "svngocli/"+version)
 		setAuth(req, user, pass)
 		resp, derr := httpClient().Do(req)
-		f.Close()
+		pr.Close()
 		if derr != nil {
 			lastErr = derr
 		} else {
