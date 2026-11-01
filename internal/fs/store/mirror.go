@@ -48,6 +48,11 @@ type MirrorStore struct {
 	// repairOnce dedupes concurrent repair runs.
 	repairOnce sync.Mutex
 
+	// recovering is set while a fast recovery loop is running after a mirror
+	// went down, so redundancy is restored in seconds instead of waiting for
+	// the 60s periodic pass.
+	recovering bool
+
 	// mutableOrder orders two values of a mutable key (<0: a older than b).
 	// fs sets it so a rejoining mirror cannot overwrite a newer HEAD pointer
 	// with its stale copy. Without it, values are treated as equal.
@@ -165,6 +170,12 @@ func NewMirror(mirrors []Store, opts ...MirrorOption) *MirrorStore {
 	// electing it before it is caught up would hide committed revisions.
 	m.repairInternal()
 	go m.repairLoop()
+	if m.anyDown() {
+		m.mu.Lock()
+		m.recovering = true
+		m.mu.Unlock()
+		go m.recoveryLoop()
+	}
 	return m
 }
 
@@ -243,12 +254,20 @@ func (m *MirrorStore) primary() (Store, int) {
 // has the acknowledged HEAD.
 func (m *MirrorStore) markDown(i int) {
 	m.mu.Lock()
+	wasHealthy := m.healthy[i]
 	m.healthy[i] = false
 	m.repairable = true
 	if i == m.prim {
 		m.fenced = true
 	}
+	start := wasHealthy && !m.recovering
+	if start {
+		m.recovering = true
+	}
 	m.mu.Unlock()
+	if start {
+		go m.recoveryLoop()
+	}
 }
 
 // SetControlKey names the repository HEAD object so failover can compare the
@@ -307,17 +326,27 @@ func (m *MirrorStore) checkCaughtUp(p Store) error {
 	if !fenced || key == "" || len(want) == 0 {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	got, err := p.Get(ctx, key, nil)
-	if err != nil || ContentETag(got) != ContentETag(want) {
-		go m.repair()
-		return ErrReplicaLagging
+	// A recovering mirror is usually only seconds behind. Failing the write on
+	// the first mismatch turns a failover into a client-visible commit
+	// conflict, so poll while a repair pass copies the missing objects.
+	wantETag := ContentETag(want)
+	go m.repair()
+	deadline := time.Now().Add(8 * time.Second)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		got, err := p.Get(ctx, key, nil)
+		cancel()
+		if err == nil && ContentETag(got) == wantETag {
+			m.mu.Lock()
+			m.fenced = false
+			m.mu.Unlock()
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return ErrReplicaLagging
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
-	m.mu.Lock()
-	m.fenced = false
-	m.mu.Unlock()
-	return nil
 }
 
 // writePrimary runs a write on the elected primary; on a transport failure it
@@ -369,7 +398,7 @@ func (m *MirrorStore) Put(ctx context.Context, key string, data []byte) error {
 		m.noteAcked(data)
 	}
 	// Best-effort mirror to healthy standbys.
-	m.mirrorWrites(ctx, pi, func(s Store) error { return s.Put(ctx, key, data) })
+	m.mirrorWrites(ctx, pi, func(ctx context.Context, s Store) error { return s.Put(ctx, key, data) })
 	return nil
 }
 
@@ -378,7 +407,7 @@ func (m *MirrorStore) PutReconstructible(ctx context.Context, key string, data [
 	if err != nil {
 		return err
 	}
-	m.mirrorWrites(ctx, pi, func(s Store) error { return PutReconstructible(ctx, s, key, data) })
+	m.mirrorWrites(ctx, pi, func(ctx context.Context, s Store) error { return PutReconstructible(ctx, s, key, data) })
 	return nil
 }
 
@@ -407,7 +436,7 @@ func (m *MirrorStore) PutFromReconstructible(ctx context.Context, key string, r 
 	if err != nil {
 		return err
 	}
-	m.mirrorWrites(ctx, pi, func(s Store) error {
+	m.mirrorWrites(ctx, pi, func(ctx context.Context, s Store) error {
 		f, oerr := os.Open(tmpName)
 		if oerr != nil {
 			return oerr
@@ -426,7 +455,7 @@ func (m *MirrorStore) SyncAll(ctx context.Context) error {
 		m.markDown(pi)
 		return err
 	}
-	m.mirrorWrites(ctx, pi, func(s Store) error { return SyncAll(ctx, s) })
+	m.mirrorWrites(ctx, pi, func(ctx context.Context, s Store) error { return SyncAll(ctx, s) })
 	return nil
 }
 
@@ -506,7 +535,7 @@ func (m *MirrorStore) PutFrom(ctx context.Context, key string, r io.Reader, size
 	if err != nil {
 		return err
 	}
-	m.mirrorWrites(ctx, pi, func(s Store) error {
+	m.mirrorWrites(ctx, pi, func(ctx context.Context, s Store) error {
 		f, oerr := os.Open(tmpName)
 		if oerr != nil {
 			return oerr
@@ -623,7 +652,7 @@ func (m *MirrorStore) CreateIfAbsent(ctx context.Context, key string, data []byt
 	if err != nil {
 		return err
 	}
-	m.mirrorWrites(ctx, pi, func(s Store) error { return s.Put(ctx, key, data) })
+	m.mirrorWrites(ctx, pi, func(ctx context.Context, s Store) error { return s.Put(ctx, key, data) })
 	return nil
 }
 
@@ -642,7 +671,7 @@ func (m *MirrorStore) CAS(ctx context.Context, key string, expectETag string, da
 	}
 	// Standbys mirror the current value unconditionally (their own etag does
 	// not matter; they only serve reads after failover).
-	m.mirrorWrites(ctx, pi, func(s Store) error { return s.Put(ctx, key, data) })
+	m.mirrorWrites(ctx, pi, func(ctx context.Context, s Store) error { return s.Put(ctx, key, data) })
 	return newEtag, nil
 }
 
@@ -667,7 +696,7 @@ func (m *MirrorStore) DeleteIfMatch(ctx context.Context, key, etag string) error
 	if err != nil {
 		return err
 	}
-	m.mirrorWrites(ctx, pi, func(s Store) error { return DeleteIfMatch(ctx, s, key, etag) })
+	m.mirrorWrites(ctx, pi, func(ctx context.Context, s Store) error { return DeleteIfMatch(ctx, s, key, etag) })
 	return nil
 }
 
@@ -676,7 +705,7 @@ func (m *MirrorStore) Delete(ctx context.Context, keys []string) error {
 	if err != nil {
 		return err
 	}
-	m.mirrorWrites(ctx, pi, func(s Store) error { return s.Delete(ctx, keys) })
+	m.mirrorWrites(ctx, pi, func(ctx context.Context, s Store) error { return s.Delete(ctx, keys) })
 	return nil
 }
 
@@ -687,13 +716,18 @@ func (m *MirrorStore) DeletePrefix(ctx context.Context, prefix string) error {
 		m.markDown(pi)
 		return err
 	}
-	m.mirrorWrites(ctx, pi, func(s Store) error { return DeletePrefix(ctx, s, prefix) })
+	m.mirrorWrites(ctx, pi, func(ctx context.Context, s Store) error { return DeletePrefix(ctx, s, prefix) })
 	return nil
 }
 
+// standbyWriteTimeout bounds how long a commit waits for one standby. It is
+// far above a healthy write (tens of ms locally) but short enough that a dead
+// node costs a few seconds, not the S3 SDK's full retry budget.
+const standbyWriteTimeout = 8 * time.Second
+
 // mirrorWrites fans a standby write out to every healthy mirror in parallel:
 // standbys are best effort, so their latency must not add to the request.
-func (m *MirrorStore) mirrorWrites(ctx context.Context, pi int, fn func(Store) error) {
+func (m *MirrorStore) mirrorWrites(ctx context.Context, pi int, fn func(context.Context, Store) error) {
 	var wg sync.WaitGroup
 	for i, s := range m.mirrors {
 		if i == pi || !m.isHealthy(i) {
@@ -702,7 +736,12 @@ func (m *MirrorStore) mirrorWrites(ctx context.Context, pi int, fn func(Store) e
 		wg.Add(1)
 		go func(i int, s Store) {
 			defer wg.Done()
-			if err := fn(s); err != nil {
+			// A standby that just died must not hold the commit for the S3
+			// client's full retry budget. The primary already holds the data;
+			// anything skipped here is copied by the periodic repair pass.
+			wctx, cancel := context.WithTimeout(ctx, standbyWriteTimeout)
+			defer cancel()
+			if err := fn(wctx, s); err != nil {
 				m.markDown(i)
 				m.noteError(i, err)
 				fmt.Printf("mirror[%d] standby write failed: %v\n", i, err)
@@ -765,6 +804,62 @@ func (m *MirrorStore) repairLoop() {
 	}
 }
 
+// anyDown reports whether any mirror is currently out of service.
+func (m *MirrorStore) anyDown() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, h := range m.healthy {
+		if !h {
+			return true
+		}
+	}
+	return false
+}
+
+// recoveryLoop retries repair while a mirror is down. The periodic pass runs
+// every 60s, which is too slow to restore redundancy after a short restart; a
+// degraded mirror is repaired every few seconds until it is whole again.
+func (m *MirrorStore) recoveryLoop() {
+	defer func() {
+		m.mu.Lock()
+		m.recovering = false
+		m.mu.Unlock()
+	}()
+	for {
+		select {
+		case <-m.stop:
+			return
+		default:
+		}
+		if !m.anyDown() {
+			return
+		}
+		m.repair()
+		delay := 3 * time.Second
+		if !m.anyReachable() {
+			delay = 10 * time.Second
+		}
+		select {
+		case <-m.stop:
+			return
+		case <-time.After(delay):
+		}
+	}
+}
+
+// anyReachable reports whether at least one mirror is in service; when all are
+// down there is nothing useful for a repair pass to copy.
+func (m *MirrorStore) anyReachable() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, h := range m.healthy {
+		if h {
+			return true
+		}
+	}
+	return false
+}
+
 // RepairNow runs one repair pass immediately and synchronously (used on
 // startup / when a mirror is marked down). It must not silently skip because a
 // background repair holds the lock: callers expect the pass to have finished.
@@ -823,9 +918,16 @@ func (m *MirrorStore) repairInternal() {
 	// A mirror with every object is complete; anything missing keeps it out of
 	// service until the background loop has copied the data (a healed mirror
 	// must not serve reads for objects it lacks).
-	need := make([]bool, n)
+	// missing counts the objects each reachable mirror still lacks; a mirror
+	// is healthy only when that reaches zero (or every copy attempt failed in
+	// a way we could see). Counting is stricter than "it was incomplete but no
+	// put errored": a key no reachable mirror can serve must keep the mirror
+	// out of service.
+	missing := make([]int, n)
 	for i := range m.mirrors {
-		need[i] = reachable[i] && len(sets[i]) < len(keys)
+		if reachable[i] {
+			missing[i] = len(keys) - len(sets[i])
+		}
 	}
 	failed := make([]bool, n)
 
@@ -862,14 +964,14 @@ func (m *MirrorStore) repairInternal() {
 			if err := m.mirrors[i].Put(ctx, k, val); err != nil {
 				log.Printf("mirror[%d] repair put %q: %v", i, k, err)
 				failed[i] = true
+			} else {
+				missing[i]--
 			}
 		}
 	}
 
 	for i := range m.mirrors {
-		// Complete now when it already had everything, or when everything it
-		// was missing has just been copied successfully.
-		m.setHealthy(i, reachable[i] && !failed[i] && (len(sets[i]) == len(keys) || need[i]))
+		m.setHealthy(i, reachable[i] && !failed[i] && missing[i] <= 0)
 	}
 }
 

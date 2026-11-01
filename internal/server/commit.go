@@ -20,6 +20,7 @@ import (
 
 	"svngod/internal/cdc"
 	"svngod/internal/fs"
+	"svngod/internal/fs/store"
 	"svngod/internal/svndiff"
 )
 
@@ -1385,7 +1386,7 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 				http.Error(w, "Access forbidden to "+ch.Path, http.StatusForbidden)
 				return
 			}
-			if lp, e := s.lockForPathLocked(res.repo, ch.Path); e != nil && !mergeLockCovers(mergeLocks, lp, e.token) {
+			if lp, e := s.lockForPathLocked(res.repo, ch.Path); e != nil && !mergeLockCovers(mergeLocks, res.path, lp, e.token) {
 				s.mu.Unlock()
 				http.Error(w, "Locked: "+ch.Path, http.StatusLocked)
 				return
@@ -1450,13 +1451,21 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 			writeOutOfDate(w, "/")
 			return
 		}
+		if errors.Is(err, store.ErrReplicaLagging) {
+			// The standby has not caught up with the last acknowledged HEAD.
+			// This is transient: a 503 tells the client to retry instead of
+			// reporting a bogus out-of-date conflict.
+			w.Header().Set("Retry-After", "2")
+			http.Error(w, "repository backend is catching up; retry the commit", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, "commit failed: "+err.Error(), http.StatusConflict)
 		return
 	}
 	// A commit made without --no-unlock asks the server to release the locks it
 	// used; the client sends no separate UNLOCK for them.
 	if strings.Contains(r.Header.Get("X-SVN-Options"), "release-locks") {
-		s.releaseCommittedLocks(res.repo, repo, mergeLocks)
+		s.releaseCommittedLocks(res.repo, repo, res.path, mergeLocks)
 	}
 	if s.cfg.HooksDir != "" {
 		go func(rev uint64) {

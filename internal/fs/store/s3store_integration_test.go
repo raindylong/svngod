@@ -3,8 +3,11 @@ package store
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -158,4 +161,44 @@ func mustGet(t *testing.T, st Store, ctx context.Context, key string) []byte {
 		t.Fatalf("get %s: %v", key, err)
 	}
 	return b
+}
+
+// TestS3StoreCASConcurrent proves the backend enforces If-Match atomically:
+// with one shared base ETag only one of many concurrent writers may win.
+// A backend that checks and renames non-atomically (like a naive file server)
+// lets several succeed and silently loses updates.
+func TestS3StoreCASConcurrent(t *testing.T) {
+	cfg, ok := s3TestEnv(t)
+	if !ok {
+		t.Skip("S3_ENDPOINT not set; skipping live S3 integration test")
+	}
+	ensureBucket(t, cfg)
+	cfg.RepoPrefix = "it/cas-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	st, err := NewS3Store(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	const key = "repos/r/current"
+	if err := st.Put(ctx, key, []byte("v0")); err != nil {
+		t.Fatal(err)
+	}
+	etag := ContentETag([]byte("v0"))
+
+	const n = 8
+	var wg sync.WaitGroup
+	var okCount int32
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if _, err := st.CAS(ctx, key, etag, []byte(fmt.Sprintf("v%d", i))); err == nil {
+				atomic.AddInt32(&okCount, 1)
+			}
+		}(i)
+	}
+	wg.Wait()
+	if okCount != 1 {
+		t.Fatalf("successful CAS=%d, want exactly 1", okCount)
+	}
 }

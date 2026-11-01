@@ -48,8 +48,8 @@ func TestCommitLeaseStaleIsBroken(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Simulate a crashed holder: an old lease object.
-	old := time.Now().Add(-3 * commitLeaseTTL)
-	if err := st.Put(context.Background(), r.keys.CommitLock(), []byte("crashed  "+time.Now().Add(-3*commitLeaseTTL).Format(time.RFC3339))); err != nil {
+	old := time.Now().Add(-3 * leaseTTL())
+	if err := st.Put(context.Background(), r.keys.CommitLock(), []byte("crashed  "+time.Now().Add(-3*leaseTTL()).Format(time.RFC3339))); err != nil {
 		t.Fatal(err)
 	}
 	_ = old
@@ -77,9 +77,9 @@ func TestCommitLeaseBusy(t *testing.T) {
 	if err := st.CreateIfAbsent(context.Background(), r.keys.CommitLock(), []byte(fmt.Sprintf("other %d", time.Now().UnixNano()))); err != nil {
 		t.Fatal(err)
 	}
-	oldWait := commitLeaseWait
-	commitLeaseWait = 200 * time.Millisecond
-	defer func() { commitLeaseWait = oldWait }()
+	oldWait := commitLeaseWait.Load()
+	commitLeaseWait.Store(int64(200 * time.Millisecond))
+	defer func() { commitLeaseWait.Store(oldWait) }()
 	_, err = r.CommitTxn(0, []Change{{Path: "/a", Action: ActionAdd, Kind: KindFile, Data: []byte("x")}}, nil)
 	if !errors.Is(err, ErrCommitBusy) {
 		t.Fatalf("err=%v, want ErrCommitBusy", err)
@@ -149,9 +149,15 @@ func TestLeaseRenewalKeepsLockLive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	oldTTL, oldWait, oldPoll := commitLeaseTTL, commitLeaseWait, commitLeasePoll
-	commitLeaseTTL, commitLeaseWait, commitLeasePoll = 150*time.Millisecond, 300*time.Millisecond, 10*time.Millisecond
-	defer func() { commitLeaseTTL, commitLeaseWait, commitLeasePoll = oldTTL, oldWait, oldPoll }()
+	oldTTL, oldWait, oldPoll := commitLeaseTTL.Load(), commitLeaseWait.Load(), commitLeasePoll.Load()
+	commitLeaseTTL.Store(int64(150 * time.Millisecond))
+	commitLeaseWait.Store(int64(300 * time.Millisecond))
+	commitLeasePoll.Store(int64(10 * time.Millisecond))
+	defer func() {
+		commitLeaseTTL.Store(oldTTL)
+		commitLeaseWait.Store(oldWait)
+		commitLeasePoll.Store(oldPoll)
+	}()
 
 	l, err := r.acquireCommitLease(context.Background())
 	if err != nil {

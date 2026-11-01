@@ -306,15 +306,35 @@ func parseMergeLocks(body []byte) []mergeLock {
 	return out
 }
 
+// mergeLockAbsPath resolves a MERGE lock-path. svn sends these relative to the
+// MERGE target, which is the shallowest modified path (repo root, a subdir, or
+// the VCC), not necessarily the repository root.
+func mergeLockAbsPath(target, p string) string {
+	p = strings.TrimSpace(p)
+	if strings.HasPrefix(p, "/") {
+		return "/" + strings.Trim(p, "/")
+	}
+	t := "/" + strings.Trim(target, "/")
+	rel := strings.Trim(p, "/")
+	switch {
+	case rel == "":
+		return t
+	case t == "/":
+		return "/" + rel
+	default:
+		return t + "/" + rel
+	}
+}
+
 // mergeLockCovers reports whether the MERGE body listed the lock on lockPath
-// with the given token (lock paths are repository-relative, without a slash).
-func mergeLockCovers(locks []mergeLock, lockPath, token string) bool {
+// with the given token.
+func mergeLockCovers(locks []mergeLock, target, lockPath, token string) bool {
 	want := "/" + strings.Trim(lockPath, "/")
 	for _, l := range locks {
 		if l.Token != token {
 			continue
 		}
-		if "/"+strings.Trim(strings.TrimSpace(l.Path), "/") == want {
+		if mergeLockAbsPath(target, l.Path) == want {
 			return true
 		}
 	}
@@ -324,13 +344,13 @@ func mergeLockCovers(locks []mergeLock, lockPath, token string) bool {
 // releaseCommittedLocks drops the locks a successful commit used, mirroring
 // mod_dav_svn's X-SVN-Options: release-locks behaviour. Commits made with
 // --no-unlock do not send that header and keep their locks.
-func (s *Server) releaseCommittedLocks(repoName string, repo *fs.Repo, locks []mergeLock) {
+func (s *Server) releaseCommittedLocks(repoName string, repo *fs.Repo, target string, locks []mergeLock) {
 	if len(locks) == 0 {
 		return
 	}
 	want := make(map[string]string, len(locks))
 	for _, l := range locks {
-		want["/"+strings.Trim(strings.TrimSpace(l.Path), "/")] = l.Token
+		want[mergeLockAbsPath(target, l.Path)] = l.Token
 	}
 	if _, err := s.mutateLocks(repoName, repo, func(list []lockedJSON) ([]lockedJSON, interface{}, error) {
 		kept := list[:0]

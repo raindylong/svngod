@@ -25,10 +25,22 @@ var (
 	ErrCommitBusy = errors.New("fs: another commit is in progress")
 	ErrLeaseLost  = errors.New("fs: commit lease lost")
 
-	commitLeaseTTL  = 2 * time.Minute
-	commitLeaseWait = 30 * time.Second
-	commitLeasePoll = 50 * time.Millisecond
+	// Nanoseconds, accessed atomically: tests retune the timings while a
+	// background heartbeat from another lease may still be reading them.
+	commitLeaseTTL  atomic.Int64
+	commitLeaseWait atomic.Int64
+	commitLeasePoll atomic.Int64
 )
+
+func init() {
+	commitLeaseTTL.Store(int64(2 * time.Minute))
+	commitLeaseWait.Store(int64(30 * time.Second))
+	commitLeasePoll.Store(int64(50 * time.Millisecond))
+}
+
+func leaseTTL() time.Duration  { return time.Duration(commitLeaseTTL.Load()) }
+func leaseWait() time.Duration { return time.Duration(commitLeaseWait.Load()) }
+func leasePoll() time.Duration { return time.Duration(commitLeasePoll.Load()) }
 
 func leaseToken() string {
 	var b [8]byte
@@ -85,7 +97,7 @@ func (l *commitLease) Release(st store.Store) {
 }
 
 func (l *commitLease) keepAlive(ctx context.Context, st store.Store) {
-	interval := commitLeaseTTL / 3
+	interval := leaseTTL() / 3
 	if interval < 10*time.Millisecond {
 		interval = 10 * time.Millisecond
 	}
@@ -117,7 +129,7 @@ func (r *Repo) acquireCommitLease(ctx context.Context) (*commitLease, error) {
 	key := r.keys.CommitLock()
 	l := &commitLease{key: key, token: leaseToken(), stop: make(chan struct{})}
 	payload := l.payload()
-	deadline := time.Now().Add(commitLeaseWait)
+	deadline := time.Now().Add(leaseWait())
 	for {
 		err := r.store.CreateIfAbsent(ctx, key, payload)
 		if err == nil {
@@ -128,7 +140,7 @@ func (r *Repo) acquireCommitLease(ctx context.Context) (*commitLease, error) {
 			return nil, err
 		}
 		if cur, gerr := r.store.Get(ctx, key, nil); gerr == nil {
-			if ts, ok := leaseTimestamp(string(cur)); !ok || time.Since(ts) > commitLeaseTTL {
+			if ts, ok := leaseTimestamp(string(cur)); !ok || time.Since(ts) > leaseTTL() {
 				r.breakCommitLease(ctx, key, l.token)
 				continue
 			}
@@ -139,7 +151,7 @@ func (r *Repo) acquireCommitLease(ctx context.Context) (*commitLease, error) {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(commitLeasePoll):
+		case <-time.After(leasePoll()):
 		}
 	}
 }
@@ -154,7 +166,7 @@ func (r *Repo) breakCommitLease(ctx context.Context, key, token string) {
 	payload := []byte(fmt.Sprintf("%s %d", token, time.Now().UnixNano()))
 	if err := r.store.CreateIfAbsent(ctx, marker, payload); err != nil {
 		if cur, gerr := r.store.Get(ctx, marker, nil); gerr == nil {
-			if ts, ok := leaseTimestamp(string(cur)); !ok || time.Since(ts) > commitLeaseTTL {
+			if ts, ok := leaseTimestamp(string(cur)); !ok || time.Since(ts) > leaseTTL() {
 				_ = r.store.Delete(ctx, []string{marker})
 			}
 		}
@@ -165,7 +177,7 @@ func (r *Repo) breakCommitLease(ctx context.Context, key, token string) {
 	if gerr != nil {
 		return
 	}
-	if ts, ok := leaseTimestamp(string(cur)); ok && time.Since(ts) <= commitLeaseTTL {
+	if ts, ok := leaseTimestamp(string(cur)); ok && time.Since(ts) <= leaseTTL() {
 		return // renewed by a live holder
 	}
 	_ = store.DeleteIfMatch(ctx, r.store, key, store.ContentETag(cur))

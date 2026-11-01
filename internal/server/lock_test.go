@@ -274,14 +274,22 @@ func TestParseMergeLocks(t *testing.T) {
 	if len(locks) != 2 {
 		t.Fatalf("parsed %d locks, want 2", len(locks))
 	}
-	if !mergeLockCovers(locks, "/f.txt", "opaquelocktoken:01") {
+	if !mergeLockCovers(locks, "", "/f.txt", "opaquelocktoken:01") {
 		t.Fatal("leading-slash lock path not matched")
 	}
-	if mergeLockCovers(locks, "/f.txt", "opaquelocktoken:02") {
+	if mergeLockCovers(locks, "", "/f.txt", "opaquelocktoken:02") {
 		t.Fatal("token matched the wrong path")
 	}
-	if !mergeLockCovers(locks, "/dir/c.txt", "opaquelocktoken:02") {
+	if !mergeLockCovers(locks, "", "/dir/c.txt", "opaquelocktoken:02") {
 		t.Fatal("nested lock path not matched")
+	}
+	// svn commits from a subdirectory MERGE to that subdirectory and sends
+	// lock paths relative to it; they must still resolve to the repo path.
+	if !mergeLockCovers(locks, "/trunk", "/trunk/f.txt", "opaquelocktoken:01") {
+		t.Fatal("lock path relative to the MERGE target not resolved")
+	}
+	if mergeLockCovers(locks, "/other", "/trunk/f.txt", "opaquelocktoken:01") {
+		t.Fatal("lock path resolved against the wrong target")
 	}
 }
 
@@ -297,7 +305,7 @@ func TestReleaseCommittedLocks(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	a.releaseCommittedLocks("demo", repo, []mergeLock{{Path: "trunk/README.txt", Token: "urn:uuid:aa"}})
+	a.releaseCommittedLocks("demo", repo, "", []mergeLock{{Path: "trunk/README.txt", Token: "urn:uuid:aa"}})
 	list, _, err := readLockState(repo)
 	if err != nil {
 		t.Fatal(err)

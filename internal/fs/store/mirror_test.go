@@ -209,3 +209,35 @@ func TestMirrorStatusReportsHealth(t *testing.T) {
 		t.Fatal("replica 1 still healthy after markDown")
 	}
 }
+
+// TestMirrorRecoveryLoopRestoresStandby: after a standby goes down and misses a
+// write, it must be repaired and returned to service within seconds, not after
+// the 60s periodic pass. A stale standby must not serve reads meanwhile.
+func TestMirrorRecoveryLoopRestoresStandby(t *testing.T) {
+	f := newMirrorFixtures(t)
+	ctx := f.ctx
+	if err := f.m.Put(ctx, "repos/demo/a", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	f.m.markDown(1)
+	if err := f.m.Put(ctx, "repos/demo/b", []byte("v2")); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := f.b.Head(ctx, "repos/demo/b"); ok {
+		t.Fatal("standby unexpectedly holds the object it missed")
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if f.m.isHealthy(1) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !f.m.isHealthy(1) {
+		t.Fatal("standby not returned to service by the recovery loop")
+	}
+	if _, ok, _ := f.b.Head(ctx, "repos/demo/b"); !ok {
+		t.Fatal("standby still missing the object after repair")
+	}
+	f.m.Close()
+}
