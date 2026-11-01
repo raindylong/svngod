@@ -482,3 +482,79 @@ func TestUploadLimitDisabled(t *testing.T) {
 		rel()
 	}
 }
+
+func TestMetricsEndpoint(t *testing.T) {
+	ts, _, base := testServer(t, "", "")
+	defer ts.Close()
+	resp := doRequest(t, "OPTIONS", base+"/svn/demo", "", "", "", nil)
+	resp.Body.Close()
+	mr, err := http.Get(ts.URL + "/_metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mr.Body.Close()
+	b, _ := io.ReadAll(mr.Body)
+	body := string(b)
+	for _, want := range []string{
+		`svngod_http_requests_total{method="OPTIONS"`,
+		"svngod_http_request_duration_seconds_sum",
+		"svngod_http_request_bytes_total",
+		"svngod_upload_inflight",
+		"svngod_upload_limit",
+		"svngod_commits_total",
+		"svngod_bundle_uploads_total",
+		"svngod_bundle_replays_total",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestMetricsDisabled(t *testing.T) {
+	srv := New(Config{DisableMetrics: true})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/_metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404", resp.StatusCode)
+	}
+}
+
+func TestMetricsCountsCommitsAndReplays(t *testing.T) {
+	ts, repo := newBundleTestServer(t)
+	defer ts.Close()
+	b := &testBundle{Token: strings.Repeat("9a", 16), Message: "m"}
+	body := b.body("hello")
+	if code, out := postBundle(t, ts, body); code != http.StatusOK {
+		t.Fatalf("upload status=%d out=%v", code, out)
+	}
+	// Same token again: replay.
+	if code, out := postBundle(t, ts, body); code != http.StatusOK {
+		t.Fatalf("replay status=%d out=%v", code, out)
+	}
+	head, _ := repo.HeadFresh()
+	if head != 1 {
+		t.Fatalf("head=%d", head)
+	}
+	resp, err := http.Get(ts.URL + "/_metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bts, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	bodyStr := string(bts)
+	if !strings.Contains(bodyStr, "svngod_commits_total 1") {
+		t.Fatalf("commits metric wrong:\n%s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, "svngod_bundle_uploads_total 1") {
+		t.Fatalf("uploads metric wrong:\n%s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, "svngod_bundle_replays_total 1") {
+		t.Fatalf("replays metric wrong:\n%s", bodyStr)
+	}
+}

@@ -50,6 +50,7 @@ type fileConfig struct {
 	// MaxUploads bounds concurrent PUT/bundle bodies (0 = server default 16).
 	MaxUploads     int        `json:"max-uploads"`
 	MaxUserUploads int        `json:"max-user-uploads"`
+	DisableMetrics bool       `json:"disable-metrics"`
 	Repos          []fileRepo `json:"repos"`
 }
 

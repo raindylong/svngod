@@ -49,6 +49,9 @@ type Config struct {
 	// client cannot occupy every slot. Zero = unlimited.
 	MaxUserUploads int
 
+	// DisableMetrics turns off the /_metrics exposition endpoint.
+	DisableMetrics bool
+
 	// Logger for request logging; nil disables.
 	Logger *log.Logger
 }
@@ -107,6 +110,7 @@ type Server struct {
 	uploads     chan struct{}       // nil when uploads are unlimited
 	upMu        sync.Mutex
 	userUploads map[string]int
+	m           *metrics
 }
 
 // New builds a Server.
@@ -120,6 +124,7 @@ func New(cfg Config) *Server {
 		stateLoaded: map[string]bool{},
 		repoCache:   map[string]*fs.Repo{},
 		userUploads: map[string]int{},
+		m:           newMetrics(cfg.MaxConcurrentUploads),
 	}
 	if cfg.MaxConcurrentUploads > 0 {
 		s.uploads = make(chan struct{}, cfg.MaxConcurrentUploads)
@@ -144,12 +149,14 @@ func (s *Server) acquireUpload(w http.ResponseWriter, r *http.Request, user stri
 			return nil, false
 		}
 	}
+	s.m.acquire()
 	counted := false
 	if s.cfg.MaxUserUploads > 0 && user != "" {
 		s.upMu.Lock()
 		if s.userUploads[user] >= s.cfg.MaxUserUploads {
 			s.upMu.Unlock()
 			releaseGlobal()
+			s.m.release()
 			w.Header().Set("Retry-After", "30")
 			http.Error(w, "user upload limit reached", http.StatusTooManyRequests)
 			return nil, false
@@ -159,6 +166,7 @@ func (s *Server) acquireUpload(w http.ResponseWriter, r *http.Request, user stri
 		s.upMu.Unlock()
 	}
 	return func() {
+		s.m.release()
 		if counted {
 			s.upMu.Lock()
 			if n := s.userUploads[user] - 1; n > 0 {
@@ -194,6 +202,7 @@ type identityKey struct{}
 type statusWriter struct {
 	http.ResponseWriter
 	code int
+	n    int64
 }
 
 func (s *statusWriter) WriteHeader(code int) { s.code = code; s.ResponseWriter.WriteHeader(code) }
@@ -201,7 +210,9 @@ func (s *statusWriter) Write(b []byte) (int, error) {
 	if s.code == 0 {
 		s.code = 200
 	}
-	return s.ResponseWriter.Write(b)
+	n, err := s.ResponseWriter.Write(b)
+	s.n += int64(n)
+	return n, err
 }
 
 // IdentityFrom pulls the authenticated identity out of a request context.
@@ -219,6 +230,15 @@ func (s *Server) Handler() http.Handler {
 
 // route is the top-level dispatcher: auth, then per-method handling.
 func (s *Server) route(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/_metrics" {
+		s.serveMetrics(w)
+		return
+	}
+	var cr *countingReadCloser
+	if r.Body != nil {
+		cr = &countingReadCloser{r: r.Body}
+		r.Body = cr
+	}
 	sw := &statusWriter{ResponseWriter: w}
 	w = sw
 	// One summary line per request (status + user) when a logger is set; the
@@ -226,6 +246,11 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	user := ""
 	start := time.Now()
 	defer func() {
+		if cr != nil {
+			s.m.addRead(cr.n)
+		}
+		s.m.addWrite(sw.n)
+		s.m.observe(r.Method, sw.code, time.Since(start))
 		if s.cfg.Logger != nil {
 			s.cfg.Logger.Printf("HTTP %d %s %s user=%q %v", sw.code, r.Method, r.URL.Path, user, time.Since(start).Round(time.Microsecond))
 		}

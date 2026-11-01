@@ -63,6 +63,7 @@ type options struct {
 	tlsKey         string
 	maxUploads     int
 	maxUserUploads int
+	metrics        bool
 }
 
 func (o *options) makeStore() (store.Store, error) {
@@ -117,6 +118,7 @@ func main() {
 	fl.StringVar(&o.addr, "addr", ":8080", "listen address")
 	fl.IntVar(&o.maxUploads, "max-uploads", 16, "maximum concurrent PUT/bundle uploads (0 = unlimited)")
 	fl.IntVar(&o.maxUserUploads, "max-user-uploads", 4, "maximum concurrent uploads per user (0 = unlimited)")
+	fl.BoolVar(&o.metrics, "metrics", true, "expose Prometheus metrics at /_metrics")
 	fl.StringVar(&o.basePath, "base-path", "/svn", "URL prefix for repositories")
 	fl.StringVar(&o.repoRoot, "repo-root", "./repos", "local directory holding repositories")
 	fl.StringVar(&o.passwd, "passwd", "", "local password file (plain/{SHA}/{CRYPT})")
@@ -181,6 +183,7 @@ func main() {
 		HooksDir:             o.hooksDir,
 		MaxConcurrentUploads: o.maxUploads,
 		MaxUserUploads:       o.maxUserUploads,
+		DisableMetrics:       !o.metrics,
 		Logger:               log.New(os.Stderr, "svngod ", log.LstdFlags),
 	})
 
@@ -243,6 +246,7 @@ func runMultiRepo(configPath string) {
 		HooksDir:             cfg.Hooks,
 		MaxConcurrentUploads: maxUploads,
 		MaxUserUploads:       maxUserUploads,
+		DisableMetrics:       cfg.DisableMetrics,
 		Logger:               log.New(os.Stderr, "svngod ", log.LstdFlags),
 	})
 	log.Printf("svngod listening on %s (base %s, %d repos)", addr, cfg.BasePath, len(repos))

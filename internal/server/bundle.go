@@ -175,6 +175,7 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		repo.Store().Delete(ctx, []string{intentKey})
+		s.m.bundleReplays.Add(1)
 		writeBundleResult(w, rec.Rev, true)
 		return
 	}
@@ -186,11 +187,13 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 		if rev, found := findCommittedToken(ctx, repo, hdr.Token, in.Created); found {
 			saveBundleRecord(ctx, repo, key, hdr.Token, user, rev)
 			repo.Store().Delete(ctx, []string{intentKey})
+			s.m.bundleReplays.Add(1)
 			io.Copy(io.Discard, io.LimitReader(r.Body, maxBundleTotal))
 			writeBundleResult(w, rev, true)
 			return
 		}
 	}
+	s.m.bundleUploads.Add(1)
 	// Persist the intent before claiming/committing so the recovery path above
 	// knows which token to look for.
 	if b, merr := json.Marshal(bundleIntent{
@@ -428,6 +431,9 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 		"svngod:bundle-token": hdr.Token,
 	}
 	rev, cerr := repo.CommitTxn(base, changes, revProps)
+	if cerr == nil {
+		s.m.commits.Add(1)
+	}
 	if cerr != nil {
 		var ood *fs.OutOfDateError
 		if errors.As(cerr, &ood) {
