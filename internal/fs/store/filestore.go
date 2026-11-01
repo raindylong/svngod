@@ -403,11 +403,15 @@ func (s *FileStore) CreateIfAbsent(_ context.Context, key string, data []byte) e
 	return s.syncDir(filepath.Dir(p))
 }
 
+// casLockName is the advisory lock file used to serialise compare-and-swap
+// across FileStore processes sharing one directory. It is not an object.
+const casLockName = ".cas.lock"
+
 // acquireCASLock takes an advisory exclusive lock shared by every FileStore
 // pointed at this base directory, so compare-and-swap is atomic across
 // processes, not just goroutines.
 func (s *FileStore) acquireCASLock() (*os.File, error) {
-	f, err := os.OpenFile(filepath.Join(s.base, ".cas.lock"), os.O_CREATE|os.O_RDWR, 0o644)
+	f, err := os.OpenFile(filepath.Join(s.base, casLockName), os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
 	}
@@ -522,6 +526,11 @@ func (s *FileStore) ListPrefix(_ context.Context, prefix, continuation string, m
 			return nil // skip missing
 		}
 		if d.IsDir() {
+			return nil
+		}
+		// The CAS lock file is process coordination, not a stored object; the
+		// mirror repair pass lists every key and must not copy it to S3.
+		if d.Name() == casLockName {
 			return nil
 		}
 		rel, err := filepath.Rel(s.base, path)

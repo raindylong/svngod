@@ -27,8 +27,29 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+// keyLocks serialises conditional writes per object. Real S3 enforces
+// If-Match atomically; a naive stat-then-rename lets two concurrent PUTs both
+// pass the check and lose an update, which would make CAS tests flaky.
+var (
+	keyLocksMu sync.Mutex
+	keyLocks   = map[string]*sync.Mutex{}
+)
+
+func keyLock(bucket, key string) *sync.Mutex {
+	k := bucket + "/" + key
+	keyLocksMu.Lock()
+	defer keyLocksMu.Unlock()
+	l := keyLocks[k]
+	if l == nil {
+		l = &sync.Mutex{}
+		keyLocks[k] = l
+	}
+	return l
+}
 
 func isChunked(r *http.Request) bool {
 	ce := r.Header.Get("Content-Encoding")
@@ -215,6 +236,9 @@ func main() {
 
 		case r.Method == "PUT":
 			full := objPath(root, bucket, key)
+			lock := keyLock(bucket, key)
+			lock.Lock()
+			defer lock.Unlock()
 			if r.Header.Get("If-None-Match") == "*" {
 				if _, err := os.Stat(full); err == nil {
 					writeError(sw, 412, "PreconditionFailed", "object exists")

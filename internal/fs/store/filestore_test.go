@@ -230,4 +230,15 @@ func TestCASAcrossInstances(t *testing.T) {
 	if ok != 1 {
 		t.Fatalf("successful CAS=%d, want exactly 1 (lost update)", ok)
 	}
+	// The coordination file must never leak into object listings (mirror repair
+	// copies every listed key to the other backends).
+	objs, _, err := a.ListPrefix(ctx, "", "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range objs {
+		if o.Key == casLockName {
+			t.Fatalf("lock file %q appeared as a stored object", casLockName)
+		}
+	}
 }
