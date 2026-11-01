@@ -67,6 +67,13 @@ type Repo struct {
 	blockCache   map[uint64]*RevBlock
 	blockBytes   int
 
+	// Parsed revprops packs, keyed by shard. A packed revprops object holds up
+	// to shardSz revisions; fetching it per revision made svn log O(pack size)
+	// per entry on object storage. Bounded to a few shards.
+	revPropsPackMu    sync.Mutex
+	revPropsPacks     map[uint64]map[uint64]*RevProps
+	revPropsPackOrder []uint64
+
 	// Short-lived HEAD cache: one commit issues several requests (OPTIONS,
 	// PROPFIND, REPORT, CHECKOUT, MERGE), each of which would otherwise read
 	// the current pointer from the object store. Writes that depend on a fresh
@@ -1598,6 +1605,7 @@ func (r *Repo) PackShard(shard uint64) error {
 	if err := r.store.Put(ctx, r.keys.PackedDone(shard), []byte("1")); err != nil {
 		return err
 	}
+	r.invalidateRevPropsPack(shard)
 	r.cache.Clear()
 	return nil
 }
@@ -1827,6 +1835,43 @@ func (r *Repo) GetRevProps(rev uint64) (*RevProps, error) {
 	return rp, nil
 }
 
+const revPropsPackCacheMax = 4
+
+func (r *Repo) cachedRevPropsPack(sh uint64) map[uint64]*RevProps {
+	r.revPropsPackMu.Lock()
+	defer r.revPropsPackMu.Unlock()
+	return r.revPropsPacks[sh]
+}
+
+func (r *Repo) putRevPropsPack(sh uint64, m map[uint64]*RevProps) {
+	r.revPropsPackMu.Lock()
+	defer r.revPropsPackMu.Unlock()
+	if r.revPropsPacks == nil {
+		r.revPropsPacks = make(map[uint64]map[uint64]*RevProps)
+	}
+	if _, ok := r.revPropsPacks[sh]; !ok {
+		r.revPropsPackOrder = append(r.revPropsPackOrder, sh)
+		for len(r.revPropsPackOrder) > revPropsPackCacheMax {
+			evict := r.revPropsPackOrder[0]
+			r.revPropsPackOrder = r.revPropsPackOrder[1:]
+			delete(r.revPropsPacks, evict)
+		}
+	}
+	r.revPropsPacks[sh] = m
+}
+
+func (r *Repo) invalidateRevPropsPack(sh uint64) {
+	r.revPropsPackMu.Lock()
+	defer r.revPropsPackMu.Unlock()
+	delete(r.revPropsPacks, sh)
+	for i, v := range r.revPropsPackOrder {
+		if v == sh {
+			r.revPropsPackOrder = append(r.revPropsPackOrder[:i], r.revPropsPackOrder[i+1:]...)
+			break
+		}
+	}
+}
+
 func (r *Repo) loadRevProps(rev uint64) (*RevProps, error) {
 	ctx := context.Background()
 	sh := r.shard(rev)
@@ -1841,9 +1886,22 @@ func (r *Repo) loadRevProps(rev uint64) (*RevProps, error) {
 		}
 		return UnmarshalRevProps(b)
 	}
+	if m := r.cachedRevPropsPack(sh); m != nil {
+		if rp, ok := m[rev]; ok {
+			return rp, nil
+		}
+	}
 	b, err := r.store.Get(ctx, r.keys.PackedRevProps(sh), nil)
 	if err != nil {
 		return nil, err
 	}
-	return RevPropsFromPack(b, rev)
+	m, err := ParseRevPropsPack(b)
+	if err != nil {
+		return nil, err
+	}
+	r.putRevPropsPack(sh, m)
+	if rp, ok := m[rev]; ok {
+		return rp, nil
+	}
+	return nil, errors.New("fs: revision props not found in pack")
 }

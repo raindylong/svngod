@@ -7,6 +7,7 @@ import (
 	"crypto/sha1"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 
 	"svngod/internal/fs/store"
@@ -827,5 +828,69 @@ func TestNoopChangeEnforcesOutOfDate(t *testing.T) {
 	got, _ := r.GetText(nr.Node)
 	if string(got) != "a2" {
 		t.Fatalf("/a changed to %q", got)
+	}
+}
+
+// countingStore counts Get calls per key while delegating everything else.
+type countingStore struct {
+	store.Store
+	mu   sync.Mutex
+	gets map[string]int
+}
+
+func (c *countingStore) Get(ctx context.Context, key string, rng *store.Range) ([]byte, error) {
+	c.mu.Lock()
+	if c.gets == nil {
+		c.gets = map[string]int{}
+	}
+	c.gets[key]++
+	c.mu.Unlock()
+	return c.Store.Get(ctx, key, rng)
+}
+
+func (c *countingStore) count(key string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.gets[key]
+}
+
+func TestPackedRevPropsFetchedOncePerShard(t *testing.T) {
+	cs := &countingStore{Store: store.NewMemoryStore()}
+	r, err := CreateRepo(cs, "rp", 2, 64) // two revisions per shard
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.CommitTxn(0, []Change{{Path: "/a", Action: ActionAdd, Kind: KindFile, Data: []byte("a")}},
+		map[string]string{"svn:log": "one", "svn:author": "u", "svn:date": "2026-01-01T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.CommitTxn(0, []Change{{Path: "/b", Action: ActionAdd, Kind: KindFile, Data: []byte("b")}},
+		map[string]string{"svn:log": "two", "svn:author": "u", "svn:date": "2026-01-01T00:00:01Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.PackShard(0); err != nil { // revisions 0 and 1
+		t.Fatal(err)
+	}
+	cs.mu.Lock()
+	cs.gets = map[string]int{}
+	cs.mu.Unlock()
+
+	rp0, err := r.GetRevProps(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rp1, err := r.GetRevProps(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rp1.Props["svn:log"] != "one" {
+		t.Fatalf("r1 log=%q", rp1.Props["svn:log"])
+	}
+	if rp0 == nil {
+		t.Fatal("r0 props missing")
+	}
+	key := r.keys.PackedRevProps(0)
+	if n := cs.count(key); n != 1 {
+		t.Fatalf("packed revprops fetched %d times, want 1", n)
 	}
 }

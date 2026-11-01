@@ -83,6 +83,36 @@ func PackRevProps(revProps map[uint64]*RevProps) []byte {
 	return b.Bytes()
 }
 
+// ParseRevPropsPack decodes every entry of a packed revprops object. Callers
+// cache the map per shard so a log over thousands of revisions performs one
+// object GET instead of one per revision.
+func ParseRevPropsPack(b []byte) (map[uint64]*RevProps, error) {
+	out := make(map[uint64]*RevProps)
+	p := 0
+	for p < len(b) {
+		rev, n, err := wire.ReadUvarint(b[p:])
+		if err != nil {
+			return nil, err
+		}
+		p += n
+		l, n, err := wire.ReadUvarint(b[p:])
+		if err != nil {
+			return nil, err
+		}
+		p += n
+		if uint64(len(b)-p) < l {
+			return nil, errors.New("fs: revprops pack truncated")
+		}
+		rp, err := UnmarshalRevProps(b[p : p+int(l)])
+		if err != nil {
+			return nil, err
+		}
+		out[rev] = rp
+		p += int(l)
+	}
+	return out, nil
+}
+
 // RevPropsFromPack scans a packed revprops object for the given revision.
 func RevPropsFromPack(b []byte, want uint64) (*RevProps, error) {
 	p := 0
