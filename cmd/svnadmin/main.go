@@ -20,6 +20,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"svngod/internal/cdc"
 	"svngod/internal/dump"
@@ -33,19 +34,21 @@ const (
 )
 
 type options struct {
-	endpoint   string
-	accessKey  string
-	secretKey  string
-	bucket     string
-	prefix     string
-	useSSL     bool
-	mirrorFile string
-	allRevs    bool
-	texts      bool
-	fromRev    uint64
-	toRev      uint64
-	chunkAvg   uint64
-	dirBuckets bool
+	endpoint        string
+	accessKey       string
+	secretKey       string
+	bucket          string
+	prefix          string
+	useSSL          bool
+	mirrorFile      string
+	allRevs         bool
+	texts           bool
+	fromRev         uint64
+	toRev           uint64
+	chunkAvg        uint64
+	dirBuckets      bool
+	migrateDirs     string
+	migrateChunkAvg uint64
 }
 
 // mirrorEntry is one backend in a --mirror-file JSON array (same shape as the
@@ -157,6 +160,10 @@ func main() {
 	fs.BoolVar(&o.useSSL, "ssl", false, "use https for S3")
 	fs.StringVar(&o.mirrorFile, "mirror-file", "", "JSON array of backends to create a mirror store (local-primary + S3-standby etc.)")
 	var output, input string
+	if cmd == "migrate" {
+		fs.StringVar(&o.migrateDirs, "dir-buckets", "", "on|off: page large directories (leave empty to keep)")
+		fs.Uint64Var(&o.migrateChunkAvg, "chunk-avg", 0, "new target average chunk size in bytes (0 keeps)")
+	}
 	if cmd == "verify" {
 		fs.BoolVar(&o.allRevs, "all-revs", false, "verify every historical revision, not just HEAD")
 		fs.BoolVar(&o.texts, "texts", false, "with --all-revs: read and hash every file text (slow)")
@@ -196,6 +203,10 @@ func main() {
 		doLoad(&o, repoName, input)
 	case "verify":
 		doVerify(&o, repoName)
+	case "info":
+		doInfo(&o, repoName)
+	case "migrate":
+		doMigrate(&o, repoName)
 	case "gc":
 		doGC(&o, repoName)
 	default:
@@ -253,6 +264,71 @@ func chunkParamsFor(avg uint64) cdc.Params {
 		max = cdc.AbsoluteMax
 	}
 	return cdc.Params{Min: int(min), Max: int(max), Mask: mask}.Normalize()
+}
+
+// doInfo prints the repository format and head without modifying anything.
+func doInfo(o *options, repoName string) {
+	st, prefix, err := o.repoStore(repoName)
+	if err != nil {
+		fatal(err)
+	}
+	b, err := st.Get(context.Background(), store.NewKeys(prefix).Format(), nil)
+	if err != nil {
+		fatal(err)
+	}
+	f, err := fs.UnmarshalFormat(b)
+	if err != nil {
+		fatal(err)
+	}
+	repo, err := fs.OpenRepo(st, prefix)
+	if err != nil {
+		fatal(err)
+	}
+	head, err := repo.HeadFresh()
+	if err != nil {
+		fatal(err)
+	}
+	uuid, _ := repo.UUID()
+	fmt.Printf("repo: %s\nformat-version: %d\nshard-size: %d\nmax-delta-chain: %d\n",
+		repoName, f.Version, f.ShardSize, f.MaxDeltaChain)
+	fmt.Printf("chunk-min: %d\nchunk-max: %d\nchunk-mask: %d\ndir-buckets: %v\nhead: %d\nuuid: %s\n",
+		f.ChunkMin, f.ChunkMax, f.ChunkMask, f.DirBuckets, head, uuid)
+}
+
+// doMigrate changes opt-in format switches. Every replica must be restarted
+// afterwards: servers cache the format when they open a repository.
+func doMigrate(o *options, repoName string) {
+	if o.migrateDirs == "" && o.migrateChunkAvg == 0 {
+		fatal(fmt.Errorf("nothing to change: use --dir-buckets on|off and/or --chunk-avg N"))
+	}
+	st, prefix, err := o.repoStore(repoName)
+	if err != nil {
+		fatal(err)
+	}
+	f, err := fs.UpdateFormat(st, prefix, func(f *fs.Format) error {
+		switch strings.ToLower(o.migrateDirs) {
+		case "":
+		case "on", "true", "1":
+			f.DirBuckets = true
+		case "off", "false", "0":
+			f.DirBuckets = false
+		default:
+			return fmt.Errorf("invalid --dir-buckets %q (use on or off)", o.migrateDirs)
+		}
+		if o.migrateChunkAvg > 0 {
+			cp := chunkParamsFor(o.migrateChunkAvg)
+			f.ChunkMin = uint64(cp.Min)
+			f.ChunkMax = uint64(cp.Max)
+			f.ChunkMask = cp.Mask
+		}
+		return nil
+	})
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Printf("migrated %q: dir-buckets=%v chunk-min=%d chunk-max=%d chunk-mask=%d\n",
+		repoName, f.DirBuckets, f.ChunkMin, f.ChunkMax, f.ChunkMask)
+	fmt.Println("restart running servers and replicas to pick up the new format")
 }
 
 // doGC removes loose revision objects that have been superseded by a shard

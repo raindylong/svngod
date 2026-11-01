@@ -2,11 +2,13 @@ package fs
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"sort"
 	"strconv"
 	"strings"
 
+	"svngod/internal/fs/store"
 	"svngod/internal/wire"
 )
 
@@ -277,4 +279,31 @@ func CompareMutable(key string, a, b []byte) int {
 		return 1
 	}
 	return 0
+}
+
+// UpdateFormat applies fn to the repository's format object with a CAS retry
+// loop, so a concurrent migration or create cannot be lost. Callers should
+// restart running servers afterwards: they cache the format at open time.
+func UpdateFormat(st store.Store, prefix string, fn func(*Format) error) (*Format, error) {
+	keys := store.NewKeys(prefix)
+	ctx := context.Background()
+	for i := 0; i < 8; i++ {
+		b, err := st.Get(ctx, keys.Format(), nil)
+		if err != nil {
+			return nil, err
+		}
+		f, err := UnmarshalFormat(b)
+		if err != nil {
+			return nil, err
+		}
+		if err := fn(f); err != nil {
+			return nil, err
+		}
+		if _, err := st.CAS(ctx, keys.Format(), store.ContentETag(b), f.Marshal()); err == nil {
+			return f, nil
+		} else if !errors.Is(err, store.ErrPreconditionFailed) {
+			return nil, err
+		}
+	}
+	return nil, errors.New("fs: format update contention")
 }
