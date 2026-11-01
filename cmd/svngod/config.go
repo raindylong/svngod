@@ -48,8 +48,9 @@ type fileConfig struct {
 	TLSCert  string `json:"tls-cert"`
 	TLSKey   string `json:"tls-key"`
 	// MaxUploads bounds concurrent PUT/bundle bodies (0 = server default 16).
-	MaxUploads int        `json:"max-uploads"`
-	Repos      []fileRepo `json:"repos"`
+	MaxUploads     int        `json:"max-uploads"`
+	MaxUserUploads int        `json:"max-user-uploads"`
+	Repos          []fileRepo `json:"repos"`
 }
 
 type fileRepo struct {

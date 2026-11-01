@@ -45,6 +45,10 @@ type Config struct {
 	// multi-gigabyte uploads cannot exhaust disk or memory. Zero = unlimited.
 	MaxConcurrentUploads int
 
+	// MaxUserUploads caps concurrent uploads per authenticated user, so one
+	// client cannot occupy every slot. Zero = unlimited.
+	MaxUserUploads int
+
 	// Logger for request logging; nil disables.
 	Logger *log.Logger
 }
@@ -101,6 +105,8 @@ type Server struct {
 	repoMapMu   sync.Mutex
 	repoCache   map[string]*fs.Repo // per-name repo singletons (shared r.mu)
 	uploads     chan struct{}       // nil when uploads are unlimited
+	upMu        sync.Mutex
+	userUploads map[string]int
 }
 
 // New builds a Server.
@@ -113,6 +119,7 @@ func New(cfg Config) *Server {
 		locksLoaded: map[string]bool{},
 		stateLoaded: map[string]bool{},
 		repoCache:   map[string]*fs.Repo{},
+		userUploads: map[string]int{},
 	}
 	if cfg.MaxConcurrentUploads > 0 {
 		s.uploads = make(chan struct{}, cfg.MaxConcurrentUploads)
@@ -120,22 +127,49 @@ func New(cfg Config) *Server {
 	return s
 }
 
-// acquireUpload reserves one upload slot, waiting briefly for a busy server.
-// The returned release must be called by the handler.
-func (s *Server) acquireUpload(w http.ResponseWriter, r *http.Request) (func(), bool) {
-	if s.uploads == nil {
-		return func() {}, true
+// acquireUpload reserves one upload slot, waiting briefly for a busy server,
+// then enforces the per-user limit. The returned release must be called by
+// the handler.
+func (s *Server) acquireUpload(w http.ResponseWriter, r *http.Request, user string) (func(), bool) {
+	releaseGlobal := func() {}
+	if s.uploads != nil {
+		select {
+		case s.uploads <- struct{}{}:
+			releaseGlobal = func() { <-s.uploads }
+		case <-r.Context().Done():
+			return nil, false
+		case <-time.After(30 * time.Second):
+			w.Header().Set("Retry-After", "30")
+			http.Error(w, "server busy: too many concurrent uploads", http.StatusServiceUnavailable)
+			return nil, false
+		}
 	}
-	select {
-	case s.uploads <- struct{}{}:
-		return func() { <-s.uploads }, true
-	case <-r.Context().Done():
-		return nil, false
-	case <-time.After(30 * time.Second):
-		w.Header().Set("Retry-After", "30")
-		http.Error(w, "server busy: too many concurrent uploads", http.StatusServiceUnavailable)
-		return nil, false
+	counted := false
+	if s.cfg.MaxUserUploads > 0 && user != "" {
+		s.upMu.Lock()
+		if s.userUploads[user] >= s.cfg.MaxUserUploads {
+			s.upMu.Unlock()
+			releaseGlobal()
+			w.Header().Set("Retry-After", "30")
+			http.Error(w, "user upload limit reached", http.StatusTooManyRequests)
+			return nil, false
+		}
+		s.userUploads[user]++
+		counted = true
+		s.upMu.Unlock()
 	}
+	return func() {
+		if counted {
+			s.upMu.Lock()
+			if n := s.userUploads[user] - 1; n > 0 {
+				s.userUploads[user] = n
+			} else {
+				delete(s.userUploads, user)
+			}
+			s.upMu.Unlock()
+		}
+		releaseGlobal()
+	}, true
 }
 
 // WebDAV/DeltaV method names not defined by net/http.

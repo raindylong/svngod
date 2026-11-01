@@ -440,7 +440,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 		http.Error(w, "PUT only applies to a transaction working resource", http.StatusBadRequest)
 		return
 	}
-	release, ok := s.acquireUpload(w, r)
+	release, ok := s.acquireUpload(w, r, IdentityFrom(r.Context()).Username)
 	if !ok {
 		return
 	}

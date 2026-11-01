@@ -142,7 +142,7 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 		s.unauthorized(w)
 		return
 	}
-	release, ok := s.acquireUpload(w, r)
+	release, ok := s.acquireUpload(w, r, user)
 	if !ok {
 		return
 	}

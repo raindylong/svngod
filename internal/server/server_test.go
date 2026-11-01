@@ -436,3 +436,49 @@ func TestOptionsAdvertiseChunkParams(t *testing.T) {
 		}
 	}
 }
+
+func TestPerUserUploadLimit(t *testing.T) {
+	s := New(Config{MaxConcurrentUploads: 8, MaxUserUploads: 1})
+	req := httptest.NewRequest("PUT", "/", nil)
+	w1 := httptest.NewRecorder()
+	relA, ok := s.acquireUpload(w1, req, "alice")
+	if !ok {
+		t.Fatal("first alice upload refused")
+	}
+	w2 := httptest.NewRecorder()
+	if _, ok := s.acquireUpload(w2, req, "alice"); ok {
+		t.Fatal("second alice upload allowed")
+	}
+	if w2.Code != http.StatusTooManyRequests {
+		t.Fatalf("status=%d, want 429", w2.Code)
+	}
+	w3 := httptest.NewRecorder()
+	relB, ok := s.acquireUpload(w3, req, "bob")
+	if !ok {
+		t.Fatal("bob upload refused")
+	}
+	relA()
+	relB()
+	w4 := httptest.NewRecorder()
+	relA2, ok := s.acquireUpload(w4, req, "alice")
+	if !ok {
+		t.Fatal("alice refused after release")
+	}
+	relA2()
+}
+
+func TestUploadLimitDisabled(t *testing.T) {
+	s := New(Config{})
+	req := httptest.NewRequest("PUT", "/", nil)
+	var rels []func()
+	for i := 0; i < 50; i++ {
+		rel, ok := s.acquireUpload(httptest.NewRecorder(), req, "alice")
+		if !ok {
+			t.Fatal("unlimited uploads refused")
+		}
+		rels = append(rels, rel)
+	}
+	for _, rel := range rels {
+		rel()
+	}
+}
