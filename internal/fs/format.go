@@ -157,13 +157,28 @@ type Format struct {
 	Version       uint64
 	ShardSize     uint64
 	MaxDeltaChain uint64
+	// Chunk* configure content-defined chunking. Zero means "use defaults"
+	// for repositories created before these fields existed.
+	ChunkMin  uint64
+	ChunkMax  uint64
+	ChunkMask uint64
 }
 
 // Marshal serializes format.
 func (f *Format) Marshal() []byte {
-	return []byte("SVNGOBJ1\nFORMAT=" + strconv.FormatUint(f.Version, 10) +
+	out := "SVNGOBJ1\nFORMAT=" + strconv.FormatUint(f.Version, 10) +
 		"\nSHARD_SIZE=" + strconv.FormatUint(f.ShardSize, 10) +
-		"\nMAX_DELTA_CHAIN=" + strconv.FormatUint(f.MaxDeltaChain, 10) + "\n")
+		"\nMAX_DELTA_CHAIN=" + strconv.FormatUint(f.MaxDeltaChain, 10)
+	if f.ChunkMin != 0 {
+		out += "\nCHUNK_MIN=" + strconv.FormatUint(f.ChunkMin, 10)
+	}
+	if f.ChunkMax != 0 {
+		out += "\nCHUNK_MAX=" + strconv.FormatUint(f.ChunkMax, 10)
+	}
+	if f.ChunkMask != 0 {
+		out += "\nCHUNK_MASK=" + strconv.FormatUint(f.ChunkMask, 10)
+	}
+	return []byte(out + "\n")
 }
 
 // UnmarshalFormat decodes format.
@@ -189,6 +204,12 @@ func UnmarshalFormat(b []byte) (*Format, error) {
 			f.ShardSize = v
 		case "MAX_DELTA_CHAIN":
 			f.MaxDeltaChain = v
+		case "CHUNK_MIN":
+			f.ChunkMin = v
+		case "CHUNK_MAX":
+			f.ChunkMax = v
+		case "CHUNK_MASK":
+			f.ChunkMask = v
 		}
 	}
 	return f, nil

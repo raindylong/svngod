@@ -14,14 +14,50 @@ import (
 )
 
 const (
-	Min          = 256 << 10 // do not cut below 256 KiB
-	Max          = 4 << 20   // hard cap, keeps one chunk in memory
-	Mask         = (1 << 20) - 1
-	Magic        = "CHK1"
-	HashLen      = sha256.Size
-	RefLen       = 4 + HashLen
-	Threshold    = 4 << 20 // texts above this are stored as chunks
+	Min         = 256 << 10 // default lower bound
+	Max         = 4 << 20   // default hard cap, keeps one chunk in memory
+	Mask        = (1 << 20) - 1
+	AbsoluteMax = 64 << 20 // hard safety cap for any configured chunk
+	Magic       = "CHK1"
+	HashLen     = sha256.Size
+	RefLen      = 4 + HashLen
+	Threshold   = 4 << 20 // texts above this are stored as chunks
 )
+
+// Params controls where a text is cut. The server advertises them and the
+// client uses the same values so their chunk boundaries (and therefore dedupe)
+// agree. Repositories created before this existed read back the defaults.
+type Params struct {
+	Min  int
+	Max  int
+	Mask uint64
+}
+
+// DefaultParams returns the historical 256 KiB / 1 MiB / 4 MiB profile.
+func DefaultParams() Params { return Params{Min: Min, Max: Max, Mask: Mask} }
+
+// Normalize clamps a user-supplied profile into a safe range.
+func (p Params) Normalize() Params {
+	if p.Min <= 0 {
+		p.Min = Min
+	}
+	if p.Max <= 0 {
+		p.Max = Max
+	}
+	if p.Mask == 0 {
+		p.Mask = Mask
+	}
+	if p.Min > p.Max {
+		p.Min = p.Max
+	}
+	if p.Max > AbsoluteMax {
+		p.Max = AbsoluteMax
+	}
+	if p.Min > p.Max {
+		p.Min = p.Max
+	}
+	return p
+}
 
 // Ref describes one chunk.
 type Ref struct {
@@ -56,12 +92,18 @@ var gearTable = func() [256]uint64 {
 	return t
 }()
 
-// Split reads rd and calls emit for every content-defined chunk. The slice
-// passed to emit is only valid for the duration of the call (the caller must
-// consume or copy it); at most Max bytes are held at a time.
+// Split reads rd with the default profile.
 func Split(rd io.Reader, emit func(data []byte) error) error {
+	return SplitParams(DefaultParams(), rd, emit)
+}
+
+// SplitParams reads rd and calls emit for every content-defined chunk. The
+// slice passed to emit is only valid for the duration of the call (the caller
+// must consume or copy it); at most p.Max bytes are held at a time.
+func SplitParams(p Params, rd io.Reader, emit func(data []byte) error) error {
+	p = p.Normalize()
 	br := bufio.NewReaderSize(rd, 1<<20)
-	buf := make([]byte, 0, Max)
+	buf := make([]byte, 0, p.Max)
 	var h uint64
 	flush := func() error {
 		if len(buf) == 0 {
@@ -84,7 +126,7 @@ func Split(rd io.Reader, emit func(data []byte) error) error {
 		}
 		buf = append(buf, c)
 		h = (h << 1) + gearTable[c]
-		if len(buf) >= Max || (len(buf) >= Min && h&Mask == 0) {
+		if len(buf) >= p.Max || (len(buf) >= p.Min && h&p.Mask == 0) {
 			if err := flush(); err != nil {
 				return err
 			}

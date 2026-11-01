@@ -201,3 +201,44 @@ func TestChunkManifestNotReplacedByOldText(t *testing.T) {
 		t.Fatal("chunk manifest was replaced by the old text")
 	}
 }
+
+func TestChunkParamsApplyAndPersist(t *testing.T) {
+	st := store.NewMemoryStore()
+	cp := cdc.Params{Min: 64 << 10, Max: 1 << 20, Mask: (1 << 19) - 1}
+	r, err := CreateRepoParams(st, "cp", 4096, 64, cp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := r.ChunkParams(); got != cp.Normalize() {
+		t.Fatalf("params=%+v, want %+v", got, cp.Normalize())
+	}
+	data := make([]byte, 8<<20)
+	rand.New(rand.NewSource(9)).Read(data)
+	if _, err := r.CommitTxn(0, []Change{{Path: "/f", Action: ActionAdd, Kind: KindFile, Data: data}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	nr, err := r.Resolve(1, "/f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	refs, err := cdc.Parse(nr.Text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) < 8 {
+		t.Fatalf("chunks=%d, want ~16 with 512 KiB average", len(refs))
+	}
+	for _, ref := range refs {
+		if ref.Size == 0 || ref.Size > 1<<20 {
+			t.Fatalf("chunk size %d outside configured max", ref.Size)
+		}
+	}
+	// Reopening must read the profile back.
+	r2, err := OpenRepo(st, "cp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := r2.ChunkParams(); got != cp.Normalize() {
+		t.Fatalf("reopened params=%+v", got)
+	}
+}

@@ -15,6 +15,7 @@ import (
 
 	"svngod/internal/auth"
 	"svngod/internal/authz"
+	"svngod/internal/cdc"
 	"svngod/internal/fs"
 	"svngod/internal/fs/store"
 )
@@ -402,4 +403,36 @@ func TestAuthzCommitRechecksCopyDestination(t *testing.T) {
 		t.Fatalf("MERGE into /trunk status=%d, want 200: %s", resp.StatusCode, bodyOf(t, resp))
 	}
 	resp.Body.Close()
+}
+
+func TestOptionsAdvertiseChunkParams(t *testing.T) {
+	st := store.NewMemoryStore()
+	cp := cdc.Params{Min: 128 << 10, Max: 2 << 20, Mask: (1 << 20) - 1}
+	repo, err := fs.CreateRepoParams(st, "demo", 0, 0, cp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := New(Config{
+		BasePath: "/svn",
+		OpenRepo: func(name string) (*fs.Repo, error) {
+			if name == "demo" {
+				return repo, nil
+			}
+			return nil, fs.ErrRepoNotFound
+		},
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	resp := doRequest(t, "OPTIONS", ts.URL+"/svn/demo", "", "", "", nil)
+	resp.Body.Close()
+	want := map[string]string{
+		"X-Svngod-Chunk-Min":  "131072",
+		"X-Svngod-Chunk-Max":  "2097152",
+		"X-Svngod-Chunk-Mask": "1048575",
+	}
+	for k, v := range want {
+		if got := resp.Header.Get(k); got != v {
+			t.Fatalf("%s=%q, want %q", k, got, v)
+		}
+	}
 }

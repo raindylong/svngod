@@ -67,7 +67,7 @@ func (r *Repo) storeChunkedReader(ctx context.Context, rd io.Reader) ([]byte, in
 	}
 	var refs []cdc.Ref
 	var total int64
-	err := cdc.Split(rd, func(data []byte) error {
+	err := cdc.SplitParams(r.chunkParams, rd, func(data []byte) error {
 		sum := sha256.Sum256(data)
 		ref := cdc.Ref{Size: uint32(len(data)), Hash: sum}
 		refs = append(refs, ref)

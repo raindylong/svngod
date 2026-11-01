@@ -54,6 +54,10 @@ func (s *Server) handleOptions(w http.ResponseWriter, r *http.Request, res resou
 	h.Set("X-Svngod-Bundle", "1")
 	h.Set("X-Svngod-Stat", "1")
 	h.Set("X-Svngod-Chunks", "1")
+	cp := repo.ChunkParams()
+	h.Set("X-Svngod-Chunk-Min", strconv.Itoa(cp.Min))
+	h.Set("X-Svngod-Chunk-Max", strconv.Itoa(cp.Max))
+	h.Set("X-Svngod-Chunk-Mask", strconv.FormatUint(cp.Mask, 10))
 	if httpV2Enabled() {
 		// HTTPv2 negotiation, byte-for-byte as mod_dav_svn 1.14 sends it:
 		// repository-relative URLs without a trailing slash (ra_serf asserts

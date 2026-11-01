@@ -44,10 +44,11 @@ func (e *OutOfDateError) Unwrap() error { return ErrOutOfDate }
 
 // Repo is a versioned repository backed by an object Store.
 type Repo struct {
-	store    store.Store
-	keys     *store.Keys
-	shardSz  uint64
-	maxDelta uint64
+	store       store.Store
+	keys        *store.Keys
+	shardSz     uint64
+	maxDelta    uint64
+	chunkParams cdc.Params
 
 	mu    sync.Mutex
 	cache *cache.LRU
@@ -113,8 +114,14 @@ func (r *Repo) storeBlock(rev uint64, rb *RevBlock, size int) {
 	r.blockCache[rev] = rb
 }
 
-// CreateRepo writes a fresh repository (format/uuid/current) and returns it.
+// CreateRepo writes a fresh repository with the default chunk profile.
 func CreateRepo(st store.Store, prefix string, shardSize, maxDelta uint64) (*Repo, error) {
+	return CreateRepoParams(st, prefix, shardSize, maxDelta, cdc.DefaultParams())
+}
+
+// CreateRepoParams writes a fresh repository with an explicit chunk profile.
+func CreateRepoParams(st store.Store, prefix string, shardSize, maxDelta uint64, chunks cdc.Params) (*Repo, error) {
+	chunks = chunks.Normalize()
 	if shardSize == 0 {
 		shardSize = 4096
 	}
@@ -123,7 +130,11 @@ func CreateRepo(st store.Store, prefix string, shardSize, maxDelta uint64) (*Rep
 	}
 	keys := store.NewKeys(prefix)
 	ctx := context.Background()
-	if err := st.Put(ctx, keys.Format(), (&Format{Version: 1, ShardSize: shardSize, MaxDeltaChain: maxDelta}).Marshal()); err != nil {
+	format := &Format{
+		Version: 1, ShardSize: shardSize, MaxDeltaChain: maxDelta,
+		ChunkMin: uint64(chunks.Min), ChunkMax: uint64(chunks.Max), ChunkMask: chunks.Mask,
+	}
+	if err := st.Put(ctx, keys.Format(), format.Marshal()); err != nil {
 		return nil, err
 	}
 	if err := st.Put(ctx, keys.UUID(), []byte(randomUUID())); err != nil {
@@ -149,9 +160,13 @@ func CreateRepo(st store.Store, prefix string, shardSize, maxDelta uint64) (*Rep
 	wireMirrorControl(st, keys)
 	return &Repo{
 		store: st, keys: keys, shardSz: shardSize, maxDelta: maxDelta,
-		cache: cache.New(1 << 16), nodeCache: make(map[cache.Key]*NodeRev),
+		chunkParams: chunks,
+		cache:       cache.New(1 << 16), nodeCache: make(map[cache.Key]*NodeRev),
 	}, nil
 }
+
+// ChunkParams returns the repository's content-defined chunking profile.
+func (r *Repo) ChunkParams() cdc.Params { return r.chunkParams }
 
 // OpenRepo loads an existing repository's format.
 func OpenRepo(st store.Store, prefix string) (*Repo, error) {
@@ -168,10 +183,15 @@ func OpenRepo(st store.Store, prefix string) (*Repo, error) {
 	if err != nil {
 		return nil, err
 	}
+	cp := cdc.DefaultParams()
+	if f.ChunkMin != 0 || f.ChunkMax != 0 || f.ChunkMask != 0 {
+		cp = cdc.Params{Min: int(f.ChunkMin), Max: int(f.ChunkMax), Mask: f.ChunkMask}.Normalize()
+	}
 	wireMirrorControl(st, keys)
 	return &Repo{
 		store: st, keys: keys, shardSz: f.ShardSize, maxDelta: f.MaxDeltaChain,
-		cache: cache.New(1 << 16), nodeCache: make(map[cache.Key]*NodeRev),
+		chunkParams: cp,
+		cache:       cache.New(1 << 16), nodeCache: make(map[cache.Key]*NodeRev),
 	}, nil
 }
 

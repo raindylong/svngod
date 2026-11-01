@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"svngod/internal/cdc"
 	"svngod/internal/dump"
 	"svngod/internal/fs"
 	"svngod/internal/fs/store"
@@ -43,6 +44,7 @@ type options struct {
 	texts      bool
 	fromRev    uint64
 	toRev      uint64
+	chunkAvg   uint64
 }
 
 // mirrorEntry is one backend in a --mirror-file JSON array (same shape as the
@@ -165,6 +167,7 @@ func main() {
 	if cmd == "create" {
 		fs.Uint64Var(&shardSize, "shard-size", defaultShardSize, "revisions per shard (packing granularity)")
 		fs.Uint64Var(&maxDelta, "max-delta", defaultMaxDelta, "maximum text delta chain length")
+		fs.Uint64Var(&o.chunkAvg, "chunk-avg", 1<<20, "target average chunk size in bytes (0 keeps 1 MiB)")
 	}
 	if cmd == "dump" {
 		fs.StringVar(&output, "output", "", "write dump to file (default stdout)")
@@ -218,7 +221,7 @@ func doCreate(o *options, repoName string, shardSize, maxDelta uint64) {
 	if err != nil {
 		fatal(err)
 	}
-	repo, err := fs.CreateRepo(st, prefix, shardSize, maxDelta)
+	repo, err := fs.CreateRepoParams(st, prefix, shardSize, maxDelta, chunkParamsFor(o.chunkAvg))
 	if err != nil {
 		fatal(err)
 	}
@@ -227,6 +230,27 @@ func doCreate(o *options, repoName string, shardSize, maxDelta uint64) {
 		fatal(err)
 	}
 	fmt.Printf("created repository %q uuid=%s\n", repoName, uuid)
+}
+
+// chunkParamsFor derives min/max/mask from a target average chunk size.
+func chunkParamsFor(avg uint64) cdc.Params {
+	if avg == 0 {
+		return cdc.DefaultParams()
+	}
+	bits := 1
+	for (uint64(1) << bits) < avg {
+		bits++
+	}
+	mask := (uint64(1) << bits) - 1
+	min := avg / 4
+	if min < 64<<10 {
+		min = 64 << 10
+	}
+	max := avg * 4
+	if max > cdc.AbsoluteMax {
+		max = cdc.AbsoluteMax
+	}
+	return cdc.Params{Min: int(min), Max: int(max), Mask: mask}.Normalize()
 }
 
 // doGC removes loose revision objects that have been superseded by a shard

@@ -418,11 +418,13 @@ func cmdUpload(args []string) int {
 		fmt.Fprintf(os.Stderr, "svngocli: %v\n", err)
 		return 1
 	}
-	head, bundleOK, statOK, chunksOK, err := probeBundle(repoRoot, user, pass)
+	caps, err := probeBundle(repoRoot, user, pass)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "svngocli: %v\n", err)
 		return 1
 	}
+	head, bundleOK, statOK, chunksOK := caps.head, caps.bundle, caps.stat, caps.chunks
+	chunkParams := caps.chunkParams
 	if !bundleOK {
 		// Fall back to svn import when the target does not exist yet.
 		if _, err := runSvnOutput([]string{"ls", targetURL}); err != nil {
@@ -471,7 +473,7 @@ func cmdUpload(args []string) int {
 		}
 		rp := joinRepoPath(targetPath, filepath.ToSlash(rel))
 		if chunksOK && fi.Size() > cdc.Threshold {
-			sum, sha, msum, refs, serr := scanChunkedFile(p)
+			sum, sha, msum, refs, serr := scanChunkedFile(p, chunkParams)
 			if serr != nil {
 				return serr
 			}
@@ -611,7 +613,7 @@ func cmdUpload(args []string) int {
 	}
 
 	hdr := bundleHeader{Token: token, BaseRev: head, Message: msg, Changes: changes}
-	rev, replayed, err := postBundle(repoRoot, hdr, files, user, pass)
+	rev, replayed, err := postBundle(repoRoot, hdr, files, chunkParams, user, pass)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "svngocli: upload failed: %v\n", err)
 		return 1
@@ -749,33 +751,61 @@ func parentURL(u string) string {
 }
 
 // probeBundle negotiates the bulk channel and returns the repository HEAD.
-func probeBundle(repoRoot, user, pass string) (uint64, bool, bool, bool, error) {
+type serverCaps struct {
+	head        uint64
+	bundle      bool
+	stat        bool
+	chunks      bool
+	chunkParams cdc.Params
+}
+
+func probeBundle(repoRoot, user, pass string) (serverCaps, error) {
+	var caps serverCaps
+	caps.chunkParams = cdc.DefaultParams()
 	req, err := http.NewRequest("OPTIONS", strings.TrimSuffix(repoRoot, "/")+"/", nil)
 	if err != nil {
-		return 0, false, false, false, err
+		return caps, err
 	}
 	setAuth(req, user, pass)
 	req.Header.Set("User-Agent", "svngocli/"+version)
 	resp, err := httpClient().Do(req)
 	if err != nil {
-		return 0, false, false, false, err
+		return caps, err
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode == http.StatusUnauthorized {
-		return 0, false, false, false, fmt.Errorf("authentication required (use --username/--password)")
+		return caps, fmt.Errorf("authentication required (use --username/--password)")
 	}
-	var head uint64
-	fmt.Sscanf(resp.Header.Get("SVN-Youngest-Rev"), "%d", &head)
-	ok := resp.Header.Get("X-Svngod-Bundle") == "1"
-	statOK := resp.Header.Get("X-Svngod-Stat") == "1"
-	chunksOK := resp.Header.Get("X-Svngod-Chunks") == "1"
-	if head == 0 {
-		if out, err := runSvnOutput([]string{"info", "--show-item", "revision", "--non-interactive", repoRoot + "@HEAD"}); err == nil {
-			fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &head)
+	fmt.Sscanf(resp.Header.Get("SVN-Youngest-Rev"), "%d", &caps.head)
+	caps.bundle = resp.Header.Get("X-Svngod-Bundle") == "1"
+	caps.stat = resp.Header.Get("X-Svngod-Stat") == "1"
+	caps.chunks = resp.Header.Get("X-Svngod-Chunks") == "1"
+	if v := resp.Header.Get("X-Svngod-Chunk-Min"); v != "" {
+		var n int
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil {
+			caps.chunkParams.Min = n
 		}
 	}
-	return head, ok, statOK, chunksOK, nil
+	if v := resp.Header.Get("X-Svngod-Chunk-Max"); v != "" {
+		var n int
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil {
+			caps.chunkParams.Max = n
+		}
+	}
+	if v := resp.Header.Get("X-Svngod-Chunk-Mask"); v != "" {
+		var n uint64
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil {
+			caps.chunkParams.Mask = n
+		}
+	}
+	caps.chunkParams = caps.chunkParams.Normalize()
+	if caps.head == 0 {
+		if out, err := runSvnOutput([]string{"info", "--show-item", "revision", "--non-interactive", repoRoot + "@HEAD"}); err == nil {
+			fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &caps.head)
+		}
+	}
+	return caps, nil
 }
 
 // missingOnServer lists the server tree under target and returns repo paths
@@ -816,7 +846,7 @@ func missingOnServer(targetURL, targetPath string, files []uploadFile, user, pas
 // (seekable) so the POST can be retried without rebuilding.
 // scanChunkedFile hashes a large file and computes its CDC manifest in one
 // pass: the same reader feeds the full-text hashes and the chunker.
-func scanChunkedFile(p string) ([32]byte, [20]byte, [16]byte, []cdc.Ref, error) {
+func scanChunkedFile(p string, params cdc.Params) ([32]byte, [20]byte, [16]byte, []cdc.Ref, error) {
 	var sum [32]byte
 	var sha [20]byte
 	var msum [16]byte
@@ -829,7 +859,7 @@ func scanChunkedFile(p string) ([32]byte, [20]byte, [16]byte, []cdc.Ref, error) 
 	h1 := sha1.New()
 	h2 := md5.New()
 	var refs []cdc.Ref
-	err = cdc.Split(io.TeeReader(f, io.MultiWriter(h, h1, h2)), func(data []byte) error {
+	err = cdc.SplitParams(params, io.TeeReader(f, io.MultiWriter(h, h1, h2)), func(data []byte) error {
 		refs = append(refs, cdc.Ref{Size: uint32(len(data)), Hash: sha256.Sum256(data)})
 		return nil
 	})
@@ -844,13 +874,13 @@ func scanChunkedFile(p string) ([32]byte, [20]byte, [16]byte, []cdc.Ref, error) 
 
 // writeMissingChunks writes exactly the chunks the server lacks, re-splitting
 // the local file so no chunk bytes are kept in memory.
-func writeMissingChunks(w io.Writer, f uploadFile) error {
+func writeMissingChunks(w io.Writer, f uploadFile, params cdc.Params) error {
 	in, err := os.Open(f.local)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	return cdc.Split(in, func(data []byte) error {
+	return cdc.SplitParams(params, in, func(data []byte) error {
 		sum := sha256.Sum256(data)
 		h := hex.EncodeToString(sum[:])
 		if !f.missingSet[h] {
@@ -897,7 +927,7 @@ func fetchMissingChunks(repoRoot string, hashes []string, user, pass string) (ma
 
 // writeBundle emits the bundle header followed by each file's bytes (or just
 // the missing chunks of a chunked file) directly to w.
-func writeBundle(w io.Writer, hdr bundleHeader, files []uploadFile) error {
+func writeBundle(w io.Writer, hdr bundleHeader, files []uploadFile, params cdc.Params) error {
 	hj, err := json.Marshal(hdr)
 	if err != nil {
 		return err
@@ -915,7 +945,7 @@ func writeBundle(w io.Writer, hdr bundleHeader, files []uploadFile) error {
 	}
 	for _, f := range files {
 		if f.chunked && len(f.refs) > 0 {
-			if werr := writeMissingChunks(w, f); werr != nil {
+			if werr := writeMissingChunks(w, f, params); werr != nil {
 				return werr
 			}
 			continue
@@ -940,14 +970,14 @@ func writeBundle(w io.Writer, hdr bundleHeader, files []uploadFile) error {
 // postBundle streams the bundle with retries; the token makes repeats
 // idempotent. Every attempt rebuilds the stream from the local files, so the
 // client never spools a multi-gigabyte body to disk.
-func postBundle(repoRoot string, hdr bundleHeader, files []uploadFile, user, pass string) (uint64, bool, error) {
+func postBundle(repoRoot string, hdr bundleHeader, files []uploadFile, params cdc.Params, user, pass string) (uint64, bool, error) {
 	endpoint := strings.TrimSuffix(repoRoot, "/") + "/!svngod/bundle"
 	backoff := time.Second
 	var lastErr error
 	for attempt := 0; attempt < 5; attempt++ {
 		pr, pw := io.Pipe()
 		go func() {
-			pw.CloseWithError(writeBundle(pw, hdr, files))
+			pw.CloseWithError(writeBundle(pw, hdr, files, params))
 		}()
 		req, rerr := http.NewRequest("POST", endpoint, pr)
 		if rerr != nil {

@@ -317,7 +317,7 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 			refs := make([]cdc.Ref, len(bc.Chunks))
 			for i, c := range bc.Chunks {
 				hb, herr := hex.DecodeString(strings.ToLower(c.Hash))
-				if herr != nil || len(hb) != cdc.HashLen || c.Size == 0 || c.Size > cdc.Max {
+				if herr != nil || len(hb) != cdc.HashLen || c.Size == 0 || c.Size > cdc.AbsoluteMax {
 					http.Error(w, "bad chunk entry", http.StatusBadRequest)
 					return
 				}
