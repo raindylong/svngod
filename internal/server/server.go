@@ -104,6 +104,8 @@ type Server struct {
 	txns        map[string]*txn
 	locks       map[string]*lockEntry // key: repo + "\x00" + path
 	locksLoaded map[string]bool       // repositories whose persisted locks were restored
+	locksETag   map[string]string     // content hash of the persisted lock table last seen
+	lockOpsMu   sync.Mutex            // serialises refresh/mutate of the lock table
 	stateLoaded map[string]bool       // repositories whose persisted activities were restored
 	repoMapMu   sync.Mutex
 	repoCache   map[string]*fs.Repo // per-name repo singletons (shared r.mu)
@@ -121,6 +123,7 @@ func New(cfg Config) *Server {
 		txns:        map[string]*txn{},
 		locks:       map[string]*lockEntry{},
 		locksLoaded: map[string]bool{},
+		locksETag:   map[string]string{},
 		stateLoaded: map[string]bool{},
 		repoCache:   map[string]*fs.Repo{},
 		userUploads: map[string]int{},

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -16,6 +17,35 @@ import (
 // arguments plus the given environment. Output is captured so a failing
 // pre-commit can report the hook's message to the client.
 func runHook(dir, name, repo, tx string, env map[string]string, stdin []byte) error {
+	return runHookArgs(dir, name, []string{repo, tx}, env, stdin)
+}
+
+// hookInstalled reports whether an executable hook of that name exists.
+func hookInstalled(dir, name string) bool {
+	if dir == "" {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(dir, name))
+	return err == nil && info.Mode()&0o111 != 0
+}
+
+// runRevPropHook runs pre-revprop-change with subversion's argument order:
+// <repos> <rev> <user> <propname> <action> [<value>]. The same values are also
+// exported as SVN_* environment variables for scripts that prefer them.
+func runRevPropHook(dir, repoName string, rev uint64, user, prop, action, value string) error {
+	args := []string{repoName, strconv.FormatUint(rev, 10), user, prop, action}
+	env := map[string]string{
+		"SVN_REPO": repoName, "SVN_REV": strconv.FormatUint(rev, 10),
+		"SVN_USER": user, "SVN_PROPNAME": prop, "SVN_ACTION": action,
+		"SVN_VALUE": value,
+	}
+	if action == "M" {
+		args = append(args, value)
+	}
+	return runHookArgs(dir, "pre-revprop-change", args, env, nil)
+}
+
+func runHookArgs(dir, name string, args []string, env map[string]string, stdin []byte) error {
 	path := filepath.Join(dir, name)
 	info, err := os.Stat(path)
 	if err != nil || info.Mode()&0o111 == 0 {
@@ -23,7 +53,7 @@ func runHook(dir, name, repo, tx string, env map[string]string, stdin []byte) er
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, path, repo, tx)
+	cmd := exec.CommandContext(ctx, path, args...)
 	cmd.Env = os.Environ()
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)

@@ -558,3 +558,86 @@ func TestMetricsCountsCommitsAndReplays(t *testing.T) {
 		t.Fatalf("replays metric wrong:\n%s", bodyStr)
 	}
 }
+
+func hookServer(t *testing.T, script string) (*httptest.Server, *fs.Repo) {
+	t.Helper()
+	repo := buildRepo(t)
+	dir := t.TempDir()
+	if script != "" {
+		if err := os.WriteFile(filepath.Join(dir, "pre-revprop-change"), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv := New(Config{
+		BasePath: "/svn",
+		HooksDir: dir,
+		OpenRepo: func(name string) (*fs.Repo, error) {
+			if name == "demo" {
+				return repo, nil
+			}
+			return nil, fs.ErrRepoNotFound
+		},
+	})
+	return httptest.NewServer(srv.Handler()), repo
+}
+
+const revPropBody = `<?xml version="1.0" encoding="utf-8"?>` +
+	`<D:propertyupdate xmlns:D="DAV:" xmlns:S="http://subversion.tigris.org/xmlns/svn/">` +
+	`<D:set><D:prop><S:log>edited by test</S:log></D:prop></D:set>` +
+	`</D:propertyupdate>`
+
+func TestRevPropChangeRequiresHook(t *testing.T) {
+	ts, repo := hookServer(t, "")
+	defer ts.Close()
+	resp := doRequest(t, "PROPPATCH", ts.URL+"/svn/demo/!svn/rev/1", revPropBody, "", "", nil)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status=%d, want 403", resp.StatusCode)
+	}
+	body := bodyOf(t, resp)
+	if !strings.Contains(body, "165006") {
+		t.Fatalf("missing disabled-feature errcode: %s", body)
+	}
+	if rp, _ := repo.GetRevProps(1); rp.Props["svn:log"] != "initial import" {
+		t.Fatalf("log changed without hook: %q", rp.Props["svn:log"])
+	}
+}
+
+func TestRevPropChangeWithHook(t *testing.T) {
+	ts, repo := hookServer(t, "#!/bin/sh\nexit 0\n")
+	defer ts.Close()
+	resp := doRequest(t, "PROPPATCH", ts.URL+"/svn/demo/!svn/rev/1", revPropBody, "", "", nil)
+	if resp.StatusCode != http.StatusMultiStatus {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, bodyOf(t, resp))
+	}
+	resp.Body.Close()
+	if rp, _ := repo.GetRevProps(1); rp.Props["svn:log"] != "edited by test" {
+		t.Fatalf("log=%q", rp.Props["svn:log"])
+	}
+
+	remove := `<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:" xmlns:S="http://subversion.tigris.org/xmlns/svn/">` +
+		`<D:remove><D:prop><S:log/></D:prop></D:remove></D:propertyupdate>`
+	resp = doRequest(t, "PROPPATCH", ts.URL+"/svn/demo/!svn/rev/1", remove, "", "", nil)
+	if resp.StatusCode != http.StatusMultiStatus {
+		t.Fatalf("remove status=%d body=%s", resp.StatusCode, bodyOf(t, resp))
+	}
+	resp.Body.Close()
+	if rp, _ := repo.GetRevProps(1); rp.Props["svn:log"] != "" {
+		t.Fatalf("log not removed: %q", rp.Props["svn:log"])
+	}
+}
+
+func TestRevPropChangeHookCanReject(t *testing.T) {
+	ts, repo := hookServer(t, "#!/bin/sh\necho denied by policy >&2\nexit 1\n")
+	defer ts.Close()
+	resp := doRequest(t, "PROPPATCH", ts.URL+"/svn/demo/!svn/rev/1", revPropBody, "", "", nil)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status=%d, want 403", resp.StatusCode)
+	}
+	body := bodyOf(t, resp)
+	if !strings.Contains(body, "denied by policy") {
+		t.Fatalf("hook message missing: %s", body)
+	}
+	if rp, _ := repo.GetRevProps(1); rp.Props["svn:log"] != "initial import" {
+		t.Fatalf("log changed despite rejection: %q", rp.Props["svn:log"])
+	}
+}

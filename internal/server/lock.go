@@ -53,15 +53,11 @@ func (s *Server) handleLockUnlock(w http.ResponseWriter, r *http.Request, res re
 func (s *Server) handleLock(w http.ResponseWriter, r *http.Request, res resource, repo *fs.Repo) {
 	// Locking requires an authenticated principal when the repo has auth
 	// configured; otherwise the lockowner would be meaningless and anonymous
-	// callers could lock any path. Challenge (401) so the svn client retries
-	// with credentials, then the owner is the real user.
+	// callers could lock any path.
 	if s.cfg.authFor(res.repo) != nil && IdentityFrom(r.Context()).Username == "" {
 		s.unauthorized(w)
 		return
 	}
-	// The lock owner must be the authenticated principal, never the client's
-	// <D:owner> (svn lock -m puts the comment there, and LOCK may arrive
-	// without credentials / challenge). Anonymous -> "anonymous".
 	owner := "anonymous"
 	if id := IdentityFrom(r.Context()); id.Username != "" {
 		owner = id.Username
@@ -70,38 +66,47 @@ func (s *Server) handleLock(w http.ResponseWriter, r *http.Request, res resource
 	if path == "" {
 		path = "/"
 	}
-	// svn puts the user's "-m" lock comment in <D:owner>; the authenticated
-	// principal is the lock owner. Keep them separate: folding the username
-	// into the comment field (and dropping the comment) makes clients show
-	// "(null)" as the owner and the username as the comment.
 	comment := parseLockOwner(r.Body)
-	key := lockKey(res.repo, path)
+	ifHeader := r.Header.Get("If")
 
-	s.mu.Lock()
-	existing, isLocked := s.locks[key]
-	if isLocked && !lockTokenMatches(r.Header.Get("If"), existing.token) {
-		// The lock is held by someone else and no If header names its token:
-		// refuse unless this is a refresh of the same token (handled below).
-		s.mu.Unlock()
-		w.WriteHeader(http.StatusLocked)
+	out, err := s.mutateLocks(res.repo, repo, func(list []lockedJSON) ([]lockedJSON, interface{}, error) {
+		idx := -1
+		for i := range list {
+			if list[i].Path == path {
+				idx = i
+				break
+			}
+		}
+		if idx >= 0 {
+			e := lockEntryFromJSON(list[idx])
+			if e.expired() {
+				list = append(list[:idx], list[idx+1:]...)
+				idx = -1
+			} else if lockTokenMatches(ifHeader, list[idx].Token) {
+				list[idx].Created = time.Now().Unix()
+				return list, lockEntryFromJSON(list[idx]), nil
+			} else {
+				return nil, nil, errLockHeld
+			}
+		}
+		now := time.Now()
+		e := &lockEntry{token: newLockToken(), owner: owner, comment: comment,
+			depth: "infinity", created: now, timeout: 3600}
+		list = append(list, lockedJSON{Path: path, Token: e.token, Owner: owner,
+			Comment: comment, Depth: e.depth, Created: now.Unix(), Timeout: e.timeout})
+		return list, e, nil
+	})
+	if err != nil {
+		if errors.Is(err, errLockHeld) {
+			w.WriteHeader(http.StatusLocked)
+			return
+		}
+		log.Printf("locks: lock %s %s: %v", res.repo, path, err)
+		http.Error(w, "lock failed", http.StatusInternalServerError)
 		return
 	}
-	// Refresh with an existing token, or create a new lock.
-	var tok string
-	if isLocked && lockTokenMatches(r.Header.Get("If"), existing.token) {
-		existing.created = time.Now()
-		s.mu.Unlock()
-		s.persistLocks(res.repo, repo)
-		s.writeLockDiscovery(w, res, existing)
-		return
-	}
-	tok = newLockToken()
-	entry := &lockEntry{token: tok, owner: owner, comment: comment, depth: "infinity", created: time.Now(), timeout: 3600}
-	s.locks[key] = entry
-	s.mu.Unlock()
-	s.persistLocks(res.repo, repo)
-
-	w.Header().Set("Lock-Token", "<"+tok+">")
+	entry := out.(*lockEntry)
+	w.Header().Set("Lock-Token", "<"+entry.token+">")
 	s.writeLockDiscovery(w, res, entry)
 }
 
@@ -114,25 +119,39 @@ func (s *Server) handleUnlock(w http.ResponseWriter, r *http.Request, res resour
 	if path == "" {
 		path = "/"
 	}
-	key := lockKey(res.repo, path)
 	tok := strings.TrimSpace(r.Header.Get("Lock-Token"))
 	tok = strings.Trim(tok, "<>")
 
-	s.mu.Lock()
-	entry, ok := s.locks[key]
-	if !ok {
-		s.mu.Unlock()
-		http.Error(w, "no lock on resource", http.StatusConflict)
+	_, err := s.mutateLocks(res.repo, repo, func(list []lockedJSON) ([]lockedJSON, interface{}, error) {
+		idx := -1
+		for i := range list {
+			if list[i].Path == path {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			return nil, nil, errNoLock
+		}
+		if list[idx].Token != tok {
+			return nil, nil, errLockTokenMismatch
+		}
+		list = append(list[:idx], list[idx+1:]...)
+		return list, nil, nil
+	})
+	if err != nil {
+		if errors.Is(err, errNoLock) || errors.Is(err, errLockTokenMismatch) {
+			if errors.Is(err, errNoLock) {
+				http.Error(w, "no lock on resource", http.StatusConflict)
+			} else {
+				http.Error(w, "lock token mismatch", http.StatusConflict)
+			}
+			return
+		}
+		log.Printf("locks: unlock %s %s: %v", res.repo, path, err)
+		http.Error(w, "unlock failed", http.StatusInternalServerError)
 		return
 	}
-	if entry.token != tok {
-		s.mu.Unlock()
-		http.Error(w, "lock token mismatch", http.StatusConflict)
-		return
-	}
-	delete(s.locks, key)
-	s.mu.Unlock()
-	s.persistLocks(res.repo, repo)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -260,30 +279,129 @@ func lockStateKey(repo *fs.Repo) string {
 	return repo.Keys().Prefix + "/dav-locks/locks.json"
 }
 
-// persistLocks writes this repository's lock bucket to its object store.
-// Best effort: a failed write must not fail the LOCK/UNLOCK request.
-func (s *Server) persistLocks(repoName string, repo *fs.Repo) {
+var (
+	errLockHeld          = errors.New("locks: path is locked")
+	errNoLock            = errors.New("locks: no lock on resource")
+	errLockTokenMismatch = errors.New("locks: token mismatch")
+	errLockBusy          = errors.New("locks: concurrent update, retry")
+)
+
+func lockEntryFromJSON(l lockedJSON) *lockEntry {
+	depth := l.Depth
+	if depth == "" {
+		depth = "infinity"
+	}
+	return &lockEntry{token: l.Token, owner: l.Owner, comment: l.Comment,
+		depth: depth, created: time.Unix(l.Created, 0), timeout: l.Timeout}
+}
+
+// readLockState returns the persisted table and its content-hash ETag ("" when
+// the object does not exist yet).
+func readLockState(repo *fs.Repo) ([]lockedJSON, string, error) {
+	b, err := repo.Store().Get(context.Background(), lockStateKey(repo), nil)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, "", nil
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	var list []lockedJSON
+	if len(b) > 0 {
+		if jerr := json.Unmarshal(b, &list); jerr != nil {
+			return nil, "", jerr
+		}
+	}
+	return list, store.ContentETag(b), nil
+}
+
+// setRepoLocks replaces one repository's in-memory lock bucket.
+func (s *Server) setRepoLocks(repoName string, list []lockedJSON) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	prefix := repoName + "\x00"
-	out := []lockedJSON{}
-	for key, e := range s.locks {
-		if !strings.HasPrefix(key, prefix) {
+	for k := range s.locks {
+		if strings.HasPrefix(k, prefix) {
+			delete(s.locks, k)
+		}
+	}
+	for _, l := range list {
+		e := lockEntryFromJSON(l)
+		if e.expired() {
 			continue
 		}
-		out = append(out, lockedJSON{
-			Path: key[len(prefix):], Token: e.token, Owner: e.owner,
-			Comment: e.comment, Depth: e.depth,
-			Created: e.created.Unix(), Timeout: e.timeout,
-		})
+		s.locks[lockKey(repoName, l.Path)] = e
 	}
-	s.mu.Unlock()
-	data, err := json.Marshal(out)
+}
+
+// refreshLocks reloads the shared table when another replica changed it.
+func (s *Server) refreshLocks(repoName string, repo *fs.Repo) {
+	s.lockOpsMu.Lock()
+	defer s.lockOpsMu.Unlock()
+	s.refreshLocksLocked(repoName, repo)
+}
+
+func (s *Server) refreshLocksLocked(repoName string, repo *fs.Repo) {
+	list, etag, err := readLockState(repo)
 	if err != nil {
+		log.Printf("locks: refresh %q: %v", repoName, err)
 		return
 	}
-	if err := repo.Store().Put(context.Background(), lockStateKey(repo), data); err != nil {
-		log.Printf("locks: persist %q: %v", repoName, err)
+	s.mu.Lock()
+	cur := s.locksETag[repoName]
+	s.mu.Unlock()
+	if cur == etag {
+		return
 	}
+	s.setRepoLocks(repoName, list)
+	s.mu.Lock()
+	s.locksETag[repoName] = etag
+	s.mu.Unlock()
+}
+
+// mutateLocks applies fn to the shared lock table with a CAS retry loop, so
+// two replicas locking different paths cannot drop each other's entries.
+func (s *Server) mutateLocks(repoName string, repo *fs.Repo, fn func([]lockedJSON) ([]lockedJSON, interface{}, error)) (interface{}, error) {
+	s.lockOpsMu.Lock()
+	defer s.lockOpsMu.Unlock()
+	ctx := context.Background()
+	for attempt := 0; attempt < 8; attempt++ {
+		list, etag, err := readLockState(repo)
+		if err != nil {
+			return nil, err
+		}
+		next, out, ferr := fn(list)
+		if ferr != nil {
+			return nil, ferr
+		}
+		// Drop expired entries while we are rewriting the table.
+		kept := next[:0]
+		for _, l := range next {
+			if !lockEntryFromJSON(l).expired() {
+				kept = append(kept, l)
+			}
+		}
+		next = kept
+		data, merr := json.Marshal(next)
+		if merr != nil {
+			return nil, merr
+		}
+		if etag == "" {
+			err = repo.Store().CreateIfAbsent(ctx, lockStateKey(repo), data)
+		} else {
+			_, err = repo.Store().CAS(ctx, lockStateKey(repo), etag, data)
+		}
+		if err == nil {
+			s.setRepoLocks(repoName, next)
+			s.mu.Lock()
+			s.locksETag[repoName] = store.ContentETag(data)
+			s.mu.Unlock()
+			return out, nil
+		}
+		if !errors.Is(err, store.ErrPreconditionFailed) {
+			return nil, err
+		}
+	}
+	return nil, errLockBusy
 }
 
 // ensureLocksLoaded restores a repository's locks after a restart (or on
@@ -296,16 +414,10 @@ func (s *Server) ensureLocksLoaded(repoName string, repo *fs.Repo) {
 	}
 	s.mu.Unlock()
 
-	data, err := repo.Store().Get(context.Background(), lockStateKey(repo), nil)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
+	loaded, etag, err := readLockState(repo)
+	if err != nil {
 		log.Printf("locks: load %q: %v", repoName, err)
-	}
-	var loaded []lockedJSON
-	if len(data) > 0 {
-		if err := json.Unmarshal(data, &loaded); err != nil {
-			log.Printf("locks: parse %q: %v", repoName, err)
-			loaded = nil
-		}
+		loaded = nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -324,5 +436,6 @@ func (s *Server) ensureLocksLoaded(repoName string, repo *fs.Repo) {
 		}
 		s.locks[key] = e
 	}
+	s.locksETag[repoName] = etag
 	s.locksLoaded[repoName] = true
 }

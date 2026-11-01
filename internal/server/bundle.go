@@ -142,6 +142,8 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 		s.unauthorized(w)
 		return
 	}
+	// Pick up locks created on another replica before validating changes.
+	s.refreshLocks(name, repo)
 	release, ok := s.acquireUpload(w, r, user)
 	if !ok {
 		return

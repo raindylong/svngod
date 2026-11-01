@@ -273,16 +273,22 @@ func clientBaseRevision(r *http.Request) uint64 {
 	return 0
 }
 
-// writeHookFailure reports a pre-commit veto the way mod_dav_svn does: 403
-// with errcode 165001 so svn prints the hook's own message (E165001).
-func writeHookFailure(w http.ResponseWriter, msg string) {
+// writeDAVErrorCode reports a DAV failure with an SVN errcode so the client
+// prints the server's own message.
+func writeDAVErrorCode(w http.ResponseWriter, status, code int, msg string) {
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
-	w.WriteHeader(http.StatusForbidden)
+	w.WriteHeader(status)
 	fmt.Fprintf(w, `<?xml version="1.0" encoding="utf-8"?>`+"\n"+
 		`<D:error xmlns:D="DAV:" xmlns:m="http://apache.org/dav/xmlns" xmlns:C="svn:">`+"\n"+
 		`<C:error/>`+"\n"+
-		`<m:human-readable errcode="165001">%s</m:human-readable>`+"\n"+
-		`</D:error>`+"\n", xmlEscape("Commit blocked by pre-commit hook: "+msg))
+		`<m:human-readable errcode="%d">%s</m:human-readable>`+"\n"+
+		`</D:error>`+"\n", code, xmlEscape(msg))
+}
+
+// writeHookFailure reports a pre-commit veto the way mod_dav_svn does: 403
+// with errcode 165001 so svn prints the hook's own message (E165001).
+func writeHookFailure(w http.ResponseWriter, msg string) {
+	writeDAVErrorCode(w, http.StatusForbidden, 165001, "Commit blocked by pre-commit hook: "+msg)
 }
 
 // writeOutOfDate rejects a stale working copy the way mod_dav_svn does: 409
@@ -427,10 +433,85 @@ func (s *Server) handleProppatch(w http.ResponseWriter, r *http.Request, res res
 		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 		w.WriteHeader(http.StatusMultiStatus)
 		io.WriteString(w, b.String())
+	case resRev:
+		s.handleRevPropPatch(w, r, res, repo, sets, removes)
 	default:
 		_ = repo
 		http.Error(w, "PROPPATCH not supported on this resource", http.StatusMethodNotAllowed)
 	}
+}
+
+// handleRevPropPatch changes revision properties (svn propset --revprop). Like
+// mod_dav_svn it is disabled unless a pre-revprop-change hook exists, and the
+// hook is consulted once per property.
+func (s *Server) handleRevPropPatch(w http.ResponseWriter, r *http.Request, res resource, repo *fs.Repo, sets, removes []davProp) {
+	if res.path != "" && res.path != "/" {
+		http.Error(w, "revision properties apply to the revision resource only", http.StatusMethodNotAllowed)
+		return
+	}
+	user := IdentityFrom(r.Context()).Username
+	if s.cfg.authFor(res.repo) != nil && user == "" {
+		s.unauthorized(w)
+		return
+	}
+	if az := s.cfg.authzFor(res.repo); az != nil && !az.Authorize(user, res.repo, "/", true) {
+		http.Error(w, "Access forbidden", http.StatusForbidden)
+		return
+	}
+	if !hookInstalled(s.cfg.HooksDir, "pre-revprop-change") {
+		writeDAVErrorCode(w, http.StatusForbidden, 165006,
+			"Repository has not been enabled to accept revision propchanges; ask the administrator to create a pre-revprop-change hook")
+		return
+	}
+	for _, p := range sets {
+		name := svnPropertyKey(p.ns, p.local)
+		if err := runRevPropHook(s.cfg.HooksDir, res.repo, res.rev, user, name, "M", p.value); err != nil {
+			writeDAVErrorCode(w, http.StatusForbidden, 165001, "Revision property change rejected by pre-revprop-change hook: "+err.Error())
+			return
+		}
+	}
+	for _, p := range removes {
+		name := svnPropertyKey(p.ns, p.local)
+		if err := runRevPropHook(s.cfg.HooksDir, res.repo, res.rev, user, name, "D", ""); err != nil {
+			writeDAVErrorCode(w, http.StatusForbidden, 165001, "Revision property change rejected by pre-revprop-change hook: "+err.Error())
+			return
+		}
+	}
+	setMap := make(map[string]string, len(sets))
+	rem := make([]string, 0, len(removes))
+	for _, p := range sets {
+		setMap[svnPropertyKey(p.ns, p.local)] = p.value
+	}
+	for _, p := range removes {
+		rem = append(rem, svnPropertyKey(p.ns, p.local))
+	}
+	if err := repo.UpdateRevProps(res.rev, setMap, rem); err != nil {
+		if strings.Contains(err.Error(), "does not exist") {
+			http.Error(w, "revision does not exist", http.StatusNotFound)
+			return
+		}
+		log.Printf("revprop: %s r%d: %v", res.repo, res.rev, err)
+		http.Error(w, "revision property update failed", http.StatusInternalServerError)
+		return
+	}
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
+	b.WriteString(`<D:multistatus xmlns:D="` + NS_DAV + `">` + "\n")
+	b.WriteString(`  <D:response>` + "\n")
+	b.WriteString(`    <D:href>` + s.absURL(r, res.repo, "/!svn/rev/"+strconv.FormatUint(res.rev, 10)) + `</D:href>` + "\n")
+	b.WriteString(`    <D:propstat><D:prop>` + "\n")
+	for name, val := range setMap {
+		b.WriteString("      " + davPropElement(name, val) + "\n")
+	}
+	for _, name := range rem {
+		b.WriteString("      " + davPropElement(name, "") + "\n")
+	}
+	b.WriteString(`    </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>` + "\n")
+	b.WriteString(`  </D:response>` + "\n")
+	b.WriteString(`</D:multistatus>` + "\n")
+	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+	w.WriteHeader(http.StatusMultiStatus)
+	io.WriteString(w, b.String())
 }
 
 // --- PUT / DELETE / MKCOL on a transaction working resource ---
@@ -1249,6 +1330,9 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 	if !ok {
 		return
 	}
+	// Locks may have been created on another replica; refresh once before the
+	// commit validates the changed paths.
+	s.refreshLocks(res.repo, repo)
 	body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
