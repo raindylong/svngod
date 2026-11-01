@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -185,5 +187,47 @@ func TestFileStoreReconstructibleSkipsSync(t *testing.T) {
 	}
 	if calls == 0 {
 		t.Fatal("durable Put did not fsync")
+	}
+}
+
+// TestCASAcrossInstances: two FileStores on one directory model two svngod
+// replicas sharing a filesystem backend. A process-local mutex is not enough —
+// both processes could pass the ETag check and both rename, losing an update.
+func TestCASAcrossInstances(t *testing.T) {
+	dir := t.TempDir()
+	a, err := NewFileStoreWithSync(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := NewFileStoreWithSync(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	const key = "repos/r1/current"
+	if err := a.Put(ctx, key, []byte("v0")); err != nil {
+		t.Fatal(err)
+	}
+	etag := ContentETag([]byte("v0"))
+
+	const n = 8
+	var wg sync.WaitGroup
+	var ok int32
+	for i := 0; i < n; i++ {
+		st := a
+		if i%2 == 1 {
+			st = b
+		}
+		wg.Add(1)
+		go func(st *FileStore, i int) {
+			defer wg.Done()
+			if _, err := st.CAS(ctx, key, etag, []byte(fmt.Sprintf("v%d", i))); err == nil {
+				atomic.AddInt32(&ok, 1)
+			}
+		}(st, i)
+	}
+	wg.Wait()
+	if ok != 1 {
+		t.Fatalf("successful CAS=%d, want exactly 1 (lost update)", ok)
 	}
 }

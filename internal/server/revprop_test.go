@@ -25,8 +25,13 @@ func TestPropfindRevProps(t *testing.T) {
 	}
 }
 func TestPropfindAllRevProps(t *testing.T) {
-	ts, _, base := testServer(t, "", "")
+	ts, repo, base := testServer(t, "", "")
 	defer ts.Close()
+	// A user-defined revision property must be visible to `svn proplist
+	// --revprop`; it lives in the DAV custom namespace, not svn:.
+	if err := repo.UpdateRevProps(1, map[string]string{"myprop": "custom-value"}, nil); err != nil {
+		t.Fatal(err)
+	}
 	body := `<?xml version="1.0" encoding="utf-8"?><propfind xmlns="DAV:"><allprop xmlns="DAV:"/></propfind>`
 	req, _ := http.NewRequest("PROPFIND", base+"/svn/demo/!svn/rev/1", strings.NewReader(body))
 	req.Header.Set("Content-Type", "text/xml")
@@ -40,6 +45,7 @@ func TestPropfindAllRevProps(t *testing.T) {
 	for _, want := range []string{
 		`<log xmlns="http://subversion.tigris.org/xmlns/svn/">initial import</log>`,
 		`<author xmlns="http://subversion.tigris.org/xmlns/svn/">alice</author>`,
+		`<C:myprop xmlns:C="http://subversion.tigris.org/xmlns/custom/">custom-value</C:myprop>`,
 	} {
 		if !strings.Contains(string(b), want) {
 			t.Fatalf("allprop missing %q:\n%s", want, b)

@@ -342,3 +342,13 @@ func davPropNameTag(key string) string {
 	}
 	return "<C:custom:" + key + ` xmlns:C="` + NS_CSVN + `"/>`
 }
+
+// davRevPropElement renders a revision property the way mod_dav_svn does:
+// svn:* props use the svn namespace, user props become <C:name> (the name may
+// itself contain a colon, as mod_dav_svn emits <C:bugzilla:url>).
+func davRevPropElement(key, value string) string {
+	if strings.HasPrefix(key, "svn:") {
+		return davPropElement(key, value)
+	}
+	return "<C:" + key + ` xmlns:C="` + NS_CSVN + `">` + xmlEscape(value) + "</C:" + key + ">"
+}

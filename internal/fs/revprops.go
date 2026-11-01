@@ -3,6 +3,7 @@ package fs
 import (
 	"context"
 	"errors"
+	"time"
 
 	"svngod/internal/fs/store"
 )
@@ -105,9 +106,12 @@ func (r *Repo) cacheRevProps(rev uint64, rp *RevProps) {
 	defer r.revPropsMu.Unlock()
 	if r.revProps == nil {
 		r.revProps = make(map[uint64]*RevProps)
+		r.revPropsAt = make(map[uint64]time.Time)
 	}
 	if len(r.revProps) >= revPropsCacheMax {
 		r.revProps = make(map[uint64]*RevProps)
+		r.revPropsAt = make(map[uint64]time.Time)
 	}
 	r.revProps[rev] = rp
+	r.revPropsAt[rev] = time.Now()
 }

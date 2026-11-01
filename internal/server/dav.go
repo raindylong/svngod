@@ -545,21 +545,33 @@ func (s *Server) propNode(b *strings.Builder, repo *fs.Repo, base, name string, 
 	if len(props) > 0 {
 		var rp *fs.RevProps
 		for _, p := range props {
-			if p.NS != NS_SVN || p.Local == "" {
+			var key string
+			switch p.NS {
+			case NS_SVN:
+				if p.Local == "" {
+					continue
+				}
+				key = "svn:" + p.Local
+			case NS_CSVN:
+				// Custom revision properties live in the DAV custom namespace.
+				if p.Local == "" {
+					continue
+				}
+				key = p.Local
+			default:
 				continue
 			}
-			key := "svn:" + p.Local
 			if _, isNodeProp := nr.Props[key]; isNodeProp {
 				continue
 			}
 			if rp == nil {
-				rp, _ = repo.GetRevProps(rev)
+				rp, _ = repo.GetRevPropsFresh(rev)
 			}
 			if rp == nil {
 				continue
 			}
 			if v, ok := rp.Props[key]; ok {
-				b.WriteString("      " + davPropElement(key, v) + "\n")
+				b.WriteString("      " + davRevPropElement(key, v) + "\n")
 			}
 		}
 	}
@@ -567,16 +579,14 @@ func (s *Server) propNode(b *strings.Builder, repo *fs.Repo, base, name string, 
 	// (svn proplist --revprop). Node property listings never take this path:
 	// allRevProps is only set for !svn/rev/<N> with no explicit prop list.
 	if allRevProps {
-		if rp, _ := repo.GetRevProps(rev); rp != nil {
+		if rp, _ := repo.GetRevPropsFresh(rev); rp != nil {
 			keys := make([]string, 0, len(rp.Props))
 			for k := range rp.Props {
 				keys = append(keys, k)
 			}
 			sort.Strings(keys)
 			for _, k := range keys {
-				if strings.HasPrefix(k, "svn:") {
-					b.WriteString("      " + davPropElement(k, rp.Props[k]) + "\n")
-				}
+				b.WriteString("      " + davRevPropElement(k, rp.Props[k]) + "\n")
 			}
 		}
 	}

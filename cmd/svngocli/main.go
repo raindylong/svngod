@@ -1038,12 +1038,16 @@ func setAuth(req *http.Request, user, pass string) {
 
 func httpClient() *http.Client {
 	return &http.Client{
+		// No overall timeout: multi-gigabyte bodies are expected. The header
+		// timeout still bounds a server that accepts a request and then stops
+		// responding, instead of hanging the client forever.
 		Timeout: 0,
 		Transport: &http.Transport{
-			Proxy:               http.ProxyFromEnvironment,
-			TLSClientConfig:     &tls.Config{},
-			MaxIdleConnsPerHost: 4,
-			IdleConnTimeout:     90 * time.Second,
+			Proxy:                 http.ProxyFromEnvironment,
+			TLSClientConfig:       &tls.Config{},
+			MaxIdleConnsPerHost:   4,
+			IdleConnTimeout:       90 * time.Second,
+			ResponseHeaderTimeout: 2 * time.Minute,
 		},
 	}
 }

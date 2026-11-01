@@ -343,6 +343,11 @@ func (s *Server) handleProppatch(w http.ResponseWriter, r *http.Request, res res
 		s.persistActivity(repo, res.uuid)
 		w.WriteHeader(http.StatusOK)
 	case resTxn:
+		// A lock released on another replica must not keep rejecting writes
+		// here; refresh before taking s.mu (refresh needs it itself).
+		if res.path != "" && res.path != "/" {
+			s.blockingLock(res.repo, repo, res.path, r.Header.Get("If"))
+		}
 		s.mu.Lock()
 		tx, ok := s.txns[res.uuid]
 		if !ok {
@@ -542,7 +547,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 	txnBase := tx.baseRev
 	s.mu.Unlock()
 
-	if e := s.getLock(res.repo, res.path); e != nil && !lockTokenMatches(r.Header.Get("If"), e.token) {
+	if s.blockingLock(res.repo, repo, res.path, r.Header.Get("If")) != nil {
 		// mod_dav_svn answers 423 here; the client reports "no lock token
 		// available" instead of silently overwriting a locked file.
 		http.Error(w, "Locked", http.StatusLocked)
@@ -1260,12 +1265,12 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, res resour
 		http.Error(w, "DELETE only applies to a transaction working resource", http.StatusBadRequest)
 		return
 	}
-	if repo, ok := s.repo(w, res); ok {
-		s.loadTxnChanges(repo, res.repo, res.uuid)
-	} else {
+	repo, ok := s.repo(w, res)
+	if !ok {
 		return
 	}
-	if e := s.getLockLocked(res.repo, res.path); e != nil && !lockTokenMatches(r.Header.Get("If"), e.token) {
+	s.loadTxnChanges(repo, res.repo, res.uuid)
+	if s.blockingLock(res.repo, repo, res.path, r.Header.Get("If")) != nil {
 		http.Error(w, "Locked", http.StatusLocked)
 		return
 	}
@@ -1343,6 +1348,7 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 		http.Error(w, "MERGE body must name a source activity", http.StatusBadRequest)
 		return
 	}
+	mergeLocks := parseMergeLocks(body)
 	s.loadTxnChanges(repo, res.repo, "txn-"+actID)
 	s.mu.Lock()
 	a, ok := s.activities[actID]
@@ -1379,7 +1385,7 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 				http.Error(w, "Access forbidden to "+ch.Path, http.StatusForbidden)
 				return
 			}
-			if e := s.getLockLocked(res.repo, ch.Path); e != nil && !bytes.Contains(body, []byte(e.token)) {
+			if lp, e := s.lockForPathLocked(res.repo, ch.Path); e != nil && !mergeLockCovers(mergeLocks, lp, e.token) {
 				s.mu.Unlock()
 				http.Error(w, "Locked: "+ch.Path, http.StatusLocked)
 				return
@@ -1446,6 +1452,11 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 		}
 		http.Error(w, "commit failed: "+err.Error(), http.StatusConflict)
 		return
+	}
+	// A commit made without --no-unlock asks the server to release the locks it
+	// used; the client sends no separate UNLOCK for them.
+	if strings.Contains(r.Header.Get("X-SVN-Options"), "release-locks") {
+		s.releaseCommittedLocks(res.repo, repo, mergeLocks)
 	}
 	if s.cfg.HooksDir != "" {
 		go func(rev uint64) {

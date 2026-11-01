@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -189,7 +190,7 @@ func (s *Server) writeLockDiscovery(w http.ResponseWriter, res resource, e *lock
 	w.Header().Set("X-SVN-Creation-Date", e.created.UTC().Format("2006-01-02T15:04:05.000000Z"))
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
-	b.WriteString(`<D:prop xmlns:D="` + NS_DAV + `">` + "\n")
+	b.WriteString(`<D:prop xmlns:D="` + NS_DAV + `" xmlns:S="` + NS_DAVSVN + `">` + "\n")
 	b.WriteString(`  <D:lockdiscovery>` + "\n")
 	b.WriteString(`    <D:activelock>` + "\n")
 	b.WriteString(`      <D:locktype><D:write/></D:locktype>` + "\n")
@@ -223,6 +224,148 @@ func (s *Server) getLock(repo, path string) *lockEntry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.getLockLocked(repo, path)
+}
+
+// lockForPathLocked returns the path and entry of the lock that covers path:
+// the path's own lock, or the nearest ancestor locked with DAV depth infinity.
+// Callers must hold s.mu.
+func (s *Server) lockForPathLocked(repoName, path string) (string, *lockEntry) {
+	if e := s.getLockLocked(repoName, path); e != nil {
+		return path, e
+	}
+	for p := parentDAVPath(path); p != ""; p = parentDAVPath(p) {
+		if e := s.getLockLocked(repoName, p); e != nil && e.depth == "infinity" {
+			return p, e
+		}
+	}
+	return "", nil
+}
+
+// parentDAVPath returns the parent of a leading-slash DAV path ("" above the
+// repository root).
+func parentDAVPath(p string) string {
+	p = strings.TrimSuffix(p, "/")
+	if p == "" {
+		return ""
+	}
+	if i := strings.LastIndex(p, "/"); i > 0 {
+		return p[:i]
+	}
+	return ""
+}
+
+// mergeLock is one <S:lock> entry of a MERGE lock-token-list. The client lists
+// every lock it used, so the server can validate writes and release them when
+// the commit succeeds (X-SVN-Options: release-locks).
+type mergeLock struct {
+	Path  string
+	Token string
+}
+
+// parseMergeLocks extracts the lock-token-list from a MERGE body. Local names
+// are matched, so any prefix binding works.
+func parseMergeLocks(body []byte) []mergeLock {
+	dec := xml.NewDecoder(bytes.NewReader(body))
+	var out []mergeLock
+	inLock := false
+	var cur mergeLock
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			break
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "lock":
+				inLock, cur = true, mergeLock{}
+			case "lock-path":
+				if inLock {
+					var s string
+					if dec.DecodeElement(&s, &t) == nil {
+						cur.Path = strings.TrimSpace(s)
+					}
+				}
+			case "lock-token":
+				if inLock {
+					var s string
+					if dec.DecodeElement(&s, &t) == nil {
+						cur.Token = strings.TrimSpace(s)
+					}
+				}
+			}
+		case xml.EndElement:
+			if t.Name.Local == "lock" && inLock {
+				inLock = false
+				if cur.Token != "" {
+					out = append(out, cur)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// mergeLockCovers reports whether the MERGE body listed the lock on lockPath
+// with the given token (lock paths are repository-relative, without a slash).
+func mergeLockCovers(locks []mergeLock, lockPath, token string) bool {
+	want := "/" + strings.Trim(lockPath, "/")
+	for _, l := range locks {
+		if l.Token != token {
+			continue
+		}
+		if "/"+strings.Trim(strings.TrimSpace(l.Path), "/") == want {
+			return true
+		}
+	}
+	return false
+}
+
+// releaseCommittedLocks drops the locks a successful commit used, mirroring
+// mod_dav_svn's X-SVN-Options: release-locks behaviour. Commits made with
+// --no-unlock do not send that header and keep their locks.
+func (s *Server) releaseCommittedLocks(repoName string, repo *fs.Repo, locks []mergeLock) {
+	if len(locks) == 0 {
+		return
+	}
+	want := make(map[string]string, len(locks))
+	for _, l := range locks {
+		want["/"+strings.Trim(strings.TrimSpace(l.Path), "/")] = l.Token
+	}
+	if _, err := s.mutateLocks(repoName, repo, func(list []lockedJSON) ([]lockedJSON, interface{}, error) {
+		kept := list[:0]
+		for _, l := range list {
+			if tok, ok := want[l.Path]; ok && tok == l.Token {
+				continue
+			}
+			kept = append(kept, l)
+		}
+		return kept, nil, nil
+	}); err != nil {
+		log.Printf("locks: release after commit %q: %v", repoName, err)
+	}
+}
+
+// blockingLock returns the lock that must prevent a write carrying ifHeader,
+// or nil when the write may proceed. When the locally cached lock is stale
+// (another replica released or replaced it), the shared table is reloaded once
+// before the write is rejected: otherwise an unlock on replica A would keep
+// blocking commits on replica B until its next MERGE.
+func (s *Server) blockingLock(repoName string, repo *fs.Repo, path, ifHeader string) *lockEntry {
+	s.mu.Lock()
+	_, e := s.lockForPathLocked(repoName, path)
+	s.mu.Unlock()
+	if e == nil || lockTokenMatches(ifHeader, e.token) {
+		return nil
+	}
+	s.refreshLocks(repoName, repo)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, e = s.lockForPathLocked(repoName, path)
+	if e == nil || lockTokenMatches(ifHeader, e.token) {
+		return nil
+	}
+	return e
 }
 
 // getLockLocked is getLock for callers that already hold s.mu (commit

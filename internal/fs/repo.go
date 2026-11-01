@@ -73,6 +73,7 @@ type Repo struct {
 	// per entry on object storage. Bounded to a few shards.
 	revPropsPackMu    sync.Mutex
 	revPropsPacks     map[uint64]map[uint64]*RevProps
+	revPropsPackAt    map[uint64]time.Time
 	revPropsPackOrder []uint64
 
 	// Short-lived HEAD cache: one commit issues several requests (OPTIONS,
@@ -83,6 +84,7 @@ type Repo struct {
 	// once per node, which on S3 turned `svn ls -R` into hundreds of GETs.
 	revPropsMu sync.Mutex
 	revProps   map[uint64]*RevProps
+	revPropsAt map[uint64]time.Time
 
 	headMu  sync.Mutex
 	headRev uint64
@@ -93,6 +95,12 @@ type Repo struct {
 
 // headCacheTTL bounds how long a cached HEAD may be served.
 const headCacheTTL = 100 * time.Millisecond
+
+// revPropsCacheTTL bounds how long revision properties may be served from
+// memory. Revision props are mutable (svn propset --revprop), and another
+// replica may rewrite them at any time, so a permanent cache would hide the
+// change until that replica restarts.
+const revPropsCacheTTL = 1 * time.Second
 
 // blockCacheBudget bounds decoded rev blocks held per repository.
 const blockCacheBudget = 64 << 20
@@ -1641,6 +1649,14 @@ var _ = strings.TrimSpace
 // loose objects become unreachable after the marker and are GC's later.
 func (r *Repo) PackShard(shard uint64) error {
 	ctx := context.Background()
+	// Repacking an already packed shard would rewrite its revprops pack from
+	// the loose copies, discarding a revprop change made while packed. Packing
+	// is a one-way step.
+	if packed, err := r.isPacked(shard); err != nil {
+		return err
+	} else if packed {
+		return nil
+	}
 	cur, _, err := r.readCurrent()
 	if err != nil {
 		return err
@@ -1820,6 +1836,7 @@ func (r *Repo) CollectTexts(ctx context.Context) (int, error) {
 	refs := map[string]bool{}
 	chunkRefs := map[string]bool{}
 	dirRefs := map[string]bool{}
+	dirScanOK := true
 	for rev := uint64(0); rev <= head; rev++ {
 		rb, err := r.readBlock(rev)
 		if err != nil {
@@ -1842,11 +1859,17 @@ func (r *Repo) CollectTexts(ctx context.Context) (int, error) {
 			}
 			if nr.Kind == KindDir && nr.TextRep == TextRepExternal && nr.TextRef != "" {
 				dirRefs[nr.TextRef] = true
-				if table, terr := r.dirTableOf(nr); terr == nil && table != nil {
-					for _, ref := range table.Refs {
-						if ref != "" {
-							dirRefs[ref] = true
-						}
+				table, terr := r.dirTableOf(nr)
+				if terr != nil || table == nil {
+					// Fail closed: without the table we cannot know which
+					// buckets are referenced, so do not collect dir objects.
+					log.Printf("gc: cannot read dir table %s at rev %d: %v", nr.TextRef, rev, terr)
+					dirScanOK = false
+					continue
+				}
+				for _, ref := range table.Refs {
+					if ref != "" {
+						dirRefs[ref] = true
 					}
 				}
 			}
@@ -1889,23 +1912,25 @@ func (r *Repo) CollectTexts(ctx context.Context) (int, error) {
 		}
 		next = n
 	}
-	dirPrefix := r.keys.Prefix + "/dirs/"
-	next = ""
-	for {
-		objs, n, err := r.store.ListPrefix(ctx, dirPrefix, next, 500)
-		if err != nil {
-			return 0, err
-		}
-		for _, o := range objs {
-			ref := strings.TrimPrefix(o.Key, dirPrefix)
-			if !dirRefs[ref] {
-				victims = append(victims, o.Key)
+	if dirScanOK {
+		dirPrefix := r.keys.Prefix + "/dirs/"
+		next = ""
+		for {
+			objs, n, err := r.store.ListPrefix(ctx, dirPrefix, next, 500)
+			if err != nil {
+				return 0, err
 			}
+			for _, o := range objs {
+				ref := strings.TrimPrefix(o.Key, dirPrefix)
+				if !dirRefs[ref] {
+					victims = append(victims, o.Key)
+				}
+			}
+			if n == "" {
+				break
+			}
+			next = n
 		}
-		if n == "" {
-			break
-		}
-		next = n
 	}
 	if len(victims) == 0 {
 		return 0, nil
@@ -1923,7 +1948,7 @@ const revPropsCacheMax = 4096
 // value is shared and must not be mutated.
 func (r *Repo) GetRevProps(rev uint64) (*RevProps, error) {
 	r.revPropsMu.Lock()
-	if rp, ok := r.revProps[rev]; ok {
+	if rp, ok := r.revProps[rev]; ok && time.Since(r.revPropsAt[rev]) < revPropsCacheTTL {
 		r.revPropsMu.Unlock()
 		return rp, nil
 	}
@@ -1932,15 +1957,19 @@ func (r *Repo) GetRevProps(rev uint64) (*RevProps, error) {
 	if err != nil {
 		return nil, err
 	}
-	r.revPropsMu.Lock()
-	if r.revProps == nil {
-		r.revProps = make(map[uint64]*RevProps)
+	r.cacheRevProps(rev, rp)
+	return rp, nil
+}
+
+// GetRevPropsFresh bypasses both revprop caches. Use it where a stale answer
+// would be user-visible, e.g. reading revision properties back after a
+// propset that may have been served by another replica.
+func (r *Repo) GetRevPropsFresh(rev uint64) (*RevProps, error) {
+	rp, err := r.loadRevPropsFresh(rev)
+	if err != nil {
+		return nil, err
 	}
-	if len(r.revProps) >= revPropsCacheMax {
-		r.revProps = make(map[uint64]*RevProps)
-	}
-	r.revProps[rev] = rp
-	r.revPropsMu.Unlock()
+	r.cacheRevProps(rev, rp)
 	return rp, nil
 }
 
@@ -1949,6 +1978,9 @@ const revPropsPackCacheMax = 4
 func (r *Repo) cachedRevPropsPack(sh uint64) map[uint64]*RevProps {
 	r.revPropsPackMu.Lock()
 	defer r.revPropsPackMu.Unlock()
+	if time.Since(r.revPropsPackAt[sh]) >= revPropsCacheTTL {
+		return nil
+	}
 	return r.revPropsPacks[sh]
 }
 
@@ -1957,6 +1989,7 @@ func (r *Repo) putRevPropsPack(sh uint64, m map[uint64]*RevProps) {
 	defer r.revPropsPackMu.Unlock()
 	if r.revPropsPacks == nil {
 		r.revPropsPacks = make(map[uint64]map[uint64]*RevProps)
+		r.revPropsPackAt = make(map[uint64]time.Time)
 	}
 	if _, ok := r.revPropsPacks[sh]; !ok {
 		r.revPropsPackOrder = append(r.revPropsPackOrder, sh)
@@ -1967,12 +2000,14 @@ func (r *Repo) putRevPropsPack(sh uint64, m map[uint64]*RevProps) {
 		}
 	}
 	r.revPropsPacks[sh] = m
+	r.revPropsPackAt[sh] = time.Now()
 }
 
 func (r *Repo) invalidateRevPropsPack(sh uint64) {
 	r.revPropsPackMu.Lock()
 	defer r.revPropsPackMu.Unlock()
 	delete(r.revPropsPacks, sh)
+	delete(r.revPropsPackAt, sh)
 	for i, v := range r.revPropsPackOrder {
 		if v == sh {
 			r.revPropsPackOrder = append(r.revPropsPackOrder[:i], r.revPropsPackOrder[i+1:]...)
@@ -1999,6 +2034,37 @@ func (r *Repo) loadRevProps(rev uint64) (*RevProps, error) {
 		if rp, ok := m[rev]; ok {
 			return rp, nil
 		}
+	}
+	b, err := r.store.Get(ctx, r.keys.PackedRevProps(sh), nil)
+	if err != nil {
+		return nil, err
+	}
+	m, err := ParseRevPropsPack(b)
+	if err != nil {
+		return nil, err
+	}
+	r.putRevPropsPack(sh, m)
+	if rp, ok := m[rev]; ok {
+		return rp, nil
+	}
+	return nil, errors.New("fs: revision props not found in pack")
+}
+
+// loadRevPropsFresh reads revision properties from the store, ignoring cached
+// loose entries and cached packs (another replica may have rewritten either).
+func (r *Repo) loadRevPropsFresh(rev uint64) (*RevProps, error) {
+	ctx := context.Background()
+	sh := r.shard(rev)
+	packed, err := r.isPacked(sh)
+	if err != nil {
+		return nil, err
+	}
+	if !packed {
+		b, err := r.store.Get(ctx, r.keys.LooseRevProps(sh, rev), nil)
+		if err != nil {
+			return nil, err
+		}
+		return UnmarshalRevProps(b)
 	}
 	b, err := r.store.Get(ctx, r.keys.PackedRevProps(sh), nil)
 	if err != nil {

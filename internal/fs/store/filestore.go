@@ -403,6 +403,29 @@ func (s *FileStore) CreateIfAbsent(_ context.Context, key string, data []byte) e
 	return s.syncDir(filepath.Dir(p))
 }
 
+// acquireCASLock takes an advisory exclusive lock shared by every FileStore
+// pointed at this base directory, so compare-and-swap is atomic across
+// processes, not just goroutines.
+func (s *FileStore) acquireCASLock() (*os.File, error) {
+	f, err := os.OpenFile(filepath.Join(s.base, ".cas.lock"), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+func releaseCASLock(f *os.File) {
+	if f == nil {
+		return
+	}
+	_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
+	_ = f.Close()
+}
+
 func (s *FileStore) CAS(_ context.Context, key string, expectETag string, data []byte) (string, error) {
 	p, err := s.objPath(key)
 	if err != nil {
@@ -410,6 +433,16 @@ func (s *FileStore) CAS(_ context.Context, key string, expectETag string, data [
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// The mutex only serialises this process. Several svngod replicas (or a
+	// replica plus svnadmin) can share one directory, and without an advisory
+	// lock two of them would pass the ETag check and both rename, silently
+	// losing one update. The lock is taken after s.mu everywhere, so the
+	// ordering cannot deadlock.
+	lk, lerr := s.acquireCASLock()
+	if lerr != nil {
+		return "", lerr
+	}
+	defer releaseCASLock(lk)
 	cur, ok, err := s.headLocked(p)
 	if err != nil {
 		return "", err
