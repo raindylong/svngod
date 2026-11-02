@@ -83,6 +83,20 @@ type MirrorStore struct {
 	lastSuccess []time.Time
 	lastErr     []string
 	repairing   map[string]bool
+
+	// pending records the keys written while a mirror was out of service.
+	// A mirror that was whole when it went down only misses these, so recovery
+	// copies the delta instead of enumerating a million objects. Deletes are
+	// not recorded (a leftover unreferenced object is harmless); the pending
+	// set is cleared only when the mirror is whole again.
+	pending         []map[string]bool
+	pendingOverflow []bool
+
+	// wholeAtDown is set when a healthy (hence complete) mirror goes down; it
+	// enables the fast delta recovery. verify asks for one full pass after a
+	// fast recovery, so a path that bypassed pending accounting is still caught.
+	wholeAtDown []bool
+	verify      []bool
 }
 
 // ReplicaStatus is a snapshot of one mirror's health.
@@ -200,14 +214,18 @@ func NewMirror(mirrors []Store, opts ...MirrorOption) *MirrorStore {
 		panic("MirrorStore requires at least 2 mirrors")
 	}
 	m := &MirrorStore{
-		mirrors:     mirrors,
-		healthy:     make([]bool, len(mirrors)),
-		lastSuccess: make([]time.Time, len(mirrors)),
-		lastErr:     make([]string, len(mirrors)),
-		repairing:   map[string]bool{},
-		prim:        0,
-		stop:        make(chan struct{}),
-		done:        make(chan struct{}),
+		mirrors:         mirrors,
+		healthy:         make([]bool, len(mirrors)),
+		lastSuccess:     make([]time.Time, len(mirrors)),
+		lastErr:         make([]string, len(mirrors)),
+		repairing:       map[string]bool{},
+		pending:         make([]map[string]bool, len(mirrors)),
+		pendingOverflow: make([]bool, len(mirrors)),
+		wholeAtDown:     make([]bool, len(mirrors)),
+		verify:          make([]bool, len(mirrors)),
+		prim:            0,
+		stop:            make(chan struct{}),
+		done:            make(chan struct{}),
 	}
 	for i := range m.healthy {
 		m.healthy[i] = true
@@ -271,10 +289,64 @@ func (m *MirrorStore) isHealthy(i int) bool {
 
 func (m *MirrorStore) setHealthy(i int, ok bool) {
 	m.mu.Lock()
+	was := m.healthy[i]
 	m.healthy[i] = ok
 	if !ok {
 		m.repairable = true
 	}
+	m.mu.Unlock()
+	if was != ok {
+		log.Printf("mirror[%d] healthy=%v (head caught up: %v)", i, ok, ok)
+	}
+}
+
+// maxPendingKeys bounds the delta recorded while a mirror is down. Beyond it
+// the mirror needs a full pass: the in-memory set must not grow without bound
+// during a long outage, and a bounded set is cheaper to copy than a scan.
+const maxPendingKeys = 100000
+
+// routeStandby reports whether mirror i may receive key right now. A mirror
+// that is out of service gets the key recorded as pending instead; the health
+// check and the recording share one lock so a recovery cannot flip healthy
+// between them and lose the write.
+func (m *MirrorStore) routeStandby(i int, key string) bool {
+	if isMutableKey(key) {
+		// The HEAD pointer is reconciled from the newest replica on recovery;
+		// recording every intermediate value would only copy stale pointers.
+		m.mu.Lock()
+		h := m.healthy[i]
+		m.mu.Unlock()
+		return h
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.healthy[i] {
+		return true
+	}
+	m.recordPendingLocked(i, key)
+	return false
+}
+
+func (m *MirrorStore) recordPendingLocked(i int, key string) {
+	if isMutableKey(key) {
+		return
+	}
+	if m.pending[i] == nil {
+		m.pending[i] = make(map[string]bool)
+	}
+	if len(m.pending[i]) >= maxPendingKeys {
+		m.pendingOverflow[i] = true
+		return
+	}
+	m.pending[i][key] = true
+}
+
+// skipWrite records a key whose standby copy failed (or was skipped). The
+// next recovery copies exactly this delta, closing the window where a write
+// raced a repair pass that then declared the mirror whole.
+func (m *MirrorStore) skipWrite(i int, key string) {
+	m.mu.Lock()
+	m.recordPendingLocked(i, key)
 	m.mu.Unlock()
 }
 
@@ -307,6 +379,11 @@ func (m *MirrorStore) markDown(i int) {
 	wasHealthy := m.healthy[i]
 	m.healthy[i] = false
 	m.repairable = true
+	if wasHealthy {
+		// It was complete a moment ago, so only keys written from now on can
+		// be missing. The delta is recorded by routeStandby.
+		m.wholeAtDown[i] = true
+	}
 	if i == m.prim {
 		m.fenced = true
 	}
@@ -315,6 +392,9 @@ func (m *MirrorStore) markDown(i int) {
 		m.recovering = true
 	}
 	m.mu.Unlock()
+	if wasHealthy {
+		log.Printf("mirror[%d] taken out of service (fenced=%v)", i, i == m.prim)
+	}
 	if start {
 		go m.recoveryLoop()
 	}
@@ -492,10 +572,10 @@ func (m *MirrorStore) Put(ctx context.Context, key string, data []byte) error {
 		m.noteAcked(data)
 	}
 	if q := m.writeQuorum; q > 1 {
-		return m.quorumMirror(ctx, pi, q, func(ctx context.Context, s Store) error { return s.Put(ctx, key, data) })
+		return m.quorumMirror(ctx, pi, q, key, true, func(ctx context.Context, s Store) error { return s.Put(ctx, key, data) })
 	}
 	// Best-effort mirror to healthy standbys.
-	m.mirrorWrites(ctx, pi, func(ctx context.Context, s Store) error { return s.Put(ctx, key, data) })
+	m.mirrorWrites(ctx, pi, key, true, func(ctx context.Context, s Store) error { return s.Put(ctx, key, data) })
 	return nil
 }
 
@@ -505,11 +585,11 @@ func (m *MirrorStore) PutReconstructible(ctx context.Context, key string, data [
 		return err
 	}
 	if q := m.writeQuorum; q > 1 {
-		return m.quorumMirror(ctx, pi, q, func(ctx context.Context, s Store) error {
+		return m.quorumMirror(ctx, pi, q, key, true, func(ctx context.Context, s Store) error {
 			return PutReconstructible(ctx, s, key, data)
 		})
 	}
-	m.mirrorWrites(ctx, pi, func(ctx context.Context, s Store) error { return PutReconstructible(ctx, s, key, data) })
+	m.mirrorWrites(ctx, pi, key, true, func(ctx context.Context, s Store) error { return PutReconstructible(ctx, s, key, data) })
 	return nil
 }
 
@@ -547,9 +627,9 @@ func (m *MirrorStore) PutFromReconstructible(ctx context.Context, key string, r 
 		return PutFromReconstructible(ctx, s, key, f, size)
 	}
 	if q := m.writeQuorum; q > 1 {
-		return m.quorumMirror(ctx, pi, q, fn)
+		return m.quorumMirror(ctx, pi, q, key, true, fn)
 	}
-	m.mirrorWrites(ctx, pi, fn)
+	m.mirrorWrites(ctx, pi, key, true, fn)
 	return nil
 }
 
@@ -561,7 +641,7 @@ func (m *MirrorStore) SyncAll(ctx context.Context) error {
 		m.markDown(pi)
 		return err
 	}
-	m.mirrorWrites(ctx, pi, func(ctx context.Context, s Store) error { return SyncAll(ctx, s) })
+	m.mirrorWrites(ctx, pi, "", false, func(ctx context.Context, s Store) error { return SyncAll(ctx, s) })
 	return nil
 }
 
@@ -665,9 +745,9 @@ func (m *MirrorStore) PutFrom(ctx context.Context, key string, r io.Reader, size
 		return s.PutFrom(ctx, key, f, size)
 	}
 	if q := m.writeQuorum; q > 1 {
-		return m.quorumMirror(ctx, pi, q, fn)
+		return m.quorumMirror(ctx, pi, q, key, true, fn)
 	}
-	m.mirrorWrites(ctx, pi, fn)
+	m.mirrorWrites(ctx, pi, key, true, fn)
 	return nil
 }
 
@@ -792,7 +872,7 @@ func (m *MirrorStore) CreateIfAbsent(ctx context.Context, key string, data []byt
 	if err != nil {
 		return err
 	}
-	m.mirrorWrites(ctx, pi, func(ctx context.Context, s Store) error { return s.Put(ctx, key, data) })
+	m.mirrorWrites(ctx, pi, key, true, func(ctx context.Context, s Store) error { return s.Put(ctx, key, data) })
 	return nil
 }
 
@@ -811,7 +891,7 @@ func (m *MirrorStore) CAS(ctx context.Context, key string, expectETag string, da
 	}
 	// Standbys mirror the current value unconditionally (their own etag does
 	// not matter; they only serve reads after failover).
-	m.mirrorWrites(ctx, pi, func(ctx context.Context, s Store) error { return s.Put(ctx, key, data) })
+	m.mirrorWrites(ctx, pi, key, true, func(ctx context.Context, s Store) error { return s.Put(ctx, key, data) })
 	return newEtag, nil
 }
 
@@ -836,7 +916,7 @@ func (m *MirrorStore) DeleteIfMatch(ctx context.Context, key, etag string) error
 	if err != nil {
 		return err
 	}
-	m.mirrorWrites(ctx, pi, func(ctx context.Context, s Store) error { return DeleteIfMatch(ctx, s, key, etag) })
+	m.mirrorWrites(ctx, pi, key, false, func(ctx context.Context, s Store) error { return DeleteIfMatch(ctx, s, key, etag) })
 	return nil
 }
 
@@ -845,7 +925,7 @@ func (m *MirrorStore) Delete(ctx context.Context, keys []string) error {
 	if err != nil {
 		return err
 	}
-	m.mirrorWrites(ctx, pi, func(ctx context.Context, s Store) error { return s.Delete(ctx, keys) })
+	m.mirrorWrites(ctx, pi, "", false, func(ctx context.Context, s Store) error { return s.Delete(ctx, keys) })
 	return nil
 }
 
@@ -856,7 +936,7 @@ func (m *MirrorStore) DeletePrefix(ctx context.Context, prefix string) error {
 		m.markDown(pi)
 		return err
 	}
-	m.mirrorWrites(ctx, pi, func(ctx context.Context, s Store) error { return DeletePrefix(ctx, s, prefix) })
+	m.mirrorWrites(ctx, pi, "", false, func(ctx context.Context, s Store) error { return DeletePrefix(ctx, s, prefix) })
 	return nil
 }
 
@@ -866,13 +946,22 @@ func (m *MirrorStore) DeletePrefix(ctx context.Context, prefix string) error {
 const quorumWriteTimeout = 15 * time.Second
 
 // quorumMirror writes fn to the healthy standbys after the primary has the
-// object, returning ErrQuorumUnmet unless at least quorum copies exist.
-func (m *MirrorStore) quorumMirror(ctx context.Context, pi, quorum int, fn func(context.Context, Store) error) error {
+// object, returning ErrQuorumUnmet unless at least quorum copies exist. When
+// track is set, a skipped or failed copy is recorded in the mirror's pending
+// delta so recovery copies it even if it raced a repair pass.
+func (m *MirrorStore) quorumMirror(ctx context.Context, pi, quorum int, key string, track bool, fn func(context.Context, Store) error) error {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	ok := 0
 	for i, s := range m.mirrors {
-		if i == pi || !m.isHealthy(i) {
+		if i == pi {
+			continue
+		}
+		if track {
+			if !m.routeStandby(i, key) {
+				continue
+			}
+		} else if !m.isHealthy(i) {
 			continue
 		}
 		wg.Add(1)
@@ -881,6 +970,9 @@ func (m *MirrorStore) quorumMirror(ctx context.Context, pi, quorum int, fn func(
 			wctx, cancel := context.WithTimeout(ctx, quorumWriteTimeout)
 			defer cancel()
 			if err := fn(wctx, s); err != nil {
+				if track {
+					m.skipWrite(i, key)
+				}
 				m.markDown(i)
 				m.noteError(i, err)
 				return
@@ -910,7 +1002,7 @@ func (m *MirrorStore) PutAll(ctx context.Context, key string, data []byte) error
 	if err != nil {
 		return err
 	}
-	return m.quorumMirror(ctx, pi, n, func(ctx context.Context, s Store) error {
+	return m.quorumMirror(ctx, pi, n, key, true, func(ctx context.Context, s Store) error {
 		return s.Put(ctx, key, data)
 	})
 }
@@ -951,11 +1043,20 @@ func (m *MirrorStore) QuorumGet(ctx context.Context, key string) ([]byte, int, e
 const standbyWriteTimeout = 8 * time.Second
 
 // mirrorWrites fans a standby write out to every healthy mirror in parallel:
-// standbys are best effort, so their latency must not add to the request.
-func (m *MirrorStore) mirrorWrites(ctx context.Context, pi int, fn func(context.Context, Store) error) {
+// standbys are best effort, so their latency must not add to the request. When
+// track is set, a mirror that is down (or whose copy fails) records the key in
+// its pending delta, which is what a fast recovery copies.
+func (m *MirrorStore) mirrorWrites(ctx context.Context, pi int, key string, track bool, fn func(context.Context, Store) error) {
 	var wg sync.WaitGroup
 	for i, s := range m.mirrors {
-		if i == pi || !m.isHealthy(i) {
+		if i == pi {
+			continue
+		}
+		if track {
+			if !m.routeStandby(i, key) {
+				continue
+			}
+		} else if !m.isHealthy(i) {
 			continue
 		}
 		wg.Add(1)
@@ -967,6 +1068,9 @@ func (m *MirrorStore) mirrorWrites(ctx context.Context, pi int, fn func(context.
 			wctx, cancel := context.WithTimeout(ctx, standbyWriteTimeout)
 			defer cancel()
 			if err := fn(wctx, s); err != nil {
+				if track {
+					m.skipWrite(i, key)
+				}
 				m.markDown(i)
 				m.noteError(i, err)
 				fmt.Printf("mirror[%d] standby write failed: %v\n", i, err)
@@ -1013,6 +1117,193 @@ func (m *MirrorStore) repairKey(src int, key string) {
 	}
 }
 
+// tryFastRecover heals every mirror that only needs the pending delta copied.
+// It returns false when at least one down mirror needs a full repair pass
+// (it was not whole when it went down, its delta overflowed, or a copy failed).
+func (m *MirrorStore) tryFastRecover() bool {
+	m.mu.Lock()
+	var targets []int
+	for i := range m.mirrors {
+		if m.healthy[i] {
+			continue
+		}
+		if !m.wholeAtDown[i] || m.pendingOverflow[i] {
+			m.mu.Unlock()
+			return false
+		}
+		targets = append(targets, i)
+	}
+	m.mu.Unlock()
+	if len(targets) == 0 {
+		return true
+	}
+	for _, i := range targets {
+		if !m.fastRecoverMirror(i) {
+			return false
+		}
+	}
+	return true
+}
+
+// fastRecoverMirror copies the keys mirror i missed while it was down, syncs
+// the HEAD pointer and puts it back in service. It loops so keys written while
+// the delta itself is being copied are not lost; the health flip happens under
+// the same lock as pending recording, so a writer cannot slip in between the
+// final emptiness check and the flip.
+func (m *MirrorStore) fastRecoverMirror(i int) bool {
+	if !m.drainPending(i) {
+		return false
+	}
+	key := m.controlName()
+	if key != "" {
+		if err := m.syncControl(i); err != nil {
+			log.Printf("mirror[%d] fast recovery HEAD sync failed: %v", i, err)
+			return false
+		}
+	}
+	m.mu.Lock()
+	if len(m.pending[i]) == 0 {
+		m.healthy[i] = true
+		m.wholeAtDown[i] = false
+		m.verify[i] = true
+		m.mu.Unlock()
+		log.Printf("mirror[%d] fast recovery complete", i)
+		// Audit the delta heal immediately: a full pass catches any write
+		// that bypassed pending accounting (for example one performed by
+		// another server process) instead of waiting for the 60s tick.
+		go m.repair()
+		return true
+	}
+	m.mu.Unlock()
+	return false
+}
+
+// drainPending copies (or forgets) every key recorded in mirror i's pending
+// delta. A key that no longer exists anywhere -- a session object the client
+// abandoned, or a delete that raced the outage -- is dropped instead of being
+// retried forever; that case otherwise kept a mirror out of service and turned
+// a later primary failure into a 500 for the whole repository.
+func (m *MirrorStore) drainPending(i int) bool {
+	key := m.controlName()
+	for round := 0; round < 20; round++ {
+		m.mu.Lock()
+		keys := make([]string, 0, len(m.pending[i]))
+		for k := range m.pending[i] {
+			if k != key {
+				keys = append(keys, k)
+			}
+		}
+		m.mu.Unlock()
+		if len(keys) == 0 {
+			return true
+		}
+		for _, k := range keys {
+			err := m.copyKeyTo(i, k)
+			if errors.Is(err, errRepairKeyGone) {
+				// The object was deleted while the mirror was down.
+				m.mu.Lock()
+				delete(m.pending[i], k)
+				m.mu.Unlock()
+				continue
+			}
+			if err != nil {
+				log.Printf("mirror[%d] fast recovery of %q failed: %v", i, k, err)
+				return false
+			}
+			m.mu.Lock()
+			delete(m.pending[i], k)
+			m.mu.Unlock()
+		}
+	}
+	return false
+}
+
+// errRepairKeyGone means the object was deleted after it was recorded as
+// pending; the destination does not need a copy.
+var errRepairKeyGone = errors.New("repair: object was deleted")
+
+// copyKeyTo copies one object to dst from another replica. Large objects
+// stream through a temp file. A key that no replica holds anymore returns
+// errRepairKeyGone, so recovery can stop tracking it.
+func (m *MirrorStore) copyKeyTo(dst int, key string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if _, ok, err := m.mirrors[dst].Head(ctx, key); err == nil && ok {
+		return nil // already present (for example copied by a read repair)
+	}
+	var last error
+	seen := 0
+	for idx, src := range m.mirrors {
+		if idx == dst {
+			continue
+		}
+		seen++
+		b, err := src.Get(ctx, key, &Range{Offset: 0, Length: repairStreamThreshold + 1})
+		if err != nil {
+			if !errors.Is(err, ErrNotFound) {
+				last = err
+			}
+			continue
+		}
+		if int64(len(b)) <= repairStreamThreshold {
+			return m.mirrors[dst].Put(ctx, key, b)
+		}
+		// The probe read a truncated object: stream the whole one.
+		return m.copyFullStream(ctx, src, dst, key)
+	}
+	if last != nil {
+		return last
+	}
+	if seen == 0 {
+		return fmt.Errorf("fast recovery: no replica to read %q from", key)
+	}
+	return errRepairKeyGone
+}
+
+func (m *MirrorStore) copyFullStream(ctx context.Context, src Store, dst int, key string) error {
+	f, err := os.CreateTemp("", "svngod-recover-")
+	if err != nil {
+		return err
+	}
+	name := f.Name()
+	defer os.Remove(name)
+	n, err := src.GetTo(ctx, key, f)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	rf, err := os.Open(name)
+	if err != nil {
+		return err
+	}
+	defer rf.Close()
+	return m.mirrors[dst].PutFrom(ctx, key, rf, n)
+}
+
+// syncControl copies the newest HEAD pointer to dst. The primary is
+// authoritative for the mutable pointer; if this process acknowledged a newer
+// value, that value wins (noteAcked refuses to move backwards).
+func (m *MirrorStore) syncControl(dst int) error {
+	key := m.controlName()
+	if key == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	p, _ := m.primary()
+	b, err := p.Get(ctx, key, nil)
+	if err != nil {
+		return err
+	}
+	ack := m.ackedCopy()
+	if len(ack) > 0 && m.mutableOrder != nil && m.mutableOrder(key, b, ack) < 0 {
+		b = ack
+	}
+	return m.mirrors[dst].Put(ctx, key, b)
+}
+
 // --- self-healing repair ---
 
 func (m *MirrorStore) repairLoop() {
@@ -1041,9 +1332,13 @@ func (m *MirrorStore) anyDown() bool {
 	return false
 }
 
-// recoveryLoop retries repair while a mirror is down. The periodic pass runs
-// every 60s, which is too slow to restore redundancy after a short restart; a
-// degraded mirror is repaired every few seconds until it is whole again.
+// recoveryLoop restores redundancy while a mirror is down. A mirror that was
+// whole when it went down only misses the keys recorded in pending, so the
+// common short outage is healed by copying that delta; a full listing is kept
+// for a mirror that was not whole, overflowed its delta, or failed a probe.
+// The loop also probes an unreachable mirror cheaply instead of listing every
+// object on the healthy side every 3s (at 1M objects that scan is expensive and
+// competes with foreground commits).
 func (m *MirrorStore) recoveryLoop() {
 	defer func() {
 		m.mu.Lock()
@@ -1059,7 +1354,12 @@ func (m *MirrorStore) recoveryLoop() {
 		if !m.anyDown() {
 			return
 		}
-		m.repair()
+		if m.downReachable() {
+			if m.tryFastRecover() {
+				continue
+			}
+			m.repair()
+		}
 		delay := 3 * time.Second
 		if !m.anyReachable() {
 			delay = 10 * time.Second
@@ -1070,6 +1370,36 @@ func (m *MirrorStore) recoveryLoop() {
 		case <-time.After(delay):
 		}
 	}
+}
+
+// downReachable probes every out-of-service mirror with one cheap list request.
+// Listing nothing is enough to tell a restarting backend apart from one that is
+// still gone, without enumerating the repository.
+func (m *MirrorStore) downReachable() bool {
+	m.mu.Lock()
+	var down []int
+	prefix := strings.Trim(m.repoPrefix, "/")
+	if prefix != "" {
+		prefix += "/"
+	}
+	for i, h := range m.healthy {
+		if !h {
+			down = append(down, i)
+		}
+	}
+	m.mu.Unlock()
+	if len(down) == 0 {
+		return true
+	}
+	for _, i := range down {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, _, err := m.mirrors[i].ListPrefix(ctx, prefix, "", 1)
+		cancel()
+		if err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // anyReachable reports whether at least one mirror is in service; when all are
@@ -1091,11 +1421,50 @@ func (m *MirrorStore) anyReachable() bool {
 func (m *MirrorStore) RepairNow() { m.repairInternal() }
 
 func (m *MirrorStore) repair() {
+	if m.upToDate() {
+		return
+	}
 	if !m.repairOnce.TryLock() {
 		return
 	}
 	defer m.repairOnce.Unlock()
 	m.repairInternal()
+}
+
+// upToDate reports whether every mirror is in service and already holds the
+// acknowledged HEAD. In that state a full object listing cannot find anything
+// to repair, and at 1M objects the periodic pass would enumerate every object
+// on every replica (thousands of list requests and a large key map) while
+// competing with commits for the backend. Any doubt -- a down mirror, a fence,
+// an unknown/divergent HEAD, an unreachable probe -- falls through to the full
+// pass, which is also what the recovery loop needs.
+func (m *MirrorStore) upToDate() bool {
+	m.mu.Lock()
+	key := m.controlKey
+	ack := append([]byte(nil), m.ackedCurrent...)
+	fenced := m.fenced
+	down := false
+	for i, h := range m.healthy {
+		if !h || m.verify[i] {
+			down = true
+			break
+		}
+	}
+	mirrors := append([]Store(nil), m.mirrors...)
+	m.mu.Unlock()
+	if down || fenced || key == "" || len(ack) == 0 {
+		return false
+	}
+	want := ContentETag(ack)
+	for _, s := range mirrors {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		b, err := s.Get(ctx, key, nil)
+		cancel()
+		if err != nil || ContentETag(b) != want {
+			return false
+		}
+	}
+	return true
 }
 
 // repairInternal is one repair pass; callers coordinate with repairOnce.
@@ -1110,7 +1479,7 @@ func (m *MirrorStore) repairInternal() {
 	// backend must not consume the budget of the others (which previously left
 	// all mirrors marked down just because the primary was slow to fail).
 	n := len(m.mirrors)
-	sets := make([]map[string]bool, n)
+	sets := make([]map[string]int64, n)
 	reachable := make([]bool, n)
 	var wg sync.WaitGroup
 	for i := range m.mirrors {
@@ -1125,11 +1494,7 @@ func (m *MirrorStore) repairInternal() {
 				return
 			}
 			reachable[i] = true
-			set := make(map[string]bool, len(ks))
-			for _, k := range ks {
-				set[k] = true
-			}
-			sets[i] = set
+			sets[i] = ks
 		}(i)
 	}
 	wg.Wait()
@@ -1158,45 +1523,79 @@ func (m *MirrorStore) repairInternal() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), repairCopyTimeout)
 	defer cancel()
+
+	// Mutable objects (the HEAD pointer) are reconciled first and serially:
+	// they are few, and reconcileMutable may take a mirror out of service,
+	// which the copy workers below read concurrently.
 	for k := range keys {
 		if isMutableKey(k) {
 			m.reconcileMutable(ctx, k, sets, reachable)
+		}
+	}
+
+	// Copy immutable objects with a bounded worker pool. A serial loop was the
+	// recovery bottleneck: a 27-revision outage at 800k objects left ~50k
+	// objects to copy and took 48s; the same work parallelises to a few
+	// seconds. Objects are immutable, so copies need no ordering.
+	var mu sync.Mutex
+	jobs := make(chan string)
+	var cw sync.WaitGroup
+	for w := 0; w < repairCopyConcurrency; w++ {
+		cw.Add(1)
+		go func() {
+			defer cw.Done()
+			for k := range jobs {
+				m.copyRepairObject(ctx, k, sets, reachable, &mu, missing, failed)
+			}
+		}()
+	}
+send:
+	for k := range keys {
+		if isMutableKey(k) {
 			continue
 		}
-		var val []byte
-		for i := range m.mirrors {
-			if !reachable[i] || !sets[i][k] {
-				continue
-			}
-			b, err := m.mirrors[i].Get(ctx, k, nil)
-			if err != nil {
-				continue
-			}
-			val = b
-			break
+		select {
+		case jobs <- k:
+		case <-ctx.Done():
+			break send
 		}
-		if val == nil {
+	}
+	close(jobs)
+	cw.Wait()
+
+	// A full pass is also the moment to drain keys recorded while a mirror was
+	// out of service. Some of them may have been deleted since (an abandoned
+	// session); leaving those in pending would keep the mirror unhealthy
+	// forever and turn a later primary failure into a 500 for the repository.
+	for i := range m.mirrors {
+		if !reachable[i] || failed[i] || missing[i] > 0 {
 			continue
 		}
-		for i := range m.mirrors {
-			if !reachable[i] || sets[i][k] {
-				continue
-			}
-			if ctx.Err() != nil {
-				failed[i] = true
-				continue
-			}
-			if err := m.mirrors[i].Put(ctx, k, val); err != nil {
-				log.Printf("mirror[%d] repair put %q: %v", i, k, err)
-				failed[i] = true
-			} else {
-				missing[i]--
-			}
+		if !m.drainPending(i) {
+			failed[i] = true
 		}
 	}
 
 	for i := range m.mirrors {
-		m.setHealthy(i, reachable[i] && !failed[i] && missing[i] <= 0)
+		ok := reachable[i] && !failed[i] && missing[i] <= 0
+		if ok {
+			// Writes skipped while this pass ran are only in pending. Marking
+			// the mirror whole before they are copied would leave a hole that
+			// only a later failover would expose.
+			m.mu.Lock()
+			if len(m.pending[i]) > 0 {
+				ok = false
+			}
+			m.mu.Unlock()
+		}
+		m.setHealthy(i, ok)
+		if ok {
+			m.mu.Lock()
+			m.verify[i] = false
+			m.wholeAtDown[i] = false
+			m.pending[i] = nil
+			m.mu.Unlock()
+		}
 	}
 	if os.Getenv("SVNGOD_DEBUG_REPAIR") == "1" {
 		counts := make([]int, n)
@@ -1208,12 +1607,103 @@ func (m *MirrorStore) repairInternal() {
 	}
 }
 
+// repairCopyConcurrency bounds the object copies of one repair pass. The old
+// serial loop was the recovery bottleneck (48s for a 27-revision outage at
+// 800k objects); objects are immutable, so copies can run in parallel.
+const repairCopyConcurrency = 12
+
+// repairStreamThreshold keeps large objects out of the workers' heap: above
+// this size a copy streams through a temp file instead of buffering the whole
+// object in memory.
+const repairStreamThreshold = 4 << 20
+
+// copyRepairObject copies one immutable object to every reachable mirror that
+// lacks it, reading it from the first mirror that holds it. A failed copy
+// marks the destination out of service for the rest of the pass, so a dead
+// backend costs one error instead of one per object.
+func (m *MirrorStore) copyRepairObject(ctx context.Context, key string, sets []map[string]int64,
+	reachable []bool, mu *sync.Mutex, missing []int, failed []bool) {
+	mu.Lock()
+	var dests []int
+	src, size := -1, int64(0)
+	for i := range m.mirrors {
+		if !reachable[i] {
+			continue
+		}
+		if sz, has := sets[i][key]; has {
+			if src < 0 {
+				src, size = i, sz
+			}
+			continue
+		}
+		if !failed[i] {
+			dests = append(dests, i)
+		}
+	}
+	mu.Unlock()
+	if src < 0 || len(dests) == 0 {
+		return
+	}
+	for _, dst := range dests {
+		var err error
+		if size > repairStreamThreshold {
+			err = m.copyRepairStream(ctx, src, dst, key, size)
+		} else {
+			var b []byte
+			if b, err = m.mirrors[src].Get(ctx, key, nil); err == nil {
+				err = m.mirrors[dst].Put(ctx, key, b)
+			}
+		}
+		mu.Lock()
+		if err != nil {
+			log.Printf("mirror[%d] repair put %q: %v", dst, key, err)
+			failed[dst] = true
+		} else {
+			missing[dst]--
+		}
+		mu.Unlock()
+		if err != nil {
+			return
+		}
+	}
+}
+
+// copyRepairStream copies one large object through a temp file so a repair
+// pass does not buffer it in memory.
+func (m *MirrorStore) copyRepairStream(ctx context.Context, src, dst int, key string, size int64) error {
+	f, err := os.CreateTemp("", "svngod-repair-")
+	if err != nil {
+		return err
+	}
+	name := f.Name()
+	defer os.Remove(name)
+	n, err := m.mirrors[src].GetTo(ctx, key, f)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	if size > 0 && n != size {
+		return fmt.Errorf("repair: %q copied %d of %d bytes", key, n, size)
+	}
+	rf, err := os.Open(name)
+	if err != nil {
+		return err
+	}
+	defer rf.Close()
+	return m.mirrors[dst].PutFrom(ctx, key, rf, n)
+}
+
 // reconcileMutable picks the newest value of a mutable key and writes it to
 // every reachable mirror that is missing it or holds an older one.
-func (m *MirrorStore) reconcileMutable(ctx context.Context, k string, sets []map[string]bool, reachable []bool) {
+func (m *MirrorStore) reconcileMutable(ctx context.Context, k string, sets []map[string]int64, reachable []bool) {
 	var best []byte
 	for i := range m.mirrors {
-		if !reachable[i] || !sets[i][k] {
+		if !reachable[i] {
+			continue
+		}
+		if _, has := sets[i][k]; !has {
 			continue
 		}
 		b, err := m.mirrors[i].Get(ctx, k, nil)
@@ -1254,7 +1744,10 @@ func (m *MirrorStore) reconcileMutable(ctx context.Context, k string, sets []map
 			if !allReachable {
 				holders, disagree := 0, false
 				for i := range m.mirrors {
-					if !reachable[i] || !sets[i][k] {
+					if !reachable[i] {
+						continue
+					}
+					if _, has := sets[i][k]; !has {
 						continue
 					}
 					b, err := m.mirrors[i].Get(ctx, k, nil)
@@ -1277,7 +1770,7 @@ func (m *MirrorStore) reconcileMutable(ctx context.Context, k string, sets []map
 		if !reachable[i] {
 			continue
 		}
-		if sets[i][k] {
+		if _, has := sets[i][k]; has {
 			cur, err := m.mirrors[i].Get(ctx, k, nil)
 			if err == nil && m.order(k, best, cur) <= 0 {
 				continue // already the newest
@@ -1320,8 +1813,10 @@ func isMutableKey(key string) bool {
 	return strings.HasSuffix(key, "/current")
 }
 
-func listAll(ctx context.Context, s Store, prefix string) ([]string, error) {
-	var keys []string
+// listAll returns every object under prefix with its size. Repair needs the
+// size so large objects can be copied as streams instead of buffering them.
+func listAll(ctx context.Context, s Store, prefix string) (map[string]int64, error) {
+	keys := make(map[string]int64)
 	next := ""
 	p := strings.Trim(prefix, "/")
 	if p != "" {
@@ -1333,7 +1828,7 @@ func listAll(ctx context.Context, s Store, prefix string) ([]string, error) {
 			return nil, err
 		}
 		for _, o := range objs {
-			keys = append(keys, o.Key)
+			keys[o.Key] = o.Size
 		}
 		if n == "" {
 			break

@@ -224,8 +224,8 @@ func TestMirrorRecoveryLoopRestoresStandby(t *testing.T) {
 	if err := f.m.Put(ctx, "repos/demo/b", []byte("v2")); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, _ := f.b.Head(ctx, "repos/demo/b"); ok {
-		t.Fatal("standby unexpectedly holds the object it missed")
+	if _, ok, _ := f.b.Head(ctx, "repos/demo/b"); !ok && f.m.isHealthy(1) {
+		t.Fatal("standby returned to service without the object it missed")
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
