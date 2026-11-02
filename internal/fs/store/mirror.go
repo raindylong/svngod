@@ -159,6 +159,28 @@ func WithWriteQuorum(n int) MirrorOption {
 // WriteQuorum reports the configured number of copies (0 = best effort).
 func (m *MirrorStore) WriteQuorum() int { return m.writeQuorum }
 
+// Journaling reports that commits should be described by a WAL record. The
+// record is written even in availability mode (single-copy ack): it is what
+// lets a restarted/rejoined replica reconcile HEAD instead of trusting a stale
+// pointer, without making a standby outage block commits.
+func (m *MirrorStore) Journaling() bool { return true }
+
+// LiveCount returns how many mirrors are currently in service. Availability
+// mode runs lease operations against this many replicas: all reachable nodes
+// must agree, but a node outage shrinks the requirement to one copy instead of
+// blocking commits.
+func (m *MirrorStore) LiveCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, h := range m.healthy {
+		if h {
+			n++
+		}
+	}
+	return n
+}
+
 // NewMirror builds a MirrorStore over the given backends, aligns them, and
 // starts the background repair loop.
 func NewMirror(mirrors []Store, opts ...MirrorOption) *MirrorStore {
@@ -1166,133 +1188,108 @@ func listAll(ctx context.Context, s Store) ([]string, error) {
 
 // --- quorum register (commit lease) -----------------------------------------
 
-// CreateIfAbsentQuorum creates the key on a quorum. If any replica says it
-// already exists, the partial creations are rolled back and the call fails:
-// a quorum-intersecting holder must never be overridden.
+// CreateIfAbsentQuorum creates the key on a quorum. Replicas are tried in
+// configuration order: the first reachable node is the arbiter, so two
+// processes cannot each win on a different node and then roll each other back
+// (that livelocked concurrent commits). A node that already holds the key
+// stops the attempt immediately.
 func (m *MirrorStore) CreateIfAbsentQuorum(ctx context.Context, key string, data []byte, quorum int) error {
-	n := len(m.mirrors)
-	errs := make([]error, n)
-	var wg sync.WaitGroup
-	for i, s := range m.mirrors {
-		wg.Add(1)
-		go func(i int, s Store) {
-			defer wg.Done()
-			c, cancel := context.WithTimeout(ctx, quorumWriteTimeout)
-			defer cancel()
-			errs[i] = s.CreateIfAbsent(c, key, data)
-		}(i, s)
-	}
-	wg.Wait()
-	created, held := 0, 0
-	for i, err := range errs {
-		switch {
-		case err == nil:
-			created++
-			m.noteWrite(i)
-		case errors.Is(err, ErrPreconditionFailed):
-			held++
-		default:
-			m.markDown(i)
-			m.noteError(i, err)
-		}
-	}
-	if held > 0 || created < quorum {
-		etag := ContentETag(data)
-		for i, err := range errs {
-			if err != nil {
-				continue
-			}
+	etag := ContentETag(data)
+	var created []int
+	rollback := func() {
+		for _, i := range created {
 			c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			_ = DeleteIfMatch(c, m.mirrors[i], key, etag)
 			cancel()
 		}
-		if held > 0 {
-			return ErrPreconditionFailed
-		}
-		return fmt.Errorf("%w: %d of %d created (need %d)", ErrQuorumUnmet, created, n, quorum)
 	}
-	return nil
-}
-
-// CASQuorum applies the CAS on every replica and requires quorum successes.
-// A partial success is rolled back (best effort) so the register is never
-// half-updated, which would let two holders believe they own it.
-func (m *MirrorStore) CASQuorum(ctx context.Context, key, expect string, data []byte, quorum int) error {
-	n := len(m.mirrors)
-	errs := make([]error, n)
-	var wg sync.WaitGroup
 	for i, s := range m.mirrors {
-		wg.Add(1)
-		go func(i int, s Store) {
-			defer wg.Done()
-			c, cancel := context.WithTimeout(ctx, quorumWriteTimeout)
-			defer cancel()
-			_, errs[i] = s.CAS(c, key, expect, data)
-		}(i, s)
-	}
-	wg.Wait()
-	ok, mismatch := 0, 0
-	for i, err := range errs {
+		c, cancel := context.WithTimeout(ctx, quorumWriteTimeout)
+		err := s.CreateIfAbsent(c, key, data)
+		cancel()
 		switch {
 		case err == nil:
-			ok++
+			created = append(created, i)
 			m.noteWrite(i)
+			if len(created) >= quorum {
+				return nil
+			}
 		case errors.Is(err, ErrPreconditionFailed):
-			mismatch++
+			rollback()
+			return ErrPreconditionFailed
 		default:
 			m.markDown(i)
 			m.noteError(i, err)
 		}
 	}
-	if mismatch == 0 && ok >= quorum {
-		return nil
+	if len(created) < quorum {
+		rollback()
+		return fmt.Errorf("%w: %d of %d created (need %d)", ErrQuorumUnmet, len(created), len(m.mirrors), quorum)
 	}
-	etag := ContentETag(data)
-	for i, err := range errs {
-		if err != nil {
-			continue
-		}
-		c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = DeleteIfMatch(c, m.mirrors[i], key, etag)
-		cancel()
-	}
-	if mismatch > 0 {
-		return ErrPreconditionFailed
-	}
-	return fmt.Errorf("%w: %d of %d cas (need %d)", ErrQuorumUnmet, ok, n, quorum)
+	return nil
 }
 
-// DeleteIfMatchQuorum deletes on every replica and requires quorum successes.
-func (m *MirrorStore) DeleteIfMatchQuorum(ctx context.Context, key, etag string, quorum int) error {
-	n := len(m.mirrors)
-	errs := make([]error, n)
-	var wg sync.WaitGroup
-	for i, s := range m.mirrors {
-		wg.Add(1)
-		go func(i int, s Store) {
-			defer wg.Done()
-			c, cancel := context.WithTimeout(ctx, quorumWriteTimeout)
-			defer cancel()
-			errs[i] = DeleteIfMatch(c, s, key, etag)
-		}(i, s)
+// CASQuorum applies the CAS in configuration order and requires quorum
+// successes. A mismatch is terminal (the register diverged); successes are
+// rolled back so the register is never half-updated.
+func (m *MirrorStore) CASQuorum(ctx context.Context, key, expect string, data []byte, quorum int) error {
+	etag := ContentETag(data)
+	var done []int
+	rollback := func() {
+		for _, i := range done {
+			c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = DeleteIfMatch(c, m.mirrors[i], key, etag)
+			cancel()
+		}
 	}
-	wg.Wait()
-	ok := 0
-	for i, err := range errs {
+	for i, s := range m.mirrors {
+		c, cancel := context.WithTimeout(ctx, quorumWriteTimeout)
+		_, err := s.CAS(c, key, expect, data)
+		cancel()
 		switch {
 		case err == nil:
+			done = append(done, i)
+			m.noteWrite(i)
+			if len(done) >= quorum {
+				return nil
+			}
+		case errors.Is(err, ErrPreconditionFailed):
+			rollback()
+			return ErrPreconditionFailed
+		default:
+			m.markDown(i)
+			m.noteError(i, err)
+		}
+	}
+	if len(done) < quorum {
+		rollback()
+		return fmt.Errorf("%w: %d of %d cas (need %d)", ErrQuorumUnmet, len(done), len(m.mirrors), quorum)
+	}
+	return nil
+}
+
+// DeleteIfMatchQuorum deletes in configuration order and requires quorum
+// successes (an already-gone replica counts as released).
+func (m *MirrorStore) DeleteIfMatchQuorum(ctx context.Context, key, etag string, quorum int) error {
+	ok := 0
+	for i, s := range m.mirrors {
+		c, cancel := context.WithTimeout(ctx, quorumWriteTimeout)
+		err := DeleteIfMatch(c, s, key, etag)
+		cancel()
+		switch {
+		case err == nil, errors.Is(err, ErrPreconditionFailed), errors.Is(err, ErrNotFound):
 			ok++
 			m.noteWrite(i)
-		case errors.Is(err, ErrPreconditionFailed), errors.Is(err, ErrNotFound):
-			// Already gone is a successful release for that replica.
-			ok++
+			if ok >= quorum {
+				return nil
+			}
 		default:
 			m.markDown(i)
 			m.noteError(i, err)
 		}
 	}
 	if ok < quorum {
-		return fmt.Errorf("%w: %d of %d deleted (need %d)", ErrQuorumUnmet, ok, n, quorum)
+		return fmt.Errorf("%w: %d of %d deleted (need %d)", ErrQuorumUnmet, ok, len(m.mirrors), quorum)
 	}
 	return nil
 }

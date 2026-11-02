@@ -53,6 +53,9 @@ type Repo struct {
 	// writeQuorum is the number of replicas a commit record must reach before
 	// publication (0/1 = single-node semantics, no WAL).
 	writeQuorum int
+	// journal enables the commit WAL for mirror stores; writeQuorum > 1 makes
+	// the record (and the lease) quorum-replicated, else it is best-effort.
+	journal bool
 	// journalMu serialises WAL replay and throttles it during reads.
 	journalMu sync.Mutex
 	journalAt time.Time
@@ -189,7 +192,8 @@ func CreateRepoFull(st store.Store, prefix string, shardSize, maxDelta uint64, c
 	return &Repo{
 		store: st, keys: keys, shardSz: shardSize, maxDelta: maxDelta,
 		chunkParams: chunks, dirBuckets: dirBuckets, writeQuorum: writeQuorumOf(st),
-		cache: cache.New(1 << 16), nodeCache: make(map[cache.Key]*NodeRev),
+		journal: journalOf(st),
+		cache:   cache.New(1 << 16), nodeCache: make(map[cache.Key]*NodeRev),
 	}, nil
 }
 
@@ -230,7 +234,8 @@ func OpenRepo(st store.Store, prefix string) (*Repo, error) {
 	r := &Repo{
 		store: st, keys: keys, shardSz: f.ShardSize, maxDelta: f.MaxDeltaChain,
 		chunkParams: cp, dirBuckets: f.DirBuckets, writeQuorum: writeQuorumOf(st),
-		cache: cache.New(1 << 16), nodeCache: make(map[cache.Key]*NodeRev),
+		journal: journalOf(st),
+		cache:   cache.New(1 << 16), nodeCache: make(map[cache.Key]*NodeRev),
 	}
 	// Replay the commit WAL before the mirror adopts a HEAD: a quorum-acked
 	// record whose CAS never ran is completed here.

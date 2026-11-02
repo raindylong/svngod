@@ -75,9 +75,26 @@ type commitLease struct {
 	// so two processes with different primary views cannot both commit.
 	qr     store.QuorumRegister
 	quorum int
+	// dynamic means "use the number of currently reachable replicas" instead
+	// of a fixed quorum (availability mode). A node outage must not block
+	// commits, but while both nodes are up their lease copies must agree.
+	dynamic bool
 }
 
-func (l *commitLease) useQuorum() bool { return l.qr != nil && l.quorum > 1 }
+func (l *commitLease) useQuorum() bool { return l.qr != nil }
+
+// effectiveQuorum is the number of replicas a lease operation must reach.
+func (l *commitLease) effectiveQuorum() int {
+	if !l.dynamic {
+		return l.quorum
+	}
+	if lc, ok := l.qr.(interface{ LiveCount() int }); ok {
+		if n := lc.LiveCount(); n > 0 {
+			return n
+		}
+	}
+	return 1
+}
 
 func (l *commitLease) payload() []byte {
 	return []byte(fmt.Sprintf("%s %d", l.token, time.Now().UnixNano()))
@@ -91,7 +108,7 @@ func (l *commitLease) Verify(ctx context.Context, st store.Store) error {
 	var cur []byte
 	if l.useQuorum() {
 		b, count, err := l.qr.QuorumGet(ctx, l.key)
-		if err != nil || count < l.quorum {
+		if err != nil || count < l.effectiveQuorum() {
 			return ErrLeaseLost
 		}
 		cur = b
@@ -111,7 +128,7 @@ func (l *commitLease) Verify(ctx context.Context, st store.Store) error {
 func (l *commitLease) Release(st store.Store) {
 	close(l.stop)
 	if l.useQuorum() {
-		releaseCommitLeaseQuorum(l.qr, l.key, l.token, l.quorum)
+		releaseCommitLeaseQuorum(l.qr, l.key, l.token, l.effectiveQuorum())
 		return
 	}
 	releaseCommitLease(st, l.key, l.token)
@@ -134,7 +151,7 @@ func (l *commitLease) keepAlive(ctx context.Context, st store.Store) {
 			var cur []byte
 			if l.useQuorum() {
 				b, count, err := l.qr.QuorumGet(ctx, l.key)
-				if err != nil || count < l.quorum {
+				if err != nil || count < l.effectiveQuorum() {
 					l.lost.Store(true)
 					return
 				}
@@ -143,7 +160,7 @@ func (l *commitLease) keepAlive(ctx context.Context, st store.Store) {
 					l.lost.Store(true)
 					return
 				}
-				if err := l.qr.CASQuorum(ctx, l.key, store.ContentETag(cur), l.payload(), l.quorum); err != nil {
+				if err := l.qr.CASQuorum(ctx, l.key, store.ContentETag(cur), l.payload(), l.effectiveQuorum()); err != nil {
 					l.lost.Store(true)
 					return
 				}
@@ -169,8 +186,9 @@ func (r *Repo) acquireCommitLease(ctx context.Context) (*commitLease, error) {
 	key := r.keys.CommitLock()
 	l := &commitLease{key: key, token: leaseToken(), stop: make(chan struct{})}
 	payload := l.payload()
-	if qr, ok := r.store.(store.QuorumRegister); ok && r.writeQuorum > 1 {
+	if qr, ok := r.store.(store.QuorumRegister); ok {
 		l.qr, l.quorum = qr, r.writeQuorum
+		l.dynamic = r.writeQuorum <= 1
 	}
 	deadline := time.Now().Add(leaseWait())
 	for {
@@ -206,18 +224,30 @@ func (r *Repo) acquireCommitLease(ctx context.Context) (*commitLease, error) {
 
 // createLease creates the lease on a quorum when configured, or on the single
 // store otherwise.
+func (r *Repo) effectiveQuorum() int {
+	if r.writeQuorum > 1 {
+		return r.writeQuorum
+	}
+	if lc, ok := r.store.(interface{ LiveCount() int }); ok {
+		if n := lc.LiveCount(); n > 0 {
+			return n
+		}
+	}
+	return 1
+}
+
 func (r *Repo) createLease(ctx context.Context, key string, payload []byte) error {
-	if qr, ok := r.store.(store.QuorumRegister); ok && r.writeQuorum > 1 {
-		return qr.CreateIfAbsentQuorum(ctx, key, payload, r.writeQuorum)
+	if qr, ok := r.store.(store.QuorumRegister); ok {
+		return qr.CreateIfAbsentQuorum(ctx, key, payload, r.effectiveQuorum())
 	}
 	return r.store.CreateIfAbsent(ctx, key, payload)
 }
 
 // readLease returns the lease payload held by a quorum (or the single store).
 func (r *Repo) readLease(ctx context.Context, key string) ([]byte, bool) {
-	if qr, ok := r.store.(store.QuorumRegister); ok && r.writeQuorum > 1 {
+	if qr, ok := r.store.(store.QuorumRegister); ok {
 		b, count, err := qr.QuorumGet(ctx, key)
-		return b, err == nil && count >= r.writeQuorum
+		return b, err == nil && count >= 1
 	}
 	b, err := r.store.Get(ctx, key, nil)
 	return b, err == nil
@@ -240,8 +270,8 @@ func (r *Repo) breakCommitLease(ctx context.Context, key, token string) {
 	if !created {
 		if cur, ok := r.readLease(ctx, marker); ok {
 			if ts, ok := leaseTimestamp(string(cur)); !ok || time.Since(ts) > leaseTTL() {
-				if qr, ok := r.store.(store.QuorumRegister); ok && r.writeQuorum > 1 {
-					_ = qr.DeleteIfMatchQuorum(ctx, marker, store.ContentETag(cur), r.writeQuorum)
+				if qr, ok := r.store.(store.QuorumRegister); ok {
+					_ = qr.DeleteIfMatchQuorum(ctx, marker, store.ContentETag(cur), r.effectiveQuorum())
 				} else {
 					_ = r.store.Delete(ctx, []string{marker})
 				}
@@ -250,9 +280,9 @@ func (r *Repo) breakCommitLease(ctx context.Context, key, token string) {
 		return
 	}
 	defer func() {
-		if qr, ok := r.store.(store.QuorumRegister); ok && r.writeQuorum > 1 {
+		if qr, ok := r.store.(store.QuorumRegister); ok {
 			if cur, ok := r.readLease(ctx, marker); ok {
-				_ = qr.DeleteIfMatchQuorum(ctx, marker, store.ContentETag(cur), r.writeQuorum)
+				_ = qr.DeleteIfMatchQuorum(ctx, marker, store.ContentETag(cur), r.effectiveQuorum())
 			}
 		} else {
 			_ = r.store.Delete(ctx, []string{marker})
@@ -265,8 +295,8 @@ func (r *Repo) breakCommitLease(ctx context.Context, key, token string) {
 	if ts, ok := leaseTimestamp(string(cur)); ok && time.Since(ts) <= leaseTTL() {
 		return // renewed by a live holder
 	}
-	if qr, ok := r.store.(store.QuorumRegister); ok && r.writeQuorum > 1 {
-		_ = qr.DeleteIfMatchQuorum(ctx, key, store.ContentETag(cur), r.writeQuorum)
+	if qr, ok := r.store.(store.QuorumRegister); ok {
+		_ = qr.DeleteIfMatchQuorum(ctx, key, store.ContentETag(cur), r.effectiveQuorum())
 		return
 	}
 	_ = store.DeleteIfMatch(ctx, r.store, key, store.ContentETag(cur))

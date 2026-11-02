@@ -201,3 +201,38 @@ func TestJournalReplayRollsForward(t *testing.T) {
 		t.Fatalf("rolled-forward revision unreadable: %v", err)
 	}
 }
+
+// TestJournalReplayAvailabilityMode: without an explicit quorum the mirror is
+// best-effort (primary/standby availability), but the WAL is still written and
+// replayed so a rejoining node cannot resurrect an older HEAD as the current
+// one and cause duplicate revision numbers.
+func TestJournalReplayAvailabilityMode(t *testing.T) {
+	a := store.NewMemoryStore()
+	b := store.NewMemoryStore()
+	ms := store.NewMirror([]store.Store{a, b})
+	r, err := CreateRepo(ms, "av", 4096, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.CommitTxn(0, []Change{{Path: "/a", Action: ActionAdd, Kind: KindFile, Data: []byte("1")}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if rec, err := r.JournalRecord(1); err != nil || rec == nil {
+		t.Fatalf("availability mode did not write a WAL record: %v", err)
+	}
+	// Rewind HEAD to simulate a crash after the WAL append but before the CAS.
+	cur, etag, err := r.readCurrent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ms.CAS(context.Background(), r.keys.Current(), etag, (&Current{Head: 0, Created: cur.Created}).Marshal()); err != nil {
+		t.Fatal(err)
+	}
+	r2, err := OpenRepo(ms, "av")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h, _ := r2.HeadFresh(); h != 1 {
+		t.Fatalf("head=%d after replay, want 1", h)
+	}
+}

@@ -88,6 +88,13 @@ func DecodeCommitRecord(b []byte) (*CommitRecord, error) {
 	return &rec, nil
 }
 
+func journalOf(s store.Store) bool {
+	if j, ok := s.(interface{ Journaling() bool }); ok {
+		return j.Journaling()
+	}
+	return false
+}
+
 func writeQuorumOf(s store.Store) int {
 	if q, ok := s.(interface{ WriteQuorum() int }); ok {
 		return q.WriteQuorum()
@@ -100,7 +107,7 @@ func writeQuorumOf(s store.Store) int {
 // commit is never acknowledged on a single copy.
 func (r *Repo) writeCommitJournal(ctx context.Context, rev, parent uint64, lease string, created int64,
 	revBlock []byte, revBlockKey, propsKey string, revProps map[string]string) error {
-	if r.writeQuorum <= 1 {
+	if !r.journal {
 		return nil
 	}
 	sum := sha256.Sum256(revBlock)
@@ -125,7 +132,7 @@ func (r *Repo) writeCommitJournal(ctx context.Context, rev, parent uint64, lease
 
 // reconcileJournal runs the WAL replay, throttled unless force is set.
 func (r *Repo) reconcileJournal(force bool) {
-	if r.writeQuorum <= 1 {
+	if !r.journal {
 		return
 	}
 	r.journalMu.Lock()
@@ -142,16 +149,31 @@ func (r *Repo) reconcileJournal(force bool) {
 // publication). Entries that did not reach a quorum are ignored: they are the
 // remains of an aborted attempt.
 func (r *Repo) replayJournal() {
-	if r.writeQuorum <= 1 {
+	if !r.journal {
 		return
 	}
-	qg, ok := r.store.(interface {
-		QuorumGet(ctx context.Context, key string) ([]byte, int, error)
-	})
-	if !ok {
-		return
+	// Strict mode requires the record on a quorum; availability mode accepts
+	// the best copy, because a single-copy ack is the configured trade-off.
+	quorum := r.writeQuorum
+	if quorum < 1 {
+		quorum = 1
 	}
 	ctx := context.Background()
+	read := func(key string) ([]byte, int, error) {
+		// Read every replica, not just the elected primary: a process whose
+		// primary is stale must still see a newer record published through the
+		// other node.
+		if qg, ok := r.store.(interface {
+			QuorumGet(ctx context.Context, key string) ([]byte, int, error)
+		}); ok {
+			return qg.QuorumGet(ctx, key)
+		}
+		b, err := r.store.Get(context.Background(), key, nil)
+		if err != nil {
+			return nil, 0, err
+		}
+		return b, 1, nil
+	}
 	cur0, _, err := r.readCurrent()
 	if err != nil {
 		return
@@ -160,16 +182,16 @@ func (r *Repo) replayJournal() {
 	// Only a contiguous run starting at head+1 can be published. Anything
 	// further ahead is a different writer's intent and must not be reordered.
 	for rev := head + 1; rev <= head+8; rev++ {
-		b, count, err := qg.QuorumGet(ctx, r.keys.Journal(rev))
-		if err != nil || count < r.writeQuorum {
+		b, count, err := read(r.keys.Journal(rev))
+		if err != nil || count < quorum {
 			continue
 		}
 		rec, derr := DecodeCommitRecord(b)
 		if derr != nil || rec.Rev != rev || rec.Parent != head {
 			continue
 		}
-		rb, rbCount, rerr := qg.QuorumGet(ctx, rec.RevBlockKey)
-		if rerr != nil || rbCount < r.writeQuorum {
+		rb, rbCount, rerr := read(rec.RevBlockKey)
+		if rerr != nil || rbCount < quorum {
 			continue
 		}
 		sum := sha256.Sum256(rb)
