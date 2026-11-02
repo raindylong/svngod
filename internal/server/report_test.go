@@ -382,3 +382,29 @@ func TestLineageGapBetweenSourceAndCopy(t *testing.T) {
 		}
 	}
 }
+
+// TestReportUpdateSubdirTargetBaseline: an `svn up` run inside a subdirectory
+// sends update-target and an entry tree rooted at that target. The per-file
+// revision must be taken from that tree; rooting it at src-path used to send
+// an already-current file as add-file/open-file with the wrong base
+// (E155017 checksum mismatch).
+func TestReportUpdateSubdirTargetBaseline(t *testing.T) {
+	ts, repo, base := testServer(t, "", "")
+	defer ts.Close()
+	if _, err := repo.CommitTxn(1, []fs.Change{
+		{Path: "/trunk/README.txt", Action: fs.ActionModify, Kind: fs.KindFile, Data: []byte("v2\n")},
+	}, map[string]string{"svn:log": "r2"}); err != nil {
+		t.Fatal(err)
+	}
+	body := `<?xml version="1.0"?><S:update-report xmlns:S="svn:">` +
+		`<S:src-path>` + base + `/svn/demo/</S:src-path>` +
+		`<S:target-revision>2</S:target-revision><S:update-target>trunk</S:update-target>` +
+		`<S:depth>unknown</S:depth>` +
+		`<S:entry rev="2" depth="infinity" start-empty="true"></S:entry>` +
+		`<S:entry rev="2" depth="infinity">README.txt</S:entry>` +
+		`</S:update-report>`
+	out := doReport(t, base, body)
+	if strings.Contains(out, `name="README.txt"`) {
+		t.Fatalf("file already at the target revision was sent again:\n%s", out)
+	}
+}

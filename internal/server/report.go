@@ -13,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -105,6 +106,9 @@ func (e xmlEl) child(local string) (xmlEl, bool) {
 // --- update-report (svn checkout / update) ---
 
 func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name string, body []byte) {
+	if os.Getenv("SVNGOD_DEBUG_REPORT") == "1" {
+		log.Printf("update-report body:\n%s", body)
+	}
 	var root xmlEl
 	if err := xml.Unmarshal(body, &root); err != nil {
 		http.Error(w, "bad update-report", http.StatusBadRequest)
@@ -186,6 +190,20 @@ func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name s
 		if r := wb.rootRev(); r > 0 {
 			anchorRev = r
 		}
+		// The <S:entry> tree of an update-target report is rooted at the
+		// TARGET directory (e.g. "trunk"), not at src-path. A plain update of
+		// a subdirectory in a mixed-revision WC therefore needs a baseline
+		// rooted at that target; otherwise the per-file revisions are lost
+		// and an unchanged file is sent as add-file/open-file with the wrong
+		// base (checksum mismatch). Switch keeps the src-rooted baseline for
+		// its anchor revision.
+		walkWB := wb
+		if dstPath == "" {
+			walkWB = newWCBaseline(repo, oldPath, &root)
+			if r := walkWB.rootRev(); r > 0 {
+				anchorRev = r
+			}
+		}
 		var b strings.Builder
 		b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
 		b.WriteString(`<S:update-report xmlns:S="svn:" xmlns:D="` + NS_DAV + `" xmlns:V="http://subversion.tigris.org/xmlns/dav/" inline-props="true">` + "\n")
@@ -193,7 +211,7 @@ func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name s
 		rp, _ := repo.GetRevProps(rev)
 		uuid, _ := repo.UUID()
 		b.WriteString("  <S:open-directory rev=\"" + strconv.FormatUint(anchorRev, 10) + "\">\n")
-		if err := s.updateWalkDir(&b, repo, base, rev, newPath, "open-directory", true, rp, uuid, wb, 0, limit, filesOnly, explicitDepth, 0, updateTarget, oldPath, sendAll); err != nil {
+		if err := s.updateWalkDir(&b, repo, base, rev, newPath, "open-directory", true, rp, uuid, walkWB, 0, limit, filesOnly, explicitDepth, 0, updateTarget, oldPath, sendAll); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
