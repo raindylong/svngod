@@ -167,6 +167,41 @@ func TestQuorumCommitRefusesWhenTooFewCopies(t *testing.T) {
 	}
 }
 
+// walProbeStore enables WAL journaling on top of the counting store so the
+// replay probe behavior can be observed.
+type walProbeStore struct{ *countingStore }
+
+func (w *walProbeStore) Journaling() bool { return true }
+
+// TestReplayProbesOnlyNextJournalRecord: WAL replay runs on the read path
+// (every HeadFresh). It must probe only journal/head+1 and stop at the first
+// miss; probing the rest of the look-ahead window cost one backend round trip
+// per key and made every request ~10s while a replica was down.
+func TestReplayProbesOnlyNextJournalRecord(t *testing.T) {
+	ws := &walProbeStore{countingStore: &countingStore{Store: store.NewMemoryStore()}}
+	r, err := CreateRepo(ws, "probe", 4096, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.CommitTxn(0, []Change{{Path: "/a", Action: ActionAdd, Kind: KindFile, Data: []byte("1")}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	ws.mu.Lock()
+	ws.gets = map[string]int{}
+	ws.mu.Unlock()
+
+	r.reconcileJournal(true)
+
+	if n := ws.count(r.keys.Journal(2)); n != 1 {
+		t.Fatalf("journal/2 probed %d times, want 1", n)
+	}
+	for rev := uint64(3); rev <= 9; rev++ {
+		if n := ws.count(r.keys.Journal(rev)); n != 0 {
+			t.Fatalf("journal/%d probed %d times after a miss, want 0", rev, n)
+		}
+	}
+}
+
 // TestJournalReplayRollsForward: a quorum-acked record whose HEAD CAS never
 // ran (rewound here) is published when the repository is reopened.
 func TestJournalReplayRollsForward(t *testing.T) {

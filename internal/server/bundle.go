@@ -214,6 +214,14 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 	claimErr := repo.Store().CreateIfAbsent(ctx, claimKey, claim)
 	if claimErr != nil {
 		if !errors.Is(claimErr, store.ErrPreconditionFailed) {
+			if storageUnavailable(claimErr) {
+				// A fenced replica (cold start with the peer down) is a
+				// transient condition: let the client retry instead of
+				// reporting a generic server error.
+				w.Header().Set("Retry-After", "2")
+				writeBundleError(w, http.StatusServiceUnavailable, "unavailable", claimErr.Error())
+				return
+			}
 			http.Error(w, claimErr.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -246,6 +254,11 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 
 	head, err := repo.HeadFresh()
 	if err != nil {
+		if storageUnavailable(err) {
+			w.Header().Set("Retry-After", "2")
+			writeBundleError(w, http.StatusServiceUnavailable, "unavailable", err.Error())
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

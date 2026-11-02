@@ -1016,8 +1016,14 @@ func (m *MirrorStore) QuorumGet(ctx context.Context, key string) ([]byte, int, e
 		n   int
 	}
 	var best *cand
-	for _, s := range m.mirrors {
-		c, cancel := context.WithTimeout(ctx, quorumWriteTimeout)
+	for i, s := range m.mirrors {
+		// An out-of-service replica cannot contribute a copy to the count and
+		// must not add its retry budget to every quorum read (WAL replay runs
+		// on the read path). A stale healthy flag still costs one timeout.
+		if !m.isHealthy(i) {
+			continue
+		}
+		c, cancel := context.WithTimeout(ctx, quorumReadTimeout)
 		b, err := s.Get(c, key, nil)
 		cancel()
 		if err != nil {
@@ -1036,6 +1042,11 @@ func (m *MirrorStore) QuorumGet(ctx context.Context, key string) ([]byte, int, e
 	}
 	return best.val, best.n, nil
 }
+
+// quorumReadTimeout bounds one replica read in QuorumGet. It is shorter than
+// the write budget because a read has no durable side effect and a slow
+// replica can be excluded from the count instead of holding the request.
+const quorumReadTimeout = 5 * time.Second
 
 // standbyWriteTimeout bounds how long a commit waits for one standby. It is
 // far above a healthy write (tens of ms locally) but short enough that a dead

@@ -862,7 +862,17 @@ func (s *Server) reportLog(w http.ResponseWriter, repo *fs.Repo, reportPath stri
 	if len(filters) == 0 {
 		filters = []string{basePath}
 	}
-
+	// treeDiff walks the whole tree at both revisions: at 1M files it costs
+	// seconds per revision, so `svn log -q` over a large range used to take
+	// minutes. Changed paths are only needed when the client asks for them or
+	// when a sub-path filter has to decide whether a revision touched it.
+	filterIsRoot := true
+	for _, f := range filters {
+		if f != "" {
+			filterIsRoot = false
+			break
+		}
+	}
 	// requested revprops: which svn:* props the client wants
 	requested := map[string]bool{}
 	anyRevprop := false
@@ -893,14 +903,29 @@ func (s *Server) reportLog(w http.ResponseWriter, repo *fs.Repo, reportPath stri
 			return false
 		}
 		var changes map[string]change
-		if rv > 0 {
+		if rv > 0 && discoverChanged {
 			changes, _ = treeDiff(repo, rv)
 		}
 		// A path filter applies to every log request, whether or not the
 		// client asked for changed paths: svn log URL/trunk must not return
-		// revisions that only touched /branch.
-		if rv > 0 && !anyPathTouched(changes, filters) {
-			return true
+		// revisions that only touched /branch. Without changed paths a
+		// node-id comparison decides whether the filtered path moved, which
+		// avoids a whole-tree diff per revision.
+		if rv > 0 && !filterIsRoot {
+			touched := false
+			if changes != nil {
+				touched = anyPathTouched(changes, filters)
+			} else {
+				for _, f := range filters {
+					if pathTouched(repo, rv, f) {
+						touched = true
+						break
+					}
+				}
+			}
+			if !touched {
+				return true
+			}
 		}
 		count++
 		rp, err := repo.GetRevProps(rv)
@@ -977,6 +1002,45 @@ func anyPathTouched(changes map[string]change, filters []string) bool {
 		}
 	}
 	return false
+}
+
+// pathTouched reports whether the filtered path changed between rev and rev-1
+// without diffing the whole tree. A directory node id changes whenever anything
+// beneath it changes (directories are rewritten copy-on-write), so comparing
+// the node id answers "did this subtree move" in O(depth). Ancestors are
+// checked for existence, kind and copy-from changes, which carry a subtree.
+func pathTouched(repo *fs.Repo, rev uint64, path string) bool {
+	path = strings.Trim(path, "/")
+	if rev == 0 || path == "" {
+		return true
+	}
+	parts := strings.Split(path, "/")
+	for i := 1; i < len(parts); i++ {
+		anc := strings.Join(parts[:i], "/")
+		ca, ea := repo.Resolve(rev, anc)
+		pa, eb := repo.Resolve(rev-1, anc)
+		if ea != nil || eb != nil || ca.Kind != pa.Kind {
+			return true
+		}
+		if ca.CopyFrom != nil && (pa.CopyFrom == nil || *ca.CopyFrom != *pa.CopyFrom) {
+			return true
+		}
+	}
+	cur, err1 := repo.Resolve(rev, path)
+	prev, err2 := repo.Resolve(rev-1, path)
+	if (err1 == nil) != (err2 == nil) {
+		return true
+	}
+	if err1 != nil {
+		return false // absent from both revisions
+	}
+	if cur.Kind != prev.Kind || cur.Node != prev.Node {
+		return true
+	}
+	if cur.CopyFrom != nil && (prev.CopyFrom == nil || *cur.CopyFrom != *prev.CopyFrom) {
+		return true
+	}
+	return !sameProps(cur.Props, prev.Props)
 }
 
 // logChangedPaths diffs rev vs rev-1 and emits added/modified/deleted paths.
@@ -1129,6 +1193,13 @@ func treeDiff(repo *fs.Repo, rev uint64) (map[string]change, error) {
 		if cur.Kind != prev.Kind {
 			out[path] = change{action: chReplaced, kind: cur.Kind, textMods: cur.Kind == fs.KindFile, propMods: true}
 		} else if cur.Kind == fs.KindDir {
+			// Directories are copy-on-write: an identical node id means the
+			// entire subtree is unchanged. Pruning here turns a revision that
+			// touches one file in a 1M-file repository from a full tree walk
+			// into a walk of the changed directories only.
+			if cur.Node == prev.Node {
+				return nil
+			}
 			curCh, _ := repo.ListDir(rev, path)
 			prevCh, _ := repo.ListDir(prevRev, path)
 			names := map[string]bool{}
@@ -1152,6 +1223,11 @@ func treeDiff(repo *fs.Repo, rev uint64) (map[string]change, error) {
 				}
 			}
 		} else {
+			// Same node id: text and properties are unchanged, so there is
+			// nothing to compare (avoiding a text read per file per revision).
+			if cur.Node == prev.Node {
+				return nil
+			}
 			ct, err1 := repo.GetText(cur.Node)
 			pt, err2 := repo.GetText(prev.Node)
 			if err1 != nil || err2 != nil {

@@ -204,6 +204,106 @@ func TestReportLogPathFilter(t *testing.T) {
 	}
 }
 
+// TestReportLogQuietFilter: `svn log -q URL/path` sends no
+// discover-changed-paths element. The server must still filter by path, but
+// must not run a whole-tree diff per revision (the 1M-file log slowdown); the
+// node-id comparison decides whether the path moved.
+func TestReportLogQuietFilter(t *testing.T) {
+	ts, repo, base := testServer(t, "", "")
+	defer ts.Close()
+	if _, err := repo.CommitTxn(1, []fs.Change{
+		{Path: "/trunk/doc/guide.txt", Action: fs.ActionModify, Kind: fs.KindFile, Data: []byte("changed\n")},
+	}, map[string]string{"svn:log": "doc edit"}); err != nil {
+		t.Fatal(err)
+	}
+	body := `<?xml version="1.0"?><S:log-report xmlns:S="svn:">` +
+		`<S:start-revision>2</S:start-revision><S:end-revision>0</S:end-revision>` +
+		`<S:no-revprops/><S:path></S:path></S:log-report>`
+
+	readme := doReportAt(t, base+"/svn/demo/!svn/bln/2/trunk/README.txt", body)
+	if strings.Contains(readme, "<D:version-name>2</D:version-name>") {
+		t.Fatalf("quiet README log includes the unrelated r2:\n%s", readme)
+	}
+	if !strings.Contains(readme, "<D:version-name>1</D:version-name>") {
+		t.Fatalf("quiet README log missing r1:\n%s", readme)
+	}
+	if strings.Contains(readme, "S:added-path") || strings.Contains(readme, "S:modified-path") {
+		t.Fatalf("quiet log emitted changed paths:\n%s", readme)
+	}
+	guide := doReportAt(t, base+"/svn/demo/!svn/bln/2/trunk/doc/guide.txt", body)
+	if !strings.Contains(guide, "<D:version-name>2</D:version-name>") {
+		t.Fatalf("quiet guide log missing r2:\n%s", guide)
+	}
+}
+
+// TestReportLogQuietFilterDirectoryCopy: a path inside a directory copied in
+// this revision counts as touched even though its own node id is new; the
+// ancestor copy check must keep the revision.
+func TestReportLogQuietFilterDirectoryCopy(t *testing.T) {
+	ts, repo, base := testServer(t, "", "")
+	defer ts.Close()
+	if _, err := repo.CommitTxn(1, []fs.Change{
+		{Path: "/branch", Action: fs.ActionCopy, Kind: fs.KindDir,
+			CopyFromPath: "/trunk", CopyFromRev: 1},
+	}, map[string]string{"svn:log": "branch"}); err != nil {
+		t.Fatal(err)
+	}
+	body := `<?xml version="1.0"?><S:log-report xmlns:S="svn:">` +
+		`<S:start-revision>2</S:start-revision><S:end-revision>0</S:end-revision>` +
+		`<S:no-revprops/><S:path></S:path></S:log-report>`
+	out := doReportAt(t, base+"/svn/demo/!svn/bln/2/branch/README.txt", body)
+	if !strings.Contains(out, "<D:version-name>2</D:version-name>") {
+		t.Fatalf("quiet log for a copied subtree missed the copy revision:\n%s", out)
+	}
+}
+
+// TestReportLogVerbosePrunesUnchanged: treeDiff must not emit unchanged
+// siblings (the node-id prune keeps a 1M-file revision cheap and the output
+// accurate).
+func TestReportLogVerbosePrunesUnchanged(t *testing.T) {
+	ts, repo, base := testServer(t, "", "")
+	defer ts.Close()
+	if _, err := repo.CommitTxn(1, []fs.Change{
+		{Path: "/trunk/doc/guide.txt", Action: fs.ActionModify, Kind: fs.KindFile, Data: []byte("changed\n")},
+	}, map[string]string{"svn:log": "doc edit"}); err != nil {
+		t.Fatal(err)
+	}
+	body := `<?xml version="1.0"?><S:log-report xmlns:S="svn:">` +
+		`<S:start-revision>2</S:start-revision><S:end-revision>2</S:end-revision>` +
+		`<S:discover-changed-paths/><S:no-revprops/><S:path></S:path></S:log-report>`
+	out := doReportAt(t, base+"/svn/demo/!svn/bln/2", body)
+	if !strings.Contains(out, "<S:modified-path") || !strings.Contains(out, "/trunk/doc/guide.txt") {
+		t.Fatalf("verbose log missing the modified path:\n%s", out)
+	}
+	if strings.Contains(out, "/trunk/README.txt") {
+		t.Fatalf("verbose log emitted an unchanged sibling:\n%s", out)
+	}
+}
+
+// TestReportLogVerbosePropOnly: a property-only change creates a new node
+// revision, so the node-id prune must still report it (with prop-mods and no
+// text-mods).
+func TestReportLogVerbosePropOnly(t *testing.T) {
+	ts, repo, base := testServer(t, "", "")
+	defer ts.Close()
+	if _, err := repo.CommitTxn(1, []fs.Change{
+		{Path: "/trunk/README.txt", Action: fs.ActionModify, Kind: fs.KindFile,
+			Props: map[string]string{"svn:eol-style": "native"}},
+	}, map[string]string{"svn:log": "prop edit"}); err != nil {
+		t.Fatal(err)
+	}
+	body := `<?xml version="1.0"?><S:log-report xmlns:S="svn:">` +
+		`<S:start-revision>2</S:start-revision><S:end-revision>2</S:end-revision>` +
+		`<S:discover-changed-paths/><S:no-revprops/><S:path></S:path></S:log-report>`
+	out := doReportAt(t, base+"/svn/demo/!svn/bln/2", body)
+	if !strings.Contains(out, "/trunk/README.txt") || !strings.Contains(out, `prop-mods="true"`) {
+		t.Fatalf("prop-only change missing from verbose log:\n%s", out)
+	}
+	if strings.Contains(out, `text-mods="true"`) {
+		t.Fatalf("prop-only change reported text-mods:\n%s", out)
+	}
+}
+
 // TestReportLogAscending checks that an ascending revision range returns
 // items instead of nothing.
 func TestReportLogAscending(t *testing.T) {

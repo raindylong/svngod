@@ -184,14 +184,24 @@ func (r *Repo) replayJournal() {
 	head := cur0.Head
 	// Only a contiguous run starting at head+1 can be published. Anything
 	// further ahead is a different writer's intent and must not be reordered.
+	// A missing or invalid record ends the search: probing the next seven
+	// revision numbers on every HeadFresh cost one backend retry each while a
+	// replica was down (measured as ~10s per upload in availability mode).
 	for rev := head + 1; rev <= head+8; rev++ {
-		b, count, err := read(r.keys.Journal(rev))
+		key := r.keys.Journal(rev)
+		// Cheap presence probe first. A plain Get reads the primary and does
+		// not touch an out-of-service replica, so the common case (no pending
+		// record) costs one fast request instead of a quorum scan.
+		if _, err := r.store.Get(ctx, key, nil); err != nil {
+			break
+		}
+		b, count, err := read(key)
 		if err != nil || count < quorum {
-			continue
+			break
 		}
 		rec, derr := DecodeCommitRecord(b)
 		if derr != nil || rec.Rev != rev || rec.Parent != head {
-			continue
+			break
 		}
 		rb, rbCount, rerr := read(rec.RevBlockKey)
 		if rerr != nil || rbCount < quorum {
