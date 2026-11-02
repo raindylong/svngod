@@ -68,6 +68,9 @@ func (k *Keys) Dir(hash string) string { return k.p("dirs", hash) }
 // Journal returns the write-ahead commit record key for one revision.
 func (k *Keys) Journal(rev uint64) string { return k.p("journal", padRev(rev)) }
 
+// JournalPrefix is the common prefix of all journal records.
+func (k *Keys) JournalPrefix() string { return k.p("journal") + "/" }
+
 // CommitLock returns the commit-lock object key.
 func (k *Keys) CommitLock() string { return k.p("locks", "commit") }
 

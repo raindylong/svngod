@@ -6,14 +6,18 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"svngod/internal/auth"
 	"svngod/internal/authz"
 	"svngod/internal/fs"
+	"svngod/internal/fs/store"
 )
 
 // RepoOpener opens (and caches) a repository by name.
@@ -440,6 +444,11 @@ func (s *Server) repo(w http.ResponseWriter, res resource) (*fs.Repo, bool) {
 	if err != nil {
 		if errors.Is(err, fs.ErrRepoNotFound) {
 			http.NotFound(w, nil)
+		} else if storageUnavailable(err) {
+			// A dead backend is transient: let clients retry instead of
+			// reporting a generic server error.
+			w.Header().Set("Retry-After", "2")
+			http.Error(w, "repository storage is temporarily unavailable", http.StatusServiceUnavailable)
 		} else {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
@@ -454,6 +463,20 @@ func (s *Server) repo(w http.ResponseWriter, res resource) (*fs.Repo, bool) {
 	s.ensureLocksLoaded(res.repo, ropen)
 	s.ensureActivitiesLoaded(res.repo, ropen)
 	return ropen, true
+}
+
+// storageUnavailable reports whether an open error is a transient backend
+// failure (dead node, lost quorum, permission outage) rather than corruption.
+func storageUnavailable(err error) bool {
+	if errors.Is(err, store.ErrQuorumUnmet) || errors.Is(err, store.ErrReplicaLagging) {
+		return true
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, os.ErrPermission) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 // absURL builds an absolute URL for a repo-relative private/public href.

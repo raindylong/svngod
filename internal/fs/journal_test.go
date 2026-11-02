@@ -3,6 +3,7 @@ package fs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync/atomic"
 	"testing"
@@ -234,5 +235,35 @@ func TestJournalReplayAvailabilityMode(t *testing.T) {
 	}
 	if h, _ := r2.HeadFresh(); h != 1 {
 		t.Fatalf("head=%d after replay, want 1", h)
+	}
+}
+
+// TestTrimJournal keeps the newest records and drops older ones (GC calls it
+// so the WAL does not grow without bound).
+func TestTrimJournal(t *testing.T) {
+	a := store.NewMemoryStore()
+	b := store.NewMemoryStore()
+	ms := store.NewMirror([]store.Store{a, b})
+	r, err := CreateRepo(ms, "tg", 4096, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 3; i++ {
+		path := fmt.Sprintf("/f%d", i)
+		if _, err := r.CommitTxn(uint64(i-1), []Change{{Path: path, Action: ActionAdd, Kind: KindFile, Data: []byte(path)}}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recs, err := r.JournalTail(10)
+	if err != nil || len(recs) != 3 {
+		t.Fatalf("journal before trim: n=%d err=%v", len(recs), err)
+	}
+	n, err := r.TrimJournal(1)
+	if err != nil || n != 2 {
+		t.Fatalf("trimmed=%d err=%v, want 2", n, err)
+	}
+	recs, err = r.JournalTail(10)
+	if err != nil || len(recs) != 1 || recs[0].Rev != 3 {
+		t.Fatalf("journal after trim: %+v err=%v", recs, err)
 	}
 }

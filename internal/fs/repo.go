@@ -1245,6 +1245,12 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 	if err := lease.Verify(ctx, r.store); err != nil {
 		return 0, err
 	}
+	// Chaos hook (test-only): exit after the WAL append but before the HEAD CAS
+	// to exercise journal roll-forward on a live store.
+	if os.Getenv("SVNGOD_CHAOS_AFTER_WAL") == "1" {
+		log.Printf("chaos: exiting after WAL rev=%d before current CAS", N)
+		os.Exit(9)
+	}
 	if _, err := r.store.CAS(ctx, r.keys.Current(), etag, nc.Marshal()); err != nil {
 		return 0, err
 	}

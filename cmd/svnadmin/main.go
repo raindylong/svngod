@@ -47,6 +47,7 @@ type options struct {
 	fromRev         uint64
 	toRev           uint64
 	journalLimit    int
+	keepJournal     uint64
 	chunkAvg        uint64
 	dirBuckets      bool
 	migrateDirs     string
@@ -190,6 +191,9 @@ func main() {
 	}
 	if cmd == "journal" {
 		fs.IntVar(&o.journalLimit, "n", 20, "number of records to show")
+	}
+	if cmd == "gc" {
+		fs.Uint64Var(&o.keepJournal, "keep-journal", 4096, "number of recent WAL records to keep")
 	}
 	shardSize := uint64(defaultShardSize)
 	maxDelta := uint64(defaultMaxDelta)
@@ -379,8 +383,12 @@ func doGC(o *options, repoName string) {
 	if err != nil {
 		fatal(err)
 	}
-	fmt.Printf("gc: removed %d loose objects, %d orphaned txn bodies and %d unreferenced texts from %q\n",
-		n, tn, tx, repoName)
+	jn, err := repo.TrimJournal(o.keepJournal)
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Printf("gc: removed %d loose objects, %d orphaned txn bodies and %d unreferenced texts from %q (journal: %d trimmed)\n",
+		n, tn, tx, repoName, jn)
 }
 
 func doJournal(o *options, repoName string) {

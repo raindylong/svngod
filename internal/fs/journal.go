@@ -10,6 +10,9 @@ import (
 	"fmt"
 	"hash/crc32"
 	"log"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"svngod/internal/fs/store"
@@ -214,16 +217,30 @@ func (r *Repo) replayJournal() {
 }
 
 // JournalTail returns the last n journal records that can be decoded, newest
-// first. It is used by svnadmin for operator inspection.
+// first. It lists the journal prefix instead of walking down from HEAD so that
+// an in-flight record (rev > HEAD, the crash window) is visible too.
 func (r *Repo) JournalTail(n int) ([]*CommitRecord, error) {
-	head, err := r.HeadFresh()
-	if err != nil {
-		return nil, err
-	}
 	ctx := context.Background()
+	prefix := r.keys.JournalPrefix()
+	var keys []string
+	next := ""
+	for {
+		objs, nx, err := r.store.ListPrefix(ctx, prefix, next, 1000)
+		if err != nil {
+			return nil, err
+		}
+		for _, o := range objs {
+			keys = append(keys, o.Key)
+		}
+		if nx == "" || nx == next {
+			break
+		}
+		next = nx
+	}
+	sort.Strings(keys)
 	var out []*CommitRecord
-	for rev := head; rev > 0 && len(out) < n; rev-- {
-		b, err := r.store.Get(ctx, r.keys.Journal(rev), nil)
+	for i := len(keys) - 1; i >= 0 && len(out) < n; i-- {
+		b, err := r.store.Get(ctx, keys[i], nil)
 		if err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				continue
@@ -237,6 +254,48 @@ func (r *Repo) JournalTail(n int) ([]*CommitRecord, error) {
 		out = append(out, rec)
 	}
 	return out, nil
+}
+
+// TrimJournal deletes journal records older than the last keep revisions.
+// Records are small, but an unbounded log is still undesirable; GC calls this
+// after reclaiming loose objects.
+func (r *Repo) TrimJournal(keep uint64) (int, error) {
+	head, err := r.HeadFresh()
+	if err != nil {
+		return 0, err
+	}
+	if head <= keep {
+		return 0, nil
+	}
+	cutoff := head - keep
+	ctx := context.Background()
+	prefix := r.keys.JournalPrefix()
+	next := ""
+	var victims []string
+	for {
+		objs, n, lerr := r.store.ListPrefix(ctx, prefix, next, 1000)
+		if lerr != nil {
+			return 0, lerr
+		}
+		for _, o := range objs {
+			revStr := o.Key[strings.LastIndex(o.Key, "/")+1:]
+			rev, perr := strconv.ParseUint(revStr, 10, 64)
+			if perr == nil && rev <= cutoff {
+				victims = append(victims, o.Key)
+			}
+		}
+		if n == "" || n == next {
+			break
+		}
+		next = n
+	}
+	if len(victims) == 0 {
+		return 0, nil
+	}
+	if err := r.store.Delete(ctx, victims); err != nil {
+		return 0, err
+	}
+	return len(victims), nil
 }
 
 // JournalRecord returns one decoded record, or nil when absent.
