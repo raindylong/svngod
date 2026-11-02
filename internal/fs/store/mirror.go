@@ -525,10 +525,25 @@ func (m *MirrorStore) Get(ctx context.Context, key string, rng *Range) ([]byte, 
 	ack := append([]byte(nil), m.ackedCurrent...)
 	m.mu.Unlock()
 	if fenced && len(ack) > 0 && rng == nil {
-		// Fail closed: expose the last acknowledged HEAD, never a standby's
-		// older pointer. The referenced revision objects may not be readable
-		// until repair finishes, but clients cannot see a stale head.
-		return ack, nil
+		// Never expose a HEAD older than the last one this process
+		// acknowledged, but do not hide a newer one either: after an outage the
+		// other replica (or another svngod process) may be ahead, and returning
+		// the local ack forever made a healed cluster read a stale revision
+		// (observed 52 while both nodes held 53). Take the newest reachable
+		// value; without an order function fall back to the acknowledged copy.
+		if m.mutableOrder == nil {
+			return ack, nil
+		}
+		best := ack
+		for _, s := range m.mirrors {
+			c, cancel := context.WithTimeout(ctx, 2*time.Second)
+			b, err := s.Get(c, key, nil)
+			cancel()
+			if err == nil && m.mutableOrder(key, b, best) > 0 {
+				best = b
+			}
+		}
+		return best, nil
 	}
 	// Read the primary first: it is the only copy guaranteed to have every
 	// object written so far (a standby write is best effort and may still be

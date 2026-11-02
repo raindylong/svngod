@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -240,4 +241,45 @@ func TestMirrorRecoveryLoopRestoresStandby(t *testing.T) {
 		t.Fatal("standby still missing the object after repair")
 	}
 	f.m.Close()
+}
+
+// TestMirrorFencedHeadReturnsNewest: a process that fenced after losing the
+// primary must not keep serving its last acknowledged HEAD forever. Once a
+// replica (or another process) has advanced it, reads must see the newer one.
+func TestMirrorFencedHeadReturnsNewest(t *testing.T) {
+	a := NewMemoryStore()
+	b := NewMemoryStore()
+	order := func(key string, x, y []byte) int {
+		var nx, ny int
+		fmt.Sscanf(string(x), "HEAD=%d", &nx)
+		fmt.Sscanf(string(y), "HEAD=%d", &ny)
+		switch {
+		case nx < ny:
+			return -1
+		case nx > ny:
+			return 1
+		}
+		return 0
+	}
+	m := NewMirror([]Store{a, b}, WithMutableOrder(order))
+	key := "repos/demo/current"
+	m.SetControlKey(key)
+	// The primary is stale, the standby is ahead; the process last acked 1.
+	if err := a.Put(context.Background(), key, []byte("HEAD=1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Put(context.Background(), key, []byte("HEAD=2")); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	m.fenced = true
+	m.ackedCurrent = []byte("HEAD=1")
+	m.mu.Unlock()
+	got, err := m.Get(context.Background(), key, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "HEAD=2" {
+		t.Fatalf("fenced read=%q, want newest HEAD=2", got)
+	}
 }
