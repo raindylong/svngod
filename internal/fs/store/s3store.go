@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/minio/minio-go/v7"
@@ -56,7 +57,10 @@ func NewS3Store(cfg S3Config) (*S3Store, error) {
 		TLSHandshakeTimeout:   5 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
-	opt := &minio.Options{BucketLookup: minio.BucketLookupAuto, Secure: cfg.UseSSL, Transport: tr}
+	// Two internal attempts are enough: our own retry layer handles transient
+	// S3 errors, and a dead node must fail over quickly instead of burning the
+	// SDK's default ten retries on every object.
+	opt := &minio.Options{BucketLookup: minio.BucketLookupAuto, Secure: cfg.UseSSL, Transport: tr, MaxRetries: 2}
 	if cfg.Region != "" {
 		opt.Region = cfg.Region
 	}
@@ -142,6 +146,11 @@ func isTransient(err error) bool {
 		return false
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	// A refused connection means the node is down or restarting. Retrying on
+	// this path only delays failover; the recovery loop re-adds it later.
+	if errors.Is(err, syscall.ECONNREFUSED) {
 		return false
 	}
 	resp := minio.ToErrorResponse(err)

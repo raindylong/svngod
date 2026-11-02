@@ -71,6 +71,9 @@ type fileStore struct {
 	Prefix    string      `json:"prefix"`
 	SSL       bool        `json:"ssl"`
 	Mirrors   []fileStore `json:"mirrors"` // type=mirror: primary + standby backends
+	// Quorum is the number of replicas a write must reach before it is
+	// acknowledged (0/1 = primary only, 2 = both nodes of a mirror pair).
+	Quorum int `json:"quorum"`
 }
 
 func (s *fileStore) makeStore() (store.Store, error) {
@@ -99,7 +102,11 @@ func (s *fileStore) makeStore() (store.Store, error) {
 		if len(ms) < 2 {
 			return nil, fmt.Errorf("mirror storage requires at least 2 backends (got %d)", len(ms))
 		}
-		return store.NewMirror(ms, store.WithMutableOrder(fs.CompareMutable)), nil
+		opts := []store.MirrorOption{store.WithMutableOrder(fs.CompareMutable)}
+		if s.Quorum > 0 {
+			opts = append(opts, store.WithWriteQuorum(s.Quorum))
+		}
+		return store.NewMirror(ms, opts...), nil
 	default:
 		return store.NewFileStore(s.Root)
 	}

@@ -24,6 +24,10 @@ var ErrPreconditionFailed = errors.New("store: precondition failed")
 // last acknowledged HEAD, so it must not accept writes (RPO=0 failover).
 var ErrReplicaLagging = errors.New("store: replica is behind the acknowledged head")
 
+// ErrQuorumUnmet is returned when a write reached fewer replicas than the
+// configured write quorum. The write must not be acknowledged.
+var ErrQuorumUnmet = errors.New("store: write quorum not reached")
+
 // Range selects a byte window of an object.
 type Range struct {
 	Offset, Length int64 // Length <= 0 means "to end of object"
@@ -56,6 +60,16 @@ func DeletePrefix(ctx context.Context, s Store, prefix string) error {
 		next = n
 	}
 	return nil
+}
+
+// QuorumRegister is implemented by stores that can run a small register's
+// operations on a majority of replicas. Commit leases use it so two svngod
+// processes electing different mirror nodes cannot both hold the lease.
+type QuorumRegister interface {
+	CreateIfAbsentQuorum(ctx context.Context, key string, data []byte, quorum int) error
+	CASQuorum(ctx context.Context, key, expect string, data []byte, quorum int) error
+	DeleteIfMatchQuorum(ctx context.Context, key, etag string, quorum int) error
+	QuorumGet(ctx context.Context, key string) ([]byte, int, error)
 }
 
 // BulkSyncer flushes all pending writes of its backing filesystem in one

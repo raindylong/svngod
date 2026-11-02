@@ -50,6 +50,12 @@ type Repo struct {
 	maxDelta    uint64
 	chunkParams cdc.Params
 	dirBuckets  bool
+	// writeQuorum is the number of replicas a commit record must reach before
+	// publication (0/1 = single-node semantics, no WAL).
+	writeQuorum int
+	// journalMu serialises WAL replay and throttles it during reads.
+	journalMu sync.Mutex
+	journalAt time.Time
 
 	mu    sync.Mutex
 	cache *cache.LRU
@@ -182,7 +188,7 @@ func CreateRepoFull(st store.Store, prefix string, shardSize, maxDelta uint64, c
 	wireMirrorControl(st, keys)
 	return &Repo{
 		store: st, keys: keys, shardSz: shardSize, maxDelta: maxDelta,
-		chunkParams: chunks, dirBuckets: dirBuckets,
+		chunkParams: chunks, dirBuckets: dirBuckets, writeQuorum: writeQuorumOf(st),
 		cache: cache.New(1 << 16), nodeCache: make(map[cache.Key]*NodeRev),
 	}, nil
 }
@@ -221,12 +227,16 @@ func OpenRepo(st store.Store, prefix string) (*Repo, error) {
 	if f.ChunkMin != 0 || f.ChunkMax != 0 || f.ChunkMask != 0 {
 		cp = cdc.Params{Min: int(f.ChunkMin), Max: int(f.ChunkMax), Mask: f.ChunkMask}.Normalize()
 	}
-	wireMirrorControl(st, keys)
-	return &Repo{
+	r := &Repo{
 		store: st, keys: keys, shardSz: f.ShardSize, maxDelta: f.MaxDeltaChain,
-		chunkParams: cp, dirBuckets: f.DirBuckets,
+		chunkParams: cp, dirBuckets: f.DirBuckets, writeQuorum: writeQuorumOf(st),
 		cache: cache.New(1 << 16), nodeCache: make(map[cache.Key]*NodeRev),
-	}, nil
+	}
+	// Replay the commit WAL before the mirror adopts a HEAD: a quorum-acked
+	// record whose CAS never ran is completed here.
+	r.reconcileJournal(true)
+	wireMirrorControl(st, keys)
+	return r, nil
 }
 
 // wireMirrorControl tells a mirror store which object is the HEAD pointer, so
@@ -315,6 +325,10 @@ func (r *Repo) Head() (uint64, error) {
 // stale answer could change a write decision (e.g. the base revision of a new
 // transaction).
 func (r *Repo) HeadFresh() (uint64, error) {
+	// In quorum mode a process may be reading a mirror that missed a commit
+	// published through another process. Replaying the WAL tail (throttled)
+	// keeps HEAD monotonic without turning every read into a full reconcile.
+	r.reconcileJournal(false)
 	cur, _, err := r.readCurrent()
 	if err != nil {
 		return 0, err
@@ -858,6 +872,11 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 	}
 	defer lease.Release(r.store)
 
+	// Another process may have published through a different mirror primary
+	// while this one was stale; adopt the quorum-acked WAL before choosing the
+	// next revision number.
+	r.reconcileJournal(true)
+
 	if len(changes) == 0 {
 		return 0, errors.New("fs: empty commit")
 	}
@@ -1192,7 +1211,8 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 		return 0, err
 	}
 	sh := r.shard(N)
-	if err := r.store.Put(ctx, r.keys.LooseRev(sh, N), rb.Marshal()); err != nil {
+	rbBytes := rb.Marshal()
+	if err := r.store.Put(ctx, r.keys.LooseRev(sh, N), rbBytes); err != nil {
 		return 0, err
 	}
 	rp := NewRevProps()
@@ -1206,6 +1226,16 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 	nc := &Current{Head: N, Created: cur.Created}
 	if nc.Created == 0 {
 		nc.Created = time.Now().Unix()
+	}
+	// WAL: record the publication intent on a quorum before the pointer moves.
+	// A crash right after this leaves a record the ledger can roll forward; a
+	// crash before it leaves no visible revision at all.
+	if err := lease.Verify(ctx, r.store); err != nil {
+		return 0, err
+	}
+	if err := r.writeCommitJournal(ctx, N, cur.Head, lease.token, nc.Created, rbBytes,
+		r.keys.LooseRev(sh, N), r.keys.LooseRevProps(sh, N), rp.Props); err != nil {
+		return 0, err
 	}
 	if err := lease.Verify(ctx, r.store); err != nil {
 		return 0, err

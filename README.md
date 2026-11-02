@@ -10,6 +10,7 @@
 - **存储**：svndiff v0 编解码、FSFS 式分片（SHARD_SIZE 默认 4096）、自动打包、LRU 缓存；后端 `file`（本地）/ `s3`（RustFS/MinIO/AWS/OSS/COS）/ `mirror`（主备镜像）。
 - **规模**：单仓 1000 万修订级（分片+自动打包，loose 对象数 O(shards)）；实测 10 万修订 avg 0.44ms/rev 稳定不退化。
 - **多租户**：`--config` 单进程多库，每库独立存储/认证/授权；`mirror` 提供主备 S3 负载均衡 + 故障降级 + 恢复自动补齐。
+- **WAL + 写法定人数（etcd 思路）**：mirror 配置 `"quorum": 2` 后，提交先把带 CRC32C 的提交记录（WAL）写到法定人数副本，再推进 HEAD；启动/提交前回放 WAL，把“已达成法定人数但 HEAD 未推进”的提交前滚。提交租约也改为法定人数互斥，避免两个 svngod 进程各自选举不同 mirror 主节点时同时提交同一修订号。节点不足法定人数时提交返回 503，不确认任何数据。
 
 ## 快速开始
 
@@ -28,6 +29,22 @@ svngod --config svngod.json
 ```
 
 配置示例见 `docs/Go-SVN服务器架构设计方案.md` §9.4（多库）、§9.5（主备 S3 镜像）。
+
+quorum 模式示例（3 节点，任意 1 个节点故障仍可提交；2 个故障则拒绝提交）：
+
+```json
+"storage": {
+  "type": "mirror",
+  "quorum": 2,
+  "mirrors": [
+    {"type": "s3", "endpoint": "10.0.0.11:9000", "access-key": "...", "secret-key": "...", "bucket": "svn"},
+    {"type": "s3", "endpoint": "10.0.0.12:9000", "access-key": "...", "secret-key": "...", "bucket": "svn"},
+    {"type": "s3", "endpoint": "10.0.0.13:9000", "access-key": "...", "secret-key": "...", "bucket": "svn"}
+  ]
+}
+```
+
+`svnadmin journal -n 20 <repo>` 可查看最近的 WAL 记录（修订、父修订、法定人数、revblock 校验和）。
 
 ### svngocli（客户端）
 

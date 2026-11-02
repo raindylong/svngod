@@ -13,6 +13,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -45,6 +46,7 @@ type options struct {
 	texts           bool
 	fromRev         uint64
 	toRev           uint64
+	journalLimit    int
 	chunkAvg        uint64
 	dirBuckets      bool
 	migrateDirs     string
@@ -110,7 +112,19 @@ func (o *options) mirrorStore(name string) (store.Store, string, error) {
 		return nil, "", err
 	}
 	var entries []mirrorEntry
-	if err := json.Unmarshal(data, &entries); err != nil {
+	var quorum int
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		// Object form: {"mirrors":[...],"quorum":2}
+		var obj struct {
+			Mirrors []mirrorEntry `json:"mirrors"`
+			Quorum  int           `json:"quorum"`
+		}
+		if err := json.Unmarshal(trimmed, &obj); err != nil {
+			return nil, "", fmt.Errorf("parse --mirror-file: %v", err)
+		}
+		entries, quorum = obj.Mirrors, obj.Quorum
+	} else if err := json.Unmarshal(data, &entries); err != nil {
 		return nil, "", fmt.Errorf("parse --mirror-file: %v", err)
 	}
 	ms := make([]store.Store, 0, len(entries))
@@ -139,7 +153,11 @@ func (o *options) mirrorStore(name string) (store.Store, string, error) {
 	if len(ms) < 2 {
 		return nil, "", fmt.Errorf("--mirror-file requires at least 2 backends (got %d)", len(ms))
 	}
-	return store.NewMirror(ms, store.WithMutableOrder(fs.CompareMutable)), "repos/" + name, nil
+	opts := []store.MirrorOption{store.WithMutableOrder(fs.CompareMutable)}
+	if quorum > 0 {
+		opts = append(opts, store.WithWriteQuorum(quorum))
+	}
+	return store.NewMirror(ms, opts...), "repos/" + name, nil
 }
 
 func main() {
@@ -169,6 +187,9 @@ func main() {
 		fs.BoolVar(&o.texts, "texts", false, "with --all-revs: read and hash every file text (slow)")
 		fs.Uint64Var(&o.fromRev, "from", 1, "first revision for --all-revs")
 		fs.Uint64Var(&o.toRev, "to", 0, "last revision for --all-revs (0 = HEAD)")
+	}
+	if cmd == "journal" {
+		fs.IntVar(&o.journalLimit, "n", 20, "number of records to show")
 	}
 	shardSize := uint64(defaultShardSize)
 	maxDelta := uint64(defaultMaxDelta)
@@ -203,6 +224,8 @@ func main() {
 		doLoad(&o, repoName, input)
 	case "verify":
 		doVerify(&o, repoName)
+	case "journal":
+		doJournal(&o, repoName)
 	case "info":
 		doInfo(&o, repoName)
 	case "migrate":
@@ -223,6 +246,7 @@ usage:
   svnadmin dump   [--output FILE] [s3 flags] <repo>
   svnadmin load   [--input FILE] [s3 flags] <repo>
   svnadmin verify [s3 flags] <repo>   # integrity walk; prints corrupted nodes
+  svnadmin journal [-n N] [s3 flags | --mirror-file FILE] <repo>  # show WAL records
   svnadmin gc     [s3 flags] <repo>   # loose objects, txn bodies, unused texts
 
 s3 flags: --endpoint H:PORT --access-key K --secret-key S --bucket B [--prefix P] [--ssl]
@@ -357,6 +381,29 @@ func doGC(o *options, repoName string) {
 	}
 	fmt.Printf("gc: removed %d loose objects, %d orphaned txn bodies and %d unreferenced texts from %q\n",
 		n, tn, tx, repoName)
+}
+
+func doJournal(o *options, repoName string) {
+	st, prefix, err := o.repoStore(repoName)
+	if err != nil {
+		fatal(err)
+	}
+	repo, err := fs.OpenRepo(st, prefix)
+	if err != nil {
+		fatal(err)
+	}
+	recs, err := repo.JournalTail(o.journalLimit)
+	if err != nil {
+		fatal(err)
+	}
+	if len(recs) == 0 {
+		fmt.Printf("journal: no records\n")
+		return
+	}
+	for _, rec := range recs {
+		fmt.Printf("rev %d parent %d quorum %d lease %s created %d sha %s log %q\n",
+			rec.Rev, rec.Parent, rec.Quorum, rec.Lease, rec.Created, rec.RevBlockSHA[:12], rec.Log)
+	}
 }
 
 func doVerify(o *options, repoName string) {

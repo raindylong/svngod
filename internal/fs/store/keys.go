@@ -65,6 +65,9 @@ func (k *Keys) Chunk(hash string) string { return k.p("chunks", hash) }
 // Dir returns the key of a large-directory table or bucket object.
 func (k *Keys) Dir(hash string) string { return k.p("dirs", hash) }
 
+// Journal returns the write-ahead commit record key for one revision.
+func (k *Keys) Journal(rev uint64) string { return k.p("journal", padRev(rev)) }
+
 // CommitLock returns the commit-lock object key.
 func (k *Keys) CommitLock() string { return k.p("locks", "commit") }
 

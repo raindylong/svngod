@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -52,6 +53,12 @@ type MirrorStore struct {
 	// went down, so redundancy is restored in seconds instead of waiting for
 	// the 60s periodic pass.
 	recovering bool
+
+	// writeQuorum is the number of copies a write must reach before it may be
+	// acknowledged (0/1 = primary only, the historical behaviour). With >=2
+	// the store behaves like a quorum-replicated log: a commit cannot be
+	// acknowledged while too few replicas are reachable.
+	writeQuorum int
 
 	// mutableOrder orders two values of a mutable key (<0: a older than b).
 	// fs sets it so a rejoining mirror cannot overwrite a newer HEAD pointer
@@ -142,6 +149,15 @@ type MirrorOption func(*MirrorStore)
 func WithMutableOrder(fn func(key string, a, b []byte) int) MirrorOption {
 	return func(m *MirrorStore) { m.mutableOrder = fn }
 }
+
+// WithWriteQuorum requires every write to reach n copies before it returns.
+// n <= 1 keeps the best-effort standby behaviour.
+func WithWriteQuorum(n int) MirrorOption {
+	return func(m *MirrorStore) { m.writeQuorum = n }
+}
+
+// WriteQuorum reports the configured number of copies (0 = best effort).
+func (m *MirrorStore) WriteQuorum() int { return m.writeQuorum }
 
 // NewMirror builds a MirrorStore over the given backends, aligns them, and
 // starts the background repair loop.
@@ -319,7 +335,7 @@ func (m *MirrorStore) ackedCopy() []byte {
 
 // checkCaughtUp refuses writes on a standby whose HEAD differs from the last
 // acknowledged one, and asks the repair loop to catch it up.
-func (m *MirrorStore) checkCaughtUp(p Store) error {
+func (m *MirrorStore) checkCaughtUp(p Store, pi int) error {
 	m.mu.Lock()
 	key, want, fenced := m.controlKey, append([]byte(nil), m.ackedCurrent...), m.fenced
 	m.mu.Unlock()
@@ -342,6 +358,12 @@ func (m *MirrorStore) checkCaughtUp(p Store) error {
 			m.mu.Unlock()
 			return nil
 		}
+		if err != nil && !errors.Is(err, ErrNotFound) {
+			// The elected primary is unreachable, not merely behind: let the
+			// caller fail over instead of waiting out the poll deadline.
+			m.markDown(pi)
+			return err
+		}
 		if time.Now().After(deadline) {
 			return ErrReplicaLagging
 		}
@@ -355,10 +377,14 @@ func (m *MirrorStore) checkCaughtUp(p Store) error {
 // read and the write. Precondition/missing-object results are not retried.
 func (m *MirrorStore) writePrimary(fn func(Store) error) (int, error) {
 	p, pi := m.primary()
-	if err := m.checkCaughtUp(p); err != nil {
-		return pi, err
+	cerr := m.checkCaughtUp(p, pi)
+	if errors.Is(cerr, ErrReplicaLagging) {
+		return pi, cerr
 	}
-	err := fn(p)
+	err := cerr
+	if err == nil {
+		err = fn(p)
+	}
 	if err == nil {
 		m.noteWrite(pi)
 		return pi, nil
@@ -397,6 +423,9 @@ func (m *MirrorStore) Put(ctx context.Context, key string, data []byte) error {
 	if key == m.controlName() {
 		m.noteAcked(data)
 	}
+	if q := m.writeQuorum; q > 1 {
+		return m.quorumMirror(ctx, pi, q, func(ctx context.Context, s Store) error { return s.Put(ctx, key, data) })
+	}
 	// Best-effort mirror to healthy standbys.
 	m.mirrorWrites(ctx, pi, func(ctx context.Context, s Store) error { return s.Put(ctx, key, data) })
 	return nil
@@ -406,6 +435,11 @@ func (m *MirrorStore) PutReconstructible(ctx context.Context, key string, data [
 	pi, err := m.writePrimary(func(s Store) error { return PutReconstructible(ctx, s, key, data) })
 	if err != nil {
 		return err
+	}
+	if q := m.writeQuorum; q > 1 {
+		return m.quorumMirror(ctx, pi, q, func(ctx context.Context, s Store) error {
+			return PutReconstructible(ctx, s, key, data)
+		})
 	}
 	m.mirrorWrites(ctx, pi, func(ctx context.Context, s Store) error { return PutReconstructible(ctx, s, key, data) })
 	return nil
@@ -436,14 +470,18 @@ func (m *MirrorStore) PutFromReconstructible(ctx context.Context, key string, r 
 	if err != nil {
 		return err
 	}
-	m.mirrorWrites(ctx, pi, func(ctx context.Context, s Store) error {
+	fn := func(ctx context.Context, s Store) error {
 		f, oerr := os.Open(tmpName)
 		if oerr != nil {
 			return oerr
 		}
 		defer f.Close()
 		return PutFromReconstructible(ctx, s, key, f, size)
-	})
+	}
+	if q := m.writeQuorum; q > 1 {
+		return m.quorumMirror(ctx, pi, q, fn)
+	}
+	m.mirrorWrites(ctx, pi, fn)
 	return nil
 }
 
@@ -535,19 +573,38 @@ func (m *MirrorStore) PutFrom(ctx context.Context, key string, r io.Reader, size
 	if err != nil {
 		return err
 	}
-	m.mirrorWrites(ctx, pi, func(ctx context.Context, s Store) error {
+	fn := func(ctx context.Context, s Store) error {
 		f, oerr := os.Open(tmpName)
 		if oerr != nil {
 			return oerr
 		}
 		defer f.Close()
 		return s.PutFrom(ctx, key, f, size)
-	})
+	}
+	if q := m.writeQuorum; q > 1 {
+		return m.quorumMirror(ctx, pi, q, fn)
+	}
+	m.mirrorWrites(ctx, pi, fn)
 	return nil
 }
 
 // Exists asks the primary first, then any healthy standby.
 func (m *MirrorStore) Exists(ctx context.Context, key string) (bool, error) {
+	if q := m.writeQuorum; q > 1 && !isControlKey(key) {
+		// A deduplicated object only counts as present when enough replicas
+		// hold it. Reporting false makes the caller rewrite it through the
+		// quorum path, which repairs the gap.
+		n := 0
+		for _, s := range m.mirrors {
+			c, cancel := context.WithTimeout(ctx, 3*time.Second)
+			ok, err := s.Exists(c, key)
+			cancel()
+			if err == nil && ok {
+				n++
+			}
+		}
+		return n >= q, nil
+	}
 	p, pi := m.primary()
 	ok, err := p.Exists(ctx, key)
 	if err == nil && ok {
@@ -718,6 +775,74 @@ func (m *MirrorStore) DeletePrefix(ctx context.Context, prefix string) error {
 	}
 	m.mirrorWrites(ctx, pi, func(ctx context.Context, s Store) error { return DeletePrefix(ctx, s, prefix) })
 	return nil
+}
+
+// quorumWriteTimeout bounds one standby copy in quorum mode. It is larger
+// than the best-effort budget because the copy is now required for the write
+// to be acknowledged (a 100MiB body over a LAN takes a couple of seconds).
+const quorumWriteTimeout = 15 * time.Second
+
+// quorumMirror writes fn to the healthy standbys after the primary has the
+// object, returning ErrQuorumUnmet unless at least quorum copies exist.
+func (m *MirrorStore) quorumMirror(ctx context.Context, pi, quorum int, fn func(context.Context, Store) error) error {
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	ok := 0
+	for i, s := range m.mirrors {
+		if i == pi || !m.isHealthy(i) {
+			continue
+		}
+		wg.Add(1)
+		go func(i int, s Store) {
+			defer wg.Done()
+			wctx, cancel := context.WithTimeout(ctx, quorumWriteTimeout)
+			defer cancel()
+			if err := fn(wctx, s); err != nil {
+				m.markDown(i)
+				m.noteError(i, err)
+				return
+			}
+			m.noteWrite(i)
+			mu.Lock()
+			ok++
+			mu.Unlock()
+		}(i, s)
+	}
+	wg.Wait()
+	if 1+ok < quorum {
+		return fmt.Errorf("%w: %d of %d copies (need %d)", ErrQuorumUnmet, 1+ok, len(m.mirrors), quorum)
+	}
+	return nil
+}
+
+// QuorumGet returns the value held by the largest number of mirrors and that
+// count. It is used to replay the commit journal after a crash: a record only
+// counts when a quorum holds the same bytes.
+func (m *MirrorStore) QuorumGet(ctx context.Context, key string) ([]byte, int, error) {
+	type cand struct {
+		val []byte
+		n   int
+	}
+	var best *cand
+	for _, s := range m.mirrors {
+		c, cancel := context.WithTimeout(ctx, quorumWriteTimeout)
+		b, err := s.Get(c, key, nil)
+		cancel()
+		if err != nil {
+			continue
+		}
+		if best == nil {
+			best = &cand{val: b, n: 1}
+			continue
+		}
+		if bytes.Equal(best.val, b) {
+			best.n++
+		}
+	}
+	if best == nil {
+		return nil, 0, ErrNotFound
+	}
+	return best.val, best.n, nil
 }
 
 // standbyWriteTimeout bounds how long a commit waits for one standby. It is
@@ -1037,4 +1162,137 @@ func listAll(ctx context.Context, s Store) ([]string, error) {
 		next = n
 	}
 	return keys, nil
+}
+
+// --- quorum register (commit lease) -----------------------------------------
+
+// CreateIfAbsentQuorum creates the key on a quorum. If any replica says it
+// already exists, the partial creations are rolled back and the call fails:
+// a quorum-intersecting holder must never be overridden.
+func (m *MirrorStore) CreateIfAbsentQuorum(ctx context.Context, key string, data []byte, quorum int) error {
+	n := len(m.mirrors)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i, s := range m.mirrors {
+		wg.Add(1)
+		go func(i int, s Store) {
+			defer wg.Done()
+			c, cancel := context.WithTimeout(ctx, quorumWriteTimeout)
+			defer cancel()
+			errs[i] = s.CreateIfAbsent(c, key, data)
+		}(i, s)
+	}
+	wg.Wait()
+	created, held := 0, 0
+	for i, err := range errs {
+		switch {
+		case err == nil:
+			created++
+			m.noteWrite(i)
+		case errors.Is(err, ErrPreconditionFailed):
+			held++
+		default:
+			m.markDown(i)
+			m.noteError(i, err)
+		}
+	}
+	if held > 0 || created < quorum {
+		etag := ContentETag(data)
+		for i, err := range errs {
+			if err != nil {
+				continue
+			}
+			c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = DeleteIfMatch(c, m.mirrors[i], key, etag)
+			cancel()
+		}
+		if held > 0 {
+			return ErrPreconditionFailed
+		}
+		return fmt.Errorf("%w: %d of %d created (need %d)", ErrQuorumUnmet, created, n, quorum)
+	}
+	return nil
+}
+
+// CASQuorum applies the CAS on every replica and requires quorum successes.
+// A partial success is rolled back (best effort) so the register is never
+// half-updated, which would let two holders believe they own it.
+func (m *MirrorStore) CASQuorum(ctx context.Context, key, expect string, data []byte, quorum int) error {
+	n := len(m.mirrors)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i, s := range m.mirrors {
+		wg.Add(1)
+		go func(i int, s Store) {
+			defer wg.Done()
+			c, cancel := context.WithTimeout(ctx, quorumWriteTimeout)
+			defer cancel()
+			_, errs[i] = s.CAS(c, key, expect, data)
+		}(i, s)
+	}
+	wg.Wait()
+	ok, mismatch := 0, 0
+	for i, err := range errs {
+		switch {
+		case err == nil:
+			ok++
+			m.noteWrite(i)
+		case errors.Is(err, ErrPreconditionFailed):
+			mismatch++
+		default:
+			m.markDown(i)
+			m.noteError(i, err)
+		}
+	}
+	if mismatch == 0 && ok >= quorum {
+		return nil
+	}
+	etag := ContentETag(data)
+	for i, err := range errs {
+		if err != nil {
+			continue
+		}
+		c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = DeleteIfMatch(c, m.mirrors[i], key, etag)
+		cancel()
+	}
+	if mismatch > 0 {
+		return ErrPreconditionFailed
+	}
+	return fmt.Errorf("%w: %d of %d cas (need %d)", ErrQuorumUnmet, ok, n, quorum)
+}
+
+// DeleteIfMatchQuorum deletes on every replica and requires quorum successes.
+func (m *MirrorStore) DeleteIfMatchQuorum(ctx context.Context, key, etag string, quorum int) error {
+	n := len(m.mirrors)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i, s := range m.mirrors {
+		wg.Add(1)
+		go func(i int, s Store) {
+			defer wg.Done()
+			c, cancel := context.WithTimeout(ctx, quorumWriteTimeout)
+			defer cancel()
+			errs[i] = DeleteIfMatch(c, s, key, etag)
+		}(i, s)
+	}
+	wg.Wait()
+	ok := 0
+	for i, err := range errs {
+		switch {
+		case err == nil:
+			ok++
+			m.noteWrite(i)
+		case errors.Is(err, ErrPreconditionFailed), errors.Is(err, ErrNotFound):
+			// Already gone is a successful release for that replica.
+			ok++
+		default:
+			m.markDown(i)
+			m.noteError(i, err)
+		}
+	}
+	if ok < quorum {
+		return fmt.Errorf("%w: %d of %d deleted (need %d)", ErrQuorumUnmet, ok, n, quorum)
+	}
+	return nil
 }

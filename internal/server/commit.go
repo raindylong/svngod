@@ -1451,10 +1451,12 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 			writeOutOfDate(w, "/")
 			return
 		}
-		if errors.Is(err, store.ErrReplicaLagging) {
+		if errors.Is(err, store.ErrQuorumUnmet) || errors.Is(err, store.ErrReplicaLagging) ||
+			errors.Is(err, fs.ErrCommitBusy) || errors.Is(err, fs.ErrLeaseLost) {
 			// The standby has not caught up with the last acknowledged HEAD.
-			// This is transient: a 503 tells the client to retry instead of
-			// reporting a bogus out-of-date conflict.
+			// Both are transient: a 503 tells the client to retry instead of
+			// reporting a bogus out-of-date conflict. Quorum means too few
+			// replicas hold the commit, so it was not acknowledged.
 			w.Header().Set("Retry-After", "2")
 			http.Error(w, "repository backend is catching up; retry the commit", http.StatusServiceUnavailable)
 			return
