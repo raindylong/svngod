@@ -153,7 +153,7 @@ func (o *options) mirrorStore(name string) (store.Store, string, error) {
 	if len(ms) < 2 {
 		return nil, "", fmt.Errorf("--mirror-file requires at least 2 backends (got %d)", len(ms))
 	}
-	opts := []store.MirrorOption{store.WithMutableOrder(fs.CompareMutable)}
+	opts := []store.MirrorOption{store.WithMutableOrder(fs.CompareMutable), store.WithRepoPrefix("repos/" + name)}
 	if quorum > 0 {
 		opts = append(opts, store.WithWriteQuorum(quorum))
 	}

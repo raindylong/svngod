@@ -289,7 +289,9 @@ func (r *Repo) CommitTxn(txid, newRevProps) (newRev, error):
 - **租约**：`locks/commit` 的创建/CAS/删除在 MirrorStore 上按"配置顺序串行"执行：第一个可达节点是仲裁者，任一节点报告已存在即整体失败并回滚已创建副本。顺序执行避免了"两个竞争者各赢一个节点、再互相回滚"的活锁（实测并发提交卡死）。
 - **可用性模式**（默认，不配 `quorum`）：租约要求"当前可达的全部副本"；两节点都在时两个 svngod 进程无法各持一份，单节点故障时降为一份继续提交。
 - **严格模式**（`quorum: N`）：数据、WAL、租约都要求 N 份；不足即 `ErrQuorumUnmet` → HTTP 503，HEAD 不推进。
-- **跨进程读收敛**：`HeadFresh` 以 500ms 节流回放 WAL；fenced 状态下读取所有可达副本并取最新 HEAD，绝不返回比已确认值更旧的指针。
+- **跨进程读收敛**：`HeadFresh` 以 500ms 节流回放 WAL；fenced 状态下读取所有可达副本并取最新 HEAD，绝不返回比已确认值更旧的指针；副本 HEAD ≥ 已确认 HEAD 即可采纳（否则另一个进程提交后本进程会永久 fencing）。
+- **repair 作用域**：`WithRepoPrefix("repos/<name>")` 使 repair 只列举/复制本仓库对象。共享 bucket 或本地根目录时，未加作用域的 repair 会把其他仓库（甚至测试对象）复制进来。
+- **revprop 更新**：镜像后端把 revprop 修改纳入提交租约（与提交串行），读取取多数派、写入广播到全部可达副本（`PutAll`），避免两个进程各自 CAS 不同主节点导致属性丢失或读到旧值。
 
 ---
 

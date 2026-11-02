@@ -2095,13 +2095,13 @@ func (r *Repo) loadRevPropsFresh(rev uint64) (*RevProps, error) {
 		return nil, err
 	}
 	if !packed {
-		b, err := r.store.Get(ctx, r.keys.LooseRevProps(sh, rev), nil)
+		b, err := getFreshObject(ctx, r.store, r.keys.LooseRevProps(sh, rev))
 		if err != nil {
 			return nil, err
 		}
 		return UnmarshalRevProps(b)
 	}
-	b, err := r.store.Get(ctx, r.keys.PackedRevProps(sh), nil)
+	b, err := getFreshObject(ctx, r.store, r.keys.PackedRevProps(sh))
 	if err != nil {
 		return nil, err
 	}

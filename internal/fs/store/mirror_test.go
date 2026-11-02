@@ -104,7 +104,7 @@ func TestMirrorConcurrentWrites(t *testing.T) {
 		t.Fatalf("concurrent Put: %v", err)
 	}
 	// No deadlock: all objects reach both mirrors.
-	n, _ := listAll(f.ctx, f.b)
+	n, _ := listAll(f.ctx, f.b, "")
 	if len(n) == 0 {
 		t.Fatalf("standby empty after concurrent writes")
 	}
@@ -282,4 +282,67 @@ func TestMirrorFencedHeadReturnsNewest(t *testing.T) {
 	if string(got) != "HEAD=2" {
 		t.Fatalf("fenced read=%q, want newest HEAD=2", got)
 	}
+}
+
+// TestMirrorRepairScopedToRepo: repair must never copy another repository's
+// objects into this repository's backends. Mirrors share a bucket/local root,
+// and an unscoped repair used to replicate every repo (and even test objects).
+func TestMirrorRepairScopedToRepo(t *testing.T) {
+	a := NewMemoryStore()
+	b := NewMemoryStore()
+	ctx := context.Background()
+	if err := a.Put(ctx, "repos/x/a", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Put(ctx, "repos/y/b", []byte("y")); err != nil {
+		t.Fatal(err)
+	}
+	m := NewMirror([]Store{a, b}, WithRepoPrefix("repos/x"))
+	m.RepairNow()
+	if ok, _ := b.Exists(ctx, "repos/x/a"); !ok {
+		t.Fatal("scoped repair did not copy the repository object")
+	}
+	if ok, _ := b.Exists(ctx, "repos/y/b"); ok {
+		t.Fatal("repair copied another repository's object")
+	}
+	m.Close()
+}
+
+// TestCheckCaughtUpAdoptsNewerHead: another svngod process may have committed
+// through this mirror while this process was fenced. A replica that is AHEAD
+// of the local acknowledgement must be adopted, not treated as lagging, or
+// the process would refuse writes forever (repair cannot update its memory).
+func TestCheckCaughtUpAdoptsNewerHead(t *testing.T) {
+	a := NewMemoryStore()
+	b := NewMemoryStore()
+	order := func(key string, x, y []byte) int {
+		var nx, ny int
+		fmt.Sscanf(string(x), "HEAD=%d", &nx)
+		fmt.Sscanf(string(y), "HEAD=%d", &ny)
+		switch {
+		case nx < ny:
+			return -1
+		case nx > ny:
+			return 1
+		}
+		return 0
+	}
+	m := NewMirror([]Store{a, b}, WithMutableOrder(order))
+	ctx := context.Background()
+	key := "repos/demo/current"
+	m.SetControlKey(key)
+	if err := a.Put(ctx, key, []byte("HEAD=2")); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	m.fenced = true
+	m.ackedCurrent = []byte("HEAD=1")
+	m.mu.Unlock()
+	if err := m.checkCaughtUp(a, 0); err != nil {
+		t.Fatalf("newer HEAD rejected: %v", err)
+	}
+	if got := string(m.ackedCopy()); got != "HEAD=2" {
+		t.Fatalf("acked HEAD=%q, want HEAD=2", got)
+	}
+	m.Close()
 }

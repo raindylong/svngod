@@ -62,6 +62,27 @@ func DeletePrefix(ctx context.Context, s Store, prefix string) error {
 	return nil
 }
 
+// AllWriter is implemented by stores that can write one object to every
+// healthy replica and require all of them (used for revision properties,
+// which are mutable and must not diverge between processes).
+type AllWriter interface {
+	PutAll(ctx context.Context, key string, data []byte) error
+}
+
+// PutAll writes to every healthy replica when supported, else to the store.
+func PutAll(ctx context.Context, s Store, key string, data []byte) error {
+	if aw, ok := s.(AllWriter); ok {
+		return aw.PutAll(ctx, key, data)
+	}
+	return s.Put(ctx, key, data)
+}
+
+// QuorumGetter is implemented by stores that can read the value held by the
+// largest number of replicas.
+type QuorumGetter interface {
+	QuorumGet(ctx context.Context, key string) ([]byte, int, error)
+}
+
 // QuorumRegister is implemented by stores that can run a small register's
 // operations on a majority of replicas. Commit leases use it so two svngod
 // processes electing different mirror nodes cannot both hold the lease.

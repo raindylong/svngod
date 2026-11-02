@@ -76,7 +76,7 @@ type fileStore struct {
 	Quorum int `json:"quorum"`
 }
 
-func (s *fileStore) makeStore() (store.Store, error) {
+func (s *fileStore) makeStore(prefix string) (store.Store, error) {
 	switch s.Type {
 	case "s3":
 		return store.NewS3Store(store.S3Config{
@@ -93,7 +93,7 @@ func (s *fileStore) makeStore() (store.Store, error) {
 	case "mirror":
 		var ms []store.Store
 		for i := range s.Mirrors {
-			st, err := s.Mirrors[i].makeStore()
+			st, err := s.Mirrors[i].makeStore(prefix)
 			if err != nil {
 				return nil, err
 			}
@@ -102,7 +102,7 @@ func (s *fileStore) makeStore() (store.Store, error) {
 		if len(ms) < 2 {
 			return nil, fmt.Errorf("mirror storage requires at least 2 backends (got %d)", len(ms))
 		}
-		opts := []store.MirrorOption{store.WithMutableOrder(fs.CompareMutable)}
+		opts := []store.MirrorOption{store.WithMutableOrder(fs.CompareMutable), store.WithRepoPrefix(prefix)}
 		if s.Quorum > 0 {
 			opts = append(opts, store.WithWriteQuorum(s.Quorum))
 		}
@@ -142,7 +142,7 @@ func loadConfig(path string) (*fileConfig, error) {
 }
 
 func (r *fileRepo) makeStore() (store.Store, error) {
-	return r.Storage.makeStore()
+	return r.Storage.makeStore("repos/" + r.Name)
 }
 
 func (r *fileRepo) repoPrefix(name string) string {

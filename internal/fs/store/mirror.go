@@ -60,6 +60,11 @@ type MirrorStore struct {
 	// acknowledged while too few replicas are reachable.
 	writeQuorum int
 
+	// repoPrefix scopes repair/listing to one repository. Without it, mirrors
+	// sharing a bucket or a local root would copy every other repository's
+	// objects into this repository's backends during repair.
+	repoPrefix string
+
 	// mutableOrder orders two values of a mutable key (<0: a older than b).
 	// fs sets it so a rejoining mirror cannot overwrite a newer HEAD pointer
 	// with its stale copy. Without it, values are treated as equal.
@@ -148,6 +153,13 @@ type MirrorOption func(*MirrorStore)
 // initial alignment pass runs, which is why it is an option.
 func WithMutableOrder(fn func(key string, a, b []byte) int) MirrorOption {
 	return func(m *MirrorStore) { m.mutableOrder = fn }
+}
+
+// WithRepoPrefix scopes repair and health accounting to one repository
+// prefix (e.g. "repos/demo"). Required when several repositories share the
+// same bucket or local directory.
+func WithRepoPrefix(prefix string) MirrorOption {
+	return func(m *MirrorStore) { m.repoPrefix = strings.Trim(prefix, "/") }
 }
 
 // WithWriteQuorum requires every write to reach n copies before it returns.
@@ -378,6 +390,15 @@ func (m *MirrorStore) checkCaughtUp(p Store, pi int) error {
 			m.mu.Lock()
 			m.fenced = false
 			m.mu.Unlock()
+			return nil
+		}
+		// A replica that is *ahead* of this process's last acknowledgement is
+		// safe: another svngod process committed through it. Adopt that HEAD
+		// instead of fencing forever (repair updates the replicas but cannot
+		// touch this process's in-memory ack). Only a strictly older HEAD is
+		// a real lag.
+		if err == nil && m.mutableOrder != nil && m.mutableOrder(key, got, want) > 0 {
+			m.noteAcked(got)
 			return nil
 		}
 		if err != nil && !errors.Is(err, ErrNotFound) {
@@ -852,6 +873,23 @@ func (m *MirrorStore) quorumMirror(ctx context.Context, pi, quorum int, fn func(
 	return nil
 }
 
+// PutAll writes to the primary and every healthy standby, requiring all of
+// them. Revision-property updates use it so two processes cannot leave the
+// replicas with different copies of the same mutable object.
+func (m *MirrorStore) PutAll(ctx context.Context, key string, data []byte) error {
+	n := m.LiveCount()
+	if n <= 1 {
+		return m.Put(ctx, key, data)
+	}
+	pi, err := m.writePrimary(func(s Store) error { return s.Put(ctx, key, data) })
+	if err != nil {
+		return err
+	}
+	return m.quorumMirror(ctx, pi, n, func(ctx context.Context, s Store) error {
+		return s.Put(ctx, key, data)
+	})
+}
+
 // QuorumGet returns the value held by the largest number of mirrors and that
 // count. It is used to replay the commit journal after a crash: a record only
 // counts when a quorum holds the same bytes.
@@ -1056,7 +1094,7 @@ func (m *MirrorStore) repairInternal() {
 			defer wg.Done()
 			ctx, cancel := context.WithTimeout(context.Background(), repairTimeout)
 			defer cancel()
-			ks, err := listAll(ctx, m.mirrors[i])
+			ks, err := listAll(ctx, m.mirrors[i], m.repoPrefix)
 			if err != nil {
 				log.Printf("mirror[%d] unreachable during repair: %v", i, err)
 				return
@@ -1171,6 +1209,11 @@ func (m *MirrorStore) reconcileMutable(ctx context.Context, k string, sets []map
 			reachable[i] = false
 		}
 	}
+	// The reconciled value is the newest known HEAD; adopt it so the fencing
+	// state clears even when this process did not perform the CAS itself.
+	if k == m.controlName() {
+		m.noteAcked(best)
+	}
 }
 
 // repairTimeout bounds one repair pass over all mirrors.
@@ -1182,11 +1225,15 @@ func isMutableKey(key string) bool {
 	return strings.HasSuffix(key, "/current")
 }
 
-func listAll(ctx context.Context, s Store) ([]string, error) {
+func listAll(ctx context.Context, s Store, prefix string) ([]string, error) {
 	var keys []string
 	next := ""
+	p := strings.Trim(prefix, "/")
+	if p != "" {
+		p += "/"
+	}
 	for {
-		objs, n, err := s.ListPrefix(ctx, "", next, 1000)
+		objs, n, err := s.ListPrefix(ctx, p, next, 1000)
 		if err != nil {
 			return nil, err
 		}
