@@ -1,6 +1,6 @@
 # svngod — S3 存储引擎实现细则（实现级设计）
 
-> 配套文档 | 归属：《Go-SVN服务器架构设计方案》第 5 章 | 版本 v1.1 | 2026-10-28
+> 配套文档 | 归属：《Go-SVN服务器架构设计方案》第 5 章 | 版本 v1.3 | 2026-11-02（含 WAL/法定人数与 RustFS 实测）
 >
 > 目标：把第 5 章的"分片 + 封装 + 不可变对象 + 原子指针"落地为**可直接照此编码**的实现级设计：字节级对象格式、写/读路径、增量策略、svndiff 编解码、缓存、封装任务、GC、Go 类型与伪代码。
 
@@ -32,27 +32,27 @@
 type Range struct{ Offset, Length int64 }
 
 type Store interface {
-    // 创建不可变对象（写新 key）。调用方保证 key 唯一且内容一次成型。
     Put(ctx context.Context, key string, data []byte) error
-
-    // 读取对象全部或 Range 字节。
+    PutFrom(ctx context.Context, key string, r io.Reader, size int64) error // 流式大对象
     Get(ctx context.Context, key string, rng *Range) ([]byte, error)
+    GetTo(ctx context.Context, key string, w io.Writer) (int64, error)     // 流式读取
+    Exists(ctx context.Context, key string) (bool, error)                   // 只判断存在，不读 body
     Head(ctx context.Context, key string) (etag string, exists bool, err error)
-
-    // 条件创建：仅当 key 不存在时创建成功（提交锁）。
-    // 返回 ErrPreconditionFailed 表示已存在。
     CreateIfAbsent(ctx context.Context, key string, data []byte) error
-
-    // 原子推进 current：仅当当前 ETag==expect 时覆盖为新内容（CAS）。
-    // 返回新 ETag；expect 失配返回 ErrPreconditionFailed。
     CAS(ctx context.Context, key string, expectETag string, data []byte) (newETag string, err error)
-
-    // 按前缀列举（分页 + 游标续列），供 GC。
-    ListPrefix(ctx context.Context, prefix string, continuation string, max int) (objs []ListedObj, nextContinuation string, err error)
-
-    // 批量删除（GC）。
+    ListPrefix(ctx context.Context, prefix, continuation string, max int) ([]ListedObj, string, error)
     Delete(ctx context.Context, keys []string) error
 }
+
+// 可选能力：法定人数寄存器（提交租约）。MirrorStore 实现。
+type QuorumRegister interface {
+    CreateIfAbsentQuorum(ctx context.Context, key string, data []byte, quorum int) error
+    CASQuorum(ctx context.Context, key, expect string, data []byte, quorum int) error
+    DeleteIfMatchQuorum(ctx context.Context, key, etag string, quorum int) error
+    QuorumGet(ctx context.Context, key string) (data []byte, copies int, err error)
+}
+
+// 可选能力：WAL 与副本数量。MirrorStore 实现 Journaling/WriteQuorum/LiveCount。
 ```
 
 ### 2.2 S3 适配实现要点
@@ -67,8 +67,9 @@ type Store interface {
 | ListPrefix | `ListObjectsV2` + `StartAfter` | GC 列举（minio-go 无 ContinuationToken 字段） |
 | Delete | `RemoveObjects(bucket, <-chan ObjectInfo)` | GC 批量删除 |
 
-> **CAS 实测约束（minio-go v7.0.80，已在本工程验证）**：开发/测试 S3 兼容后端已切换为 **RustFS**（`rustfs server <datadir> --address 127.0.0.1:9000 --access-key test --secret-key test12345678`，仅 path-style），S3 集成测试（store 原语 + Repo×S3 端到端）在 RustFS 上实跑全通过、代码零改动。
-> `PutObjectOptions` 无 `If-Match`/`If-None-Match` 条件写字段；`CopyObject(ctx, CopyDestOptions, CopySrcOptions)` 的 `MatchETag` 虽映射 `x-amz-copy-source-if-match`，但 **CopyObject 自拷贝只能改元数据、不能改写对象 body**，无法承载条件写语义。因此在"单进程 + 提交互斥锁"的既定约束下，`Store.CAS`/`CreateIfAbsent` 退化为 **Head 预检 + PutObject 原子写**：S3 读后写一致 + 进程内互斥，正确性成立；多写者并发时可能出现"预检通过后他人已改"的丢失更新。**真正的 S3 条件写需 AWS SDK v2 的 `If-Match`/`If-None-Match` 条件 Put，已列为升级路径**（当前架构本就单进程单实例，不构成阻塞）。
+> **CAS 实测结论（minio-go v7.0.80 + RustFS 1.0.4）**：开发/测试 S3 兼容后端使用 **RustFS**（`rustfs server <datadir> --address 127.0.0.1:9000 --access-key ... --secret-key ...`，path-style），store 原语、Repo×S3 端到端、并发 CAS 均实跑通过。
+> `PutObjectOptions.SetMatchETag` 会发送 `If-Match`，RustFS/MinIO/AWS S3 对单对象条件写是原子的：8 个并发 CAS（同一 expect ETag）实测只有 1 个成功，其余 `PreconditionFailed`（`internal/fs/store/s3store_integration_test.go: TestS3StoreCASConcurrent`）。因此 `current` 的条件推进与提交租约在单副本上成立，无需退化为"先读后写"。
+> **FileStore 说明**：本地目录后端没有服务端条件写，`CAS` 在进程内互斥之外还持有 `flock`（`.cas.lock`），保证同一目录上的多个 svngod 进程/`svnadmin` 进程不会同时通过 ETag 检查并各自 rename（曾实测丢失更新）。
 >
 > **对象键命名**：仓库放同一 bucket 下的独立前缀 `<repo>/…`；仓库根 = `format`/`uuid`/`current` 所在层级。所有键用小写、数字定长补零（如 `revs-loose/0001234/000000004096`）保证字典序与列举顺序一致。
 
@@ -190,6 +191,24 @@ uuid: 随机 UUID 文本（与 SVN 仓库语义一致，dump 头携带）。
 
 `format` 一经写入不可变；`SHARD_SIZE`/`MAX_DELTA_CHAIN` 在建仓时固化，杜绝运行期不兼容。
 
+### 3.7 提交 WAL（journal/<N>）
+
+```
+偏移  长度  内容
+0     8     "SVNGWAL1"
+8     4     JSON 长度（uint32 大端）
+12    4     CRC32C（Castagnoli，覆盖 JSON）
+16    N     JSON:
+           { "v":1, "rev":N, "parent":N-1, "lease":"<token>",
+             "created":<unix>, "revblock":"revs-loose/.../<N>",
+             "revblock_sha256":"<hex>", "props":"revprops-loose/...",
+             "author":"...", "log":"...", "quorum":2 }
+```
+
+- 解码时校验魔数、长度、CRC；任一不符即拒绝回放（视为损坏记录）。
+- 记录在 `current` CAS 之前写入；提交确认前，严格模式要求记录在 N 份副本上存在。
+- 回放规则：记录达到法定人数（可用性模式为 1）、revblock 在法定人数上存在且 SHA-256 匹配、`parent == HEAD` → 把 `current` 前滚到 N。否则视为中止意图，交 GC。
+
 ---
 
 ## 4. 对象布局与生命周期
@@ -202,8 +221,10 @@ uuid: 随机 UUID 文本（与 SVN 仓库语义一致，dump 头携带）。
   revs-loose/<shard>/<N>                    # 活跃分片松散修订对象
   revprops-loose/<shard>/<N>
   txn/<txid>/                               # 进行中事务暂存
-  locks/commit                              # 提交互斥锁对象
+  locks/commit                              # 跨进程提交租约（TTL 20s，心跳续约）
+  journal/<N>                               # 提交 WAL（CRC32C + revblock SHA-256）
   dav-activities/<uuid>                     # 活动→事务映射
+  dav-locks/locks.json                      # DAV 文件锁表（CAS）
 ```
 
 ### 4.1 分片状态机
@@ -229,21 +250,24 @@ uuid: 随机 UUID 文本（与 SVN 仓库语义一致，dump 头携带）。
 
 ```
 func (r *Repo) CommitTxn(txid, newRevProps) (newRev, error):
-  1  lock := r.commitLock()                 // 进程互斥 + CreateIfAbsent(locks/commit) 双保险
-     defer lock.Unlock()
-  2  cur := readCurrent()                   // HEAD = cur.Head
-  3  N  := cur.Head + 1
+  1  lease := acquireCommitLease(locks/commit)  // TTL 20s，心跳续约
+     defer lease.Release()
+        - 可用性模式：CreateIfAbsent 写"当前可达的全部副本"；单节点故障降为 1 份
+        - 严格模式：写固定法定人数（如 3 节点 quorum=2）
+  2  reconcileJournal()                     // 回放 WAL：把 quorum 已确认但 HEAD 未推进的提交前滚
+  3  cur := readCurrent()                   // HEAD = cur.Head（可能刚被前滚）
+  4  N  := cur.Head + 1
      shard := N / r.shardSize
-  4  block := buildRevBlock(N, txn)         // 组装 node-revs + dir 树遍历补全隐式变更
-  5  Put(revs-loose/<shard>/<N>, block)     // 1 次 PUT
-  6  Put(revprops-loose/<shard>/<N>, props) // 1 次 PUT
-  7  newETag := CAS(current, cur.ETag, "HEAD=N")   // 原子推进
-     if newETag == ErrPreconditionFailed:   // 理论不发生于单进程，防御
-        delete staged; retry from 2
-  8  Delete(txn/<txid>/...)                 // 清理暂存
-  9  if N % shardSize == shardSize-1:       // 本片已写满
-        enqueuePack(shard)                  // 触发封装任务（异步）
- 10  return N
+  5  block := buildRevBlock(N, txn)         // 组装 node-revs + dir 树遍历补全隐式变更
+  6  Put(revs-loose/<shard>/<N>, block)     // 数据对象（quorum 模式下按 quorum 写）
+  7  Put(revprops-loose/<shard>/<N>, props)
+  8  Put(journal/<N>, WALRecord(...))       // CRC32C；严格模式要求 quorum 份
+  9  lease.Verify()                          // 防止租约在做完 5-8 后已失效
+ 10  newETag := CAS(current, cur.ETag, "HEAD=N")   // 唯一发布点
+     if ErrPreconditionFailed:  delete staged; retry from 3
+ 11  Delete(txn/<txid>/...)                 // 清理暂存
+ 12  if N % shardSize == shardSize-1: enqueuePack(shard)
+ 13  return N
 ```
 
 > **为什么先写数据后 CAS**：第 5/6 步写对象仅"存在"，第 7 步 CAS 成功才"可见"。崩溃于 5/6 后、7 前 → `current` 仍为 N-1，孤立的 `revs-loose/<shard>/<N>` 交 GC；仓库一致性无损。
@@ -253,10 +277,19 @@ func (r *Repo) CommitTxn(txid, newRevProps) (newRev, error):
 | 崩溃点 | 结果 | 恢复 |
 |---|---|---|
 | 事务暂存中 | `txn/<txid>` 残留 | GC 按 TTL 清理 |
-| 写 loose 对象后、CAS 前 | 孤儿 loose 对象 | GC 清理 |
+| 写 loose 对象后、WAL 前 | 孤儿 loose 对象 | GC 清理；HEAD 不变 |
+| WAL 写入后、CAS 前 | 记录可能存在（可达法定人数） | 打开仓库/下次提交回放：revblock 哈希匹配且 parent==HEAD → **前滚**；否则视为中止意图交 GC |
+| WAL 只写到少数副本 | 不构成已确认提交 | 回放要求法定人数（严格）或最新副本（可用性），其余交 GC |
 | CAS 后、清 txn 前 | 修订已提交，txn 残留 | GC 清理 txn |
 | 封装中（写 pack/idx 后、写 .done 前） | 孤儿 pack | 读路径仍用 loose；GC 清理无 .done 的 pack |
 | 封装写 .done 后 | 已切换 | 读走 pack；loose 交 GC |
+
+### 5.4 多进程与法定人数
+
+- **租约**：`locks/commit` 的创建/CAS/删除在 MirrorStore 上按"配置顺序串行"执行：第一个可达节点是仲裁者，任一节点报告已存在即整体失败并回滚已创建副本。顺序执行避免了"两个竞争者各赢一个节点、再互相回滚"的活锁（实测并发提交卡死）。
+- **可用性模式**（默认，不配 `quorum`）：租约要求"当前可达的全部副本"；两节点都在时两个 svngod 进程无法各持一份，单节点故障时降为一份继续提交。
+- **严格模式**（`quorum: N`）：数据、WAL、租约都要求 N 份；不足即 `ErrQuorumUnmet` → HTTP 503，HEAD 不推进。
+- **跨进程读收敛**：`HeadFresh` 以 500ms 节流回放 WAL；fenced 状态下读取所有可达副本并取最新 HEAD，绝不返回比已确认值更旧的指针。
 
 ---
 
@@ -422,7 +455,7 @@ func enqueuePack(shard):
 
 ## 11. 垃圾回收（GC）
 
-**可达根**：`current`、`format`、`uuid`、全部 `revs/<s>.pack/.idx/.done`、`revprops/<s>.pack`、当前活跃分片的 `revs-loose/<s>/*`、`locks/*`、存活 `dav-activities/*`。
+**可达根**：`current`、`format`、`uuid`、全部 `revs/<s>.pack/.idx/.done`、`revprops/<s>.pack`、当前活跃分片的 `revs-loose/<s>/*`、`locks/*`、存活 `dav-activities/*`、保留窗口内的 `journal/*`。
 
 **清扫目标**：
 1. `txn/<txid>` 超过 TTL（默认 7 天）。
@@ -448,6 +481,7 @@ cleanup stale txn/*, orphan dav-activities/*
 - 写路径：node-rev 的 `record_crc`、文本 `MD5` 落盘即校验。
 - 读路径：解析后校验 `record_crc`；重构文本后比对 `text_md5`。
 - `svngod-admin verify <repo>`：遍历全部分片/松散块 → 逐 node-rev 校验 → 校验 `current` 与 shard idx 一致性 → 校验 delta 链闭合。
+- `svnadmin journal -n N <repo>`：解析 WAL 尾部（魔数/长度/CRC32C），输出 rev、parent、quorum、revblock SHA-256 与 log；损坏记录直接拒绝。
 
 ---
 
@@ -455,8 +489,10 @@ cleanup stale txn/*, orphan dav-activities/*
 
 ```
 internal/fs/store/
-  store.go        // Store 接口
-  s3store.go      // S3 适配（minio-go）
+  store.go        // Store / QuorumRegister 接口、ErrQuorumUnmet
+  filestore.go    // 本地目录后端（CAS 跨进程 flock）
+  s3store.go      // S3 适配（minio-go，If-Match 条件写）
+  mirror.go       // 主备镜像：quorum 写、租约寄存器、健康/修复/故障切换
   keys.go         // 对象键构造/解析
   format.go       // format/uuid/current 读写
   idx.go          // shard idx 编解码
@@ -466,7 +502,9 @@ internal/fs/store/
   pack.go         // 分片封装任务
   gc.go           // 垃圾回收
 internal/fs/
-  repo.go         // Repo：CommitTxn / GetNodeRev / GetText / GetDir
+  repo.go         // Repo：CommitTxn / GetNodeRev / GetText / GetDir / HeadFresh 对账
+  journal.go      // 提交 WAL：帧编码、CRC32C、回放/前滚、JournalTail
+  lease.go        // 跨进程提交租约：TTL/心跳、法定人数/可用性两种模式
   txn.go          // 事务暂存
   tree.go         // 目录树遍历/隐式变更补全
 internal/svndiff/
@@ -496,12 +534,14 @@ type NodeRev struct {
 type Child struct{ Name string; ID NodeID }
 
 type Repo struct {
-    store     Store
-    prefix    string               // 仓库前缀
-    shardSize uint64
-    maxDelta  int
-    cache     *cache.LRU
-    commitMu  sync.Mutex
+    store       Store
+    prefix      string             // 仓库前缀
+    shardSize   uint64
+    maxDelta    int
+    writeQuorum int                // >1 严格模式；0/1 可用性模式
+    journal     bool               // mirror 后端启用提交 WAL
+    cache       *cache.LRU
+    mu          sync.Mutex         // 进程内提交串行化
 }
 
 func (r *Repo) CommitTxn(tx *Txn, revProps map[string]string) (uint64, error)
@@ -517,13 +557,15 @@ func (r *Repo) Verify(ctx context.Context) error
 
 | 项 | 风险/注意 | 对策 |
 |---|---|---|
-| CAS 跨提供商 | 条件写能力因 SDK/服务而异 | 单进程下 Head+Put 单写者方案已满足；多写者条件写走 AWS SDK v2 升级路径，RustFS/MinIO 集成测试均通过 |
+| CAS 跨提供商 | 条件写能力因 SDK/服务而异 | `PutObjectOptions.SetMatchETag`（If-Match）在 RustFS/MinIO 实测原子（8 并发仅 1 胜）；FileStore 用 flock 保证跨进程 |
 | svndiff 解码安全 | 恶意/损坏 delta 越界、非法 action | 严格边界与耗尽校验（对齐 `count_and_verify`），拒绝即报错不崩溃；无窗口尾 CRC |
 | 提交时全量化成本 | 大文件每 64 次改一次全文，写放大 | MAX_DELTA_CHAIN 可配；与文本体积权衡 |
 | 封装/GC 并发 | 与读路径无冲突（历史只读）；与提交在活跃分片边界 | `.done` 权威切换 + 只回收确定不可达 |
 | 1000 万修订列举 | ListObjects 慢 | 前缀分片 + 游标续列，分片粒度批量 |
 | 缓存抖动 | 热点切换导致 S3 打满 | 分预算 + 命中率告警 + 磁盘缓存兜底 |
 | 大目录块 | 单个 rev_block 很大（万级子项） | 分片 idx 用 Range 读整块；子项表分页可选优化 |
+| 多进程/分区 | 两节点分区时可用性与一致性不可兼得 | 默认可用性 + WAL 对账；强一致用 3 节点 `quorum:2`；租约多数派相交 |
+| WAL 记录增长 | 每提交一个小对象 | 保留窗口清理；`svnadmin journal` 审计；单条记录 KB 级 |
 
 ---
 

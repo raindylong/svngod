@@ -55,18 +55,25 @@ a{color:var(--accent)}
 @media print{body{background:#fff}.hero{padding:36px 20px}
 section{box-shadow:none;break-inside:avoid;page-break-inside:avoid}
 .metric{box-shadow:none}thead{display:table-header-group}}
+
+
+
+blockquote{margin:18px 0;padding:16px 18px;border-radius:12px;
+background:linear-gradient(90deg,#e6f6fa,#f2fbfd);border-left:5px solid var(--accent);
+font-size:15.5px;font-weight:600;color:#0b4a5e}
+blockquote p{margin:0}
 </style></head><body>
 <header class="hero"><div class="wrap">
 <h1>svngod</h1>
 <p class="sub">面向大规模、强一致场景的 SVN 兼容版本服务器</p>
-<p class="tag">一次提交 3 万个文件，1GiB 二进制流式处理，多副本崩溃原子性 —— 原生 svn 客户端零改造接入。</p>
-<p class="date">2026 年 10 月 · 对比 Apache mod_dav_svn</p>
+<p class="tag">一次提交 3 万个文件，1GiB 二进制流式处理，WAL + 法定人数保证多副本崩溃原子性 —— 原生 svn 客户端零改造接入。</p>
+<p class="date">2026 年 11 月 · 对比 Apache mod_dav_svn</p>
 </div></header><main>
 <div class="metrics">
 <div class="metric"><b>1.2s</b><span>30,000 个文件一次原子提交</span></div>
 <div class="metric"><b>约 100 MiB/s</b><span>1GiB 上传（CDC 分块）</span></div>
-<div class="metric"><b>20 MiB</b><span>1GiB 分块上传内存峰值</span></div>
-<div class="metric"><b>62,741</b><span>标准 dump 与原生 SVN 逐项一致</span></div>
+<div class="metric"><b>1 个节点</b><span>3 节点法定人数下仍可提交</span></div>
+<div class="metric"><b>CRC32C WAL</b><span>每次提交可审计、可前滚</span></div>
 </div>
 <section>
 <h2>原生 SVN 的三道坎</h2>
@@ -76,127 +83,361 @@ section{box-shadow:none;break-inside:avoid;page-break-inside:avoid}
 <li><strong>大文件依赖“小心调优”</strong>：单文件数 GiB 时，缓冲区、超时、临时空间与内存峰值相互牵制，稍有不慎就是 OOM 或半途失败。</li>
 <li><strong>单机语义</strong>：FSFS 天然单机；要做多副本、跨站点容灾，通常得叠加共享存储、DRBD 或自研同步，一致性边界模糊。</li>
 </ul>
-<div class="callout">svngod 保留 SVN 的协议、客户端与心智模型，重写的是提交通道、存储引擎与一致性层。</div>
-</section><section>
-<h2>六项可量化的优势</h2>
+<blockquote>
+<p><strong>重点｜</strong> svngod 保留 SVN 的协议、客户端与心智模型，重写的是提交通道、存储引擎与一致性层。</p>
+</blockquote>
+
+</section>
+<section>
+<h2>七项可量化的优势</h2>
 <ul>
 <li><strong>一次请求，一个原子修订</strong>：svngocli 的 bundle 通道把整棵目录树打包成一个请求；30,000 个文件一次提交约 1.2 秒，服务端只产生一个修订，失败则整笔不落库。重复发布先协商 stat，只传变化文件；确实变化的大文件按块清单只补传新块（8MiB 文件改 1MiB，请求体约 2MiB）。</li>
 <li><strong>大文件分块去重，内存有界</strong>：大文件按内容定义切块（平均 1MiB，可按仓库配置），1GiB 上传约 10 秒（约 100 MiB/s），读取 648 MiB/s，峰值内存约 20 MiB；随机改写 10MiB 只新增约 12MiB。</li>
 <li><strong>HTTPv2 默认开启</strong>：与现代 svn 客户端自动协商，一次提交从“活动/检出的多轮往返”缩减为 create-txn + PUT + MERGE；<code>SVNGOD_HTTPV2=0</code> 可回退 v1。</li>
-<li><strong>崩溃原子性</strong>：提交租约串行化多副本收尾，token 幂等重试；上传中杀掉服务进程或提交中杀掉客户端，都不会留下半个修订。</li>
-<li><strong>多副本与主备镜像</strong>：本地盘或 S3 后端；S3 主备双写、故障切换与自愈修复，主库宕机仍可提交，恢复后数秒到数十秒收敛。</li>
+<li><strong>WAL + 法定人数（2026-11）</strong>：每次提交先把带 CRC32C 的记录写到 <code>journal/&lt;N&gt;</code>，再推进 HEAD；崩溃后可判定“是否已发布”，并在启动/下次提交时把已达成法定人数的记录<strong>前滚</strong>。严格模式 <code>quorum: 2</code>（3 节点）下，写不够多数派就返回 503，绝不单副本确认。</li>
+<li><strong>崩溃原子性</strong>：跨进程提交租约 + WAL 对账，token 幂等重试；上传中杀掉服务进程或提交中杀掉客户端，都不会留下半个修订；陈旧节点恢复后不会复活旧 HEAD 或重复修订号。</li>
+<li><strong>多副本与主备镜像</strong>：本地盘或 S3 后端；默认主备可用性模式（单节点故障不停写），可选法定人数严格模式（RPO=0）；主备双写、故障切换与秒级自愈修复。</li>
 <li><strong>标准互操作</strong>：dump 为 SVN dump v2 格式，原生 <code>svnadmin load</code> 可直接加载并 verify；authz、hooks、TLS 与原生 svn 客户端全部沿用。</li>
 </ul>
-</section><section>
+
+</section>
+<section>
 <h2>实测数据：批量提交</h2>
-<div class="table-wrap"><table><thead><tr>
+<table>
+<thead>
+<tr>
 <th>场景</th>
 <th>原生 svn 客户端 → svngod</th>
 <th>svngocli bundle</th>
 <th>结果</th>
-</tr></thead><tbody>
-<tr><td>1,000 个文件（约 4MB）</td><td>1.38s</td><td>0.06s（约 22×）</td><td>各 1 个修订，内容校验一致</td></tr>
-<tr><td>30,000 个文件（300 目录）</td><td>35s</td><td>1.2s</td><td>30,300 项齐全，verify 干净</td></tr>
-</tbody></table></div>
-<div class="note">原生 Apache 的提交同样是逐文件 PUT；文件数上万时往返次数线性增长，现场常见 600 秒网关超时。svngod 的原生客户端路径 35 秒完成，bundle 路径把往返压到 1 次。</div>
-</section><section>
+</tr>
+</thead>
+<tbody><tr>
+<td>1,000 个文件（约 4MB）</td>
+<td>1.38s</td>
+<td>0.06s（约 22×）</td>
+<td>各 1 个修订，内容校验一致</td>
+</tr>
+<tr>
+<td>30,000 个文件（300 目录）</td>
+<td>35s</td>
+<td>1.2s</td>
+<td>30,300 项齐全，verify 干净</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>原生 Apache 的提交同样是逐文件 PUT；文件数上万时往返次数线性增长，现场常见 600 秒网关超时。svngod 的原生客户端路径 35 秒完成，bundle 路径把往返压到 1 次。</p>
+</blockquote>
+
+</section>
+<section>
 <h2>实测数据：大文件（1GiB / 2GiB 随机二进制）</h2>
-<div class="table-wrap"><table><thead><tr>
+<table>
+<thead>
+<tr>
 <th>指标</th>
 <th>svngod</th>
 <th>Apache mod_dav_svn</th>
-</tr></thead><tbody>
-<tr><td>1GiB 提交（bundle，分块）</td><td>约 10s / 约 100 MiB/s</td><td>—</td></tr>
-<tr><td>1GiB 提交（原生 svn，分块）</td><td>16.6s / 62 MiB/s</td><td>7.6s / 134 MiB/s</td></tr>
-<tr><td>服务端内存峰值</td><td>约 20 MiB</td><td>未测</td></tr>
-<tr><td>1GiB 读取（分块流式）</td><td>648 MiB/s</td><td>—</td></tr>
-<tr><td>1GiB 文件占盘</td><td>1.1GB</td><td>3.1GB</td></tr>
-</tbody></table></div>
-<div class="note">单次端到端测量，含客户端读盘与哈希；所有文件以 sha256 回读校验，仓库 verify 无完整性问题。</div>
-</section><section>
+</tr>
+</thead>
+<tbody><tr>
+<td>1GiB 提交（bundle，分块）</td>
+<td>约 10s / 约 100 MiB/s</td>
+<td>—</td>
+</tr>
+<tr>
+<td>1GiB 提交（原生 svn，分块）</td>
+<td>16.6s / 62 MiB/s</td>
+<td>7.6s / 134 MiB/s</td>
+</tr>
+<tr>
+<td>服务端内存峰值</td>
+<td>约 20 MiB</td>
+<td>未测</td>
+</tr>
+<tr>
+<td>1GiB 读取（分块流式）</td>
+<td>648 MiB/s</td>
+<td>—</td>
+</tr>
+<tr>
+<td>1GiB 文件占盘</td>
+<td>1.1GB</td>
+<td>3.1GB</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>单次端到端测量，含客户端读盘与哈希；所有文件以 sha256 回读校验，仓库 verify 无完整性问题。</p>
+</blockquote>
+
+</section>
+<section>
 <h2>实测数据：1GiB 文件随机改写 10MiB</h2>
-<div class="table-wrap"><table><thead><tr>
+<table>
+<thead>
+<tr>
 <th>指标</th>
 <th>svngod（CDC 分块）</th>
 <th>Apache mod_dav_svn</th>
-</tr></thead><tbody>
-<tr><td>提交耗时</td><td>17.1s</td><td>10.9s</td></tr>
-<tr><td>仓库增长</td><td>+11.8MiB</td><td>+10.2MiB</td></tr>
-<tr><td>服务端内存峰值</td><td>约 69 MiB</td><td>未测</td></tr>
-</tbody></table></div>
-<div class="note">单文件随机改写上，原生 FSFS 的精确 delta 仍然更快、更省；CDC 的价值在跨文件/跨修订去重、按需范围读取与无链式重建。两者都远优于默认按全量副本存储二进制的方案。</div>
-</section><section>
-<h2>实测数据：故障注入与一致性</h2>
-<div class="table-wrap"><table><thead><tr>
+</tr>
+</thead>
+<tbody><tr>
+<td>提交耗时</td>
+<td>17.1s</td>
+<td>10.9s</td>
+</tr>
+<tr>
+<td>仓库增长</td>
+<td>+11.8MiB</td>
+<td>+10.2MiB</td>
+</tr>
+<tr>
+<td>服务端内存峰值</td>
+<td>约 69 MiB</td>
+<td>未测</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>单文件随机改写上，原生 FSFS 的精确 delta 仍然更快、更省；CDC 的价值在跨文件/跨修订去重、按需范围读取与无链式重建。两者都远优于默认按全量副本存储二进制的方案。</p>
+</blockquote>
+
+</section>
+<section>
+<h2>实测数据：WAL、法定人数与多进程（RustFS 1.0.4）</h2>
+<table>
+<thead>
+<tr>
 <th>场景</th>
 <th>结果</th>
-</tr></thead><tbody>
-<tr><td>30,000 文件上传中 kill -9 服务副本</td><td>无修订发布；verify 干净；重启后重传成功</td></tr>
-<tr><td>提交 200MB 文件中 kill -9 客户端</td><td>无修订发布；cleanup 后提交成功</td></tr>
-<tr><td>跨副本事务（A 建、A/B 写、B 提交）</td><td>成功，双文件一致</td></tr>
-<tr><td>S3 主库 5% 错误注入</td><td>上传成功，verify 干净</td></tr>
-<tr><td>S3 主库宕机、恢复</td><td>上传成功；10 秒完成镜像收敛</td></tr>
-<tr><td>S3 备库宕机、恢复</td><td>上传成功；17 秒完成镜像收敛</td></tr>
-<tr><td>双副本并发 20 次提交</td><td>全部成功，无 CAS 冲突</td></tr>
-<tr><td>3 轮混合压测</td><td>成功提交数与修订数精确对账，全部 verify 干净</td></tr>
-</tbody></table></div>
-</section><section>
+</tr>
+</thead>
+<tbody><tr>
+<td>RustFS 条件写原子性（8 并发 CAS）</td>
+<td>仅 1 个成功，其余 PreconditionFailed</td>
+</tr>
+<tr>
+<td>3 节点 <code>quorum:2</code>，1 个节点宕机</td>
+<td>提交成功（首次切换约 11s，标记降级后 1s）</td>
+</tr>
+<tr>
+<td>3 节点 <code>quorum:2</code>，2 个节点宕机</td>
+<td>1s 内返回 503，HEAD 不变</td>
+</tr>
+<tr>
+<td>节点恢复后重试</td>
+<td>1s 内提交成功，WAL 对账，无重复修订</td>
+</tr>
+<tr>
+<td>两个 svngod 进程 6 并发提交</td>
+<td>6/6 成功，HEAD 精确 +6，6 个唯一修订</td>
+</tr>
+<tr>
+<td>陈旧节点（落后 2 个修订）重新加入</td>
+<td>下次提交先对账再提交，三节点最终一致</td>
+</tr>
+<tr>
+<td>2 节点主备，备节点宕机</td>
+<td>提交 1s，head +1</td>
+</tr>
+<tr>
+<td>2 节点主备，主节点宕机</td>
+<td>1s 切备提交成功</td>
+</tr>
+<tr>
+<td>主节点在上传 100MiB 增量时被杀</td>
+<td>6s 切备成功，整文件 sha256 一致</td>
+</tr>
+<tr>
+<td>两个存储节点同时宕机</td>
+<td>干净失败（HEAD 不变），恢复后重试成功</td>
+</tr>
+<tr>
+<td>三节点独立 verify</td>
+<td>同一修订，均无完整性问题</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>默认主备模式保可用性：任一节点故障仍可提交；最后一次提交可能只在一份副本（客户端会收到失败并可重试）。RPO=0 用 3 节点 + <code>quorum:2</code>。</p>
+</blockquote>
+
+</section>
+<section>
+<h2>实测数据：故障注入与一致性</h2>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>30,000 文件上传中 kill -9 服务副本</td>
+<td>无修订发布；verify 干净；重启后重传成功</td>
+</tr>
+<tr>
+<td>提交 200MB 文件中 kill -9 客户端</td>
+<td>无修订发布；cleanup 后提交成功</td>
+</tr>
+<tr>
+<td>跨副本事务（A 建、A/B 写、B 提交）</td>
+<td>成功，双文件一致</td>
+</tr>
+<tr>
+<td>S3 主库 5% 错误注入</td>
+<td>上传成功，verify 干净</td>
+</tr>
+<tr>
+<td>S3 主库宕机、恢复</td>
+<td>上传成功；10 秒完成镜像收敛</td>
+</tr>
+<tr>
+<td>S3 备库宕机、恢复</td>
+<td>上传成功；17 秒完成镜像收敛</td>
+</tr>
+<tr>
+<td>双副本并发 20 次提交</td>
+<td>全部成功，无 CAS 冲突</td>
+</tr>
+<tr>
+<td>3 轮混合压测</td>
+<td>成功提交数与修订数精确对账，全部 verify 干净</td>
+</tr>
+</tbody></table>
+
+</section>
+<section>
 <h2>实测数据：标准格式互操作</h2>
-<div class="table-wrap"><table><thead><tr>
+<table>
+<thead>
+<tr>
 <th>项目</th>
 <th>结果</th>
-</tr></thead><tbody>
-<tr><td>svngod dump → 原生 svnadmin load</td><td>146MB / 82 修订；62,741 项完全一致；原生 verify 通过</td></tr>
-<tr><td>S3 镜像 dump → 原生 svnadmin load</td><td>19,653 项完全一致</td></tr>
-<tr><td>HTTPv2 协商</td><td>svn 1.14 自动启用；可回退 v1</td></tr>
-<tr><td>原生客户端功能</td><td>checkout / add / commit / update / log / diff / lock 无需改造</td></tr>
-</tbody></table></div>
-</section><section>
+</tr>
+</thead>
+<tbody><tr>
+<td>svngod dump → 原生 svnadmin load</td>
+<td>146MB / 82 修订；62,741 项完全一致；原生 verify 通过</td>
+</tr>
+<tr>
+<td>S3 镜像 dump → 原生 svnadmin load</td>
+<td>19,653 项完全一致</td>
+</tr>
+<tr>
+<td>HTTPv2 协商</td>
+<td>svn 1.14 自动启用；可回退 v1</td>
+</tr>
+<tr>
+<td>原生客户端功能</td>
+<td>checkout / add / commit / update / log / diff / lock 无需改造</td>
+</tr>
+</tbody></table>
+
+</section>
+<section>
 <h2>定位对比</h2>
-<div class="table-wrap"><table><thead><tr>
+<table>
+<thead>
+<tr>
 <th>维度</th>
 <th>Apache mod_dav_svn</th>
 <th>svngod</th>
-</tr></thead><tbody>
-<tr><td>提交模型</td><td>每文件一次 HTTP 往返 + 活动/事务协商</td><td>目录树一次请求（bundle）或 HTTPv2 事务</td></tr>
-<tr><td>万级文件提交</td><td>往返线性增长，易触发网关超时</td><td>30,000 文件 1.2 秒</td></tr>
-<tr><td>大文件</td><td>可行，依赖部署调优</td><td>1–2GiB 流式，内存 15–26 MiB</td></tr>
-<tr><td>二进制增量</td><td>支持，单文件小编辑更快</td><td>支持，链深有界、自动压平</td></tr>
-<tr><td>多副本一致性</td><td>依赖共享存储或外部同步</td><td>提交租约 + 会话按需恢复 + 幂等 token</td></tr>
-<tr><td>存储后端</td><td>本地 FSFS</td><td>本地盘 / S3；主备镜像自愈</td></tr>
-<tr><td>互操作</td><td>SVN 生态标准</td><td>原生客户端 + 标准 dump</td></tr>
-<tr><td>运维形态</td><td>Apache + 模块 + 调优</td><td>单 Go 二进制 + Prometheus 指标</td></tr>
-</tbody></table></div>
-</section><section>
+</tr>
+</thead>
+<tbody><tr>
+<td>提交模型</td>
+<td>每文件一次 HTTP 往返 + 活动/事务协商</td>
+<td>目录树一次请求（bundle）或 HTTPv2 事务</td>
+</tr>
+<tr>
+<td>万级文件提交</td>
+<td>往返线性增长，易触发网关超时</td>
+<td>30,000 文件 1.2 秒</td>
+</tr>
+<tr>
+<td>大文件</td>
+<td>可行，依赖部署调优</td>
+<td>1–2GiB 流式，内存 15–26 MiB</td>
+</tr>
+<tr>
+<td>二进制增量</td>
+<td>支持，单文件小编辑更快</td>
+<td>支持，链深有界、自动压平</td>
+</tr>
+<tr>
+<td>多副本一致性</td>
+<td>依赖共享存储或外部同步</td>
+<td>WAL + 法定人数 + 跨进程租约；可选 RPO=0</td>
+</tr>
+<tr>
+<td>多进程/多活</td>
+<td>需外部协调</td>
+<td>两个 svngod 进程可共享镜像，并发提交唯一修订号</td>
+</tr>
+<tr>
+<td>存储后端</td>
+<td>本地 FSFS</td>
+<td>本地盘 / S3（RustFS/MinIO/AWS）；主备自愈</td>
+</tr>
+<tr>
+<td>互操作</td>
+<td>SVN 生态标准</td>
+<td>原生客户端 + 标准 dump</td>
+</tr>
+<tr>
+<td>运维形态</td>
+<td>Apache + 模块 + 调优</td>
+<td>单 Go 二进制 + Prometheus 指标</td>
+</tr>
+</tbody></table>
+
+</section>
+<section>
 <h2>零改造迁移</h2>
 <p>保留现有 svn 客户端、authz 文件、钩子与工作流；服务端替换为 svngod 即可。</p>
-<pre><code>svngod --addr :8080 --repo-root /var/lib/svngod \
+<pre><code class="language-bash">svngod --addr :8080 --repo-root /var/lib/svngod \
   --passwd /etc/svngod/passwd --authz /etc/svngod/authz
 
 # 现有的 svn 客户端照常工作
 svn co http://host:8080/svn/repo/trunk
 
 # 需要批量发布时，用增强客户端一次提交整棵树
-svngocli upload ./assets https://host/svn/repo/assets -m &quot;release&quot;</code></pre>
+svngocli upload ./assets https://host/svn/repo/assets -m &quot;release&quot;
+</code></pre>
 <p>存量仓库可通过标准 dump/load 迁移；svngod 的 dump 也能被原生 <code>svnadmin</code> 加载，迁移与回退都不锁定。</p>
-<div class="note">可选：svngod 直接对接 S3（RustFS / MinIO / AWS S3），用主备镜像替代共享存储。</div>
-</section><section>
+<blockquote>
+<p>可选：svngod 直接对接 S3（RustFS / MinIO / AWS S3），用主备镜像替代共享存储。</p>
+</blockquote>
+
+</section>
+<section>
 <h2>适用场景</h2>
 <ul>
 <li><strong>游戏与数字资产</strong>：大量中小文件、频繁整包发布、需要一次原子修订。</li>
 <li><strong>固件与二进制制品</strong>：单文件数 GiB，要求流式与内存可控。</li>
 <li><strong>monorepo / CI 高频提交</strong>：万级文件提交不超时，失败可幂等重试。</li>
-<li><strong>多站点与容灾</strong>：S3 主备、跨副本提交、崩溃后无半修订。</li>
+<li><strong>多站点与容灾</strong>：S3 主备、跨副本提交、崩溃后无半修订；RPO=0 可用 3 节点法定人数。</li>
 <li><strong>既想保留 SVN 生态，又需要现代化存储与一致性。</strong></li>
 </ul>
-</section><section>
+
+</section>
+<section>
 <h2>结语</h2>
 <p>svngod 不是另起炉灶的版本控制系统，而是把 SVN 的提交通道与存储引擎换成适配 2026 年的实现：协议不变、客户端不变、运维更轻，批量、大文件、一致性与容灾都有可复现的数据。</p>
 <p>仓库：<code>https://github.com/raindylong/svngod</code></p>
-<div class="callout">30,000 个文件 1.2 秒，1GiB 4.8 秒，内存 17MiB —— 这是 SVN 协议下可以做到的事。</div>
-</section><section>
+<blockquote>
+<p><strong>重点｜</strong> 30,000 个文件 1.2 秒，1GiB 约 10 秒，内存 17MiB；WAL + 法定人数让“快”和“不丢”同时成立。</p>
+</blockquote>
+
+</section>
+<section>
 <h2>测试环境与口径</h2>
-<div class="note">Linux x86_64，本地 overlay 盘；svn 1.14.1；Apache 2.4.52 + mod_dav_svn；svngod master（2026-11，含 P0/P1）。大文件为 /dev/urandom 随机二进制。所有数据以 sha256 回读、仓库 verify 双重校验。吞吐受硬件、网络与并发影响，生产容量请以自有环境压测为准。对比对象为 Apache mod_dav_svn；svngod 同时兼容标准 SVN dump 与原生客户端。</div>
-</section></main>
-<footer class="footer">svngod · SVN-compatible version server · 2026</footer>
+<blockquote>
+<p>Linux x86_64，本地 overlay 盘；svn 1.14.1；Apache 2.4.52 + mod_dav_svn；RustFS 1.0.4（单机双节点/三节点实例）；svngod master（2026-11，含 P0/P1 与 WAL/法定人数）。大文件为 /dev/urandom 随机二进制。所有数据以 sha256 回读、仓库 verify 双重校验。吞吐受硬件、网络与并发影响，生产容量请以自有环境压测为准。对比对象为 Apache mod_dav_svn；svngod 同时兼容标准 SVN dump 与原生客户端。</p>
+</blockquote>
+
+</section>
+</main>
+<footer class="footer">
+<p>仓库：<a href="https://github.com/raindylong/svngod">https://github.com/raindylong/svngod</a>　|　Apache mod_dav_svn 对比口径，所有数据均可复现。</p>
+</footer>
 </body></html>

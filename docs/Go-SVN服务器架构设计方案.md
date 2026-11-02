@@ -1,6 +1,6 @@
 # Go 版 SVN 服务器（svngod）架构设计方案
 
-> 版本：v1.1　|　日期：2026-10-28　|　状态：待评审（已并入 owner 规模决策）
+> 版本：v1.3　|　日期：2026-11-02　|　状态：已评审（含 WAL/法定人数落地与 RustFS 混测）
 >
 > 目标：用 Go 从零重写一个 SVN 服务器，**对 `svn` 客户端原生支持 HTTP/HTTPS 协议（WebDAV/DeltaV）**，**认证支持 LDAP 与本地密码表双通道**，**版本数据全部存储于标准 S3 兼容对象存储**（MinIO / AWS S3 / 阿里 OSS / 腾讯 COS 等），并支持存量仓库经 `svnadmin dump/load` 格式迁移。
 
@@ -40,14 +40,14 @@
 | G6 | 单二进制交付，容器化友好，TLS 原生支持 |
 | G7 | **单仓支撑 1000 万修订**量级（已确认规模目标），存储引擎按"分片 + 封装"设计，对象数可控 |
 
-**已确认规模目标（owner 拍板）**：单仓库修订数上限 **1000 万**；部署形态 **单进程单实例**；LDAP 采用 **OpenLDAP**，authz 组定义在**本地 authz 文件**（不从 LDAP 动态解析）；验收客户端 **全覆盖**（svn CLI + TortoiseSVN + IDE 插件）。
+**已确认规模目标（owner 拍板）**：单仓库修订数上限 **1000 万**；部署形态 **默认单进程（可多库）；多进程共享 mirror 已支持**；LDAP 采用 **OpenLDAP**，authz 组定义在**本地 authz 文件**（不从 LDAP 动态解析）；验收客户端 **全覆盖**（svn CLI + TortoiseSVN + IDE 插件）。
 
 ### 1.3 非目标（Non-Goals）
 
 - 不实现 `svnserve`（svn://）协议（仅做 HTTP/HTTPS）。
 - 不直接读取/兼容现有 FSFS 仓库文件（迁移走 dump/load，见第 6 节）。
 - 不追求与 Apache 的 `mod_*` 配置语法兼容（提供自有 YAML 配置）。
-- **不做多实例多活**（单进程单实例部署；`current` CAS 机制保留为未来横向扩展的预留能力，但首期不启用多实例）。
+- **不做跨地域多活/自动选主**：默认单进程部署；多进程共享同一 mirror 已支持（跨进程租约 + WAL 对账），但 2 节点网络分区下优先可用性，强一致部署使用 3 节点 + `quorum:2`。
 
 ### 1.4 关键设计原则
 
@@ -208,8 +208,11 @@ auth:
   revs-loose/<shard>/<N>         # 活跃分片内的松散修订对象（未封装，当前正在写入）
   revprops-loose/<shard>/<N>     # 活跃分片内的松散修订属性
   txn/<txid>/…                   # 进行中事务（活动）的暂存区
-  locks/<path-hash>              # 文件锁对象
+  locks/<path-hash>              # 文件锁对象（DAV 锁表在 dav-locks/locks.json）
   dav-activities/<uuid>          # 活动(DeltaV activity)→事务的映射
+  journal/<N>                    # 提交 WAL：magic+len+CRC32C+JSON，含父修订与 revblock SHA-256
+  locks/commit                   # 跨进程提交租约（法定人数模式下写多数派）
+  .cas.lock                      # 仅 FileStore：跨进程 CAS 的 flock 文件（不是对象）
 ```
 
 - **shard = N / SHARD_SIZE**；`SHARD_SIZE` 可配置，1000 万规模建议 **4096**（约 2442 个分片；可调大如 10000 进一步降对象数，换取单 pack 体积增大）。
@@ -219,8 +222,9 @@ auth:
 
 1. **暂存**：客户端变更写入 `txn/<txid>/` 下的 node-rev 对象（不可变，随写随固）。
 2. **固化**（MERGE 触发）：
-   - 加提交锁（见 5.6）→ 串行化。
+   - 取得提交租约（见 5.6）→ 串行化。
    - 把事务中所有 node-rev 序列化为**松散修订对象** `revs-loose/<shard>/<N>`（一个 PUT）+ 写 `revprops-loose/<shard>/<N>`（一个 PUT）。
+   - **写提交 WAL**：把 `journal/<N>`（父修订、租约 token、revblock 的 SHA-256、revprops 摘要）写到主节点；`quorum >= 2` 时必须写到法定人数，否则提交直接失败（HTTP 503），不推进 HEAD。
    - **原子推进** `current`：条件 PUT（`If-Match: <current 当前 ETag>`），把 `HEAD=N-1` 换成 `HEAD=N`。
    - 成功 → 清理事务与活动；失败 → 回滚暂存，孤儿对象交给 GC（见 5.7）。
 3. **封装（后台）**：当前分片写满 SHARD_SIZE 时，后台任务把该分片全部松散修订合并为 `revs/<shard>.pack` + `revs/<shard>.idx` + `revprops/<shard>.pack`，随后该分片的松散对象转为不可达，由 GC 回收。封装期间读写不受影响（读路径按 5.3 逻辑自动命中松散或封装对象）。
@@ -252,12 +256,13 @@ auth:
 ### 5.6 缓存与提交串行化
 
 - **缓存层**（`internal/cache`）：内存 LRU（默认 1 GiB，可配）+ 可选本地磁盘缓存（默认关闭，按部署可开，如 `/var/cache/svngod`），缓存键为 `(repo, rev, node-rev-id)`、`(repo, shard)` 分片 idx、`(repo, path, rev)` 重构全文。并发安全。
-- **提交锁**：单进程部署下以**进程内互斥**为主 + `current` 条件 PUT（CAS）为硬保证（双保险）。`current` CAS 本身即线性化点，为未来多实例预留（首期不启用）。
+- **提交租约**：`locks/commit` 是带 TTL（20s）的租约对象，持有者每 TTL/3 续约；进程内 `r.mu` 只负责本进程串行化。多进程部署下租约写入**当前可达的全部副本**（严格模式写固定法定人数），任意两个多数派必然相交，因此两个 svngod 进程即使各自选举了不同的 mirror 主节点，也不能同时提交。崩溃后最多 TTL 过期即可接管。
+- **`current` CAS** 仍是修订号发布的线性化点；WAL 在其之前落地，负责崩溃后的对账与前滚。
 - 缓存命中率是 1000 万规模下性能的**第一指标**，P4 阶段按该指标压测调优。
 
 ### 5.7 垃圾回收（GC）
 
-- 孤儿对象来源：崩溃残留的 `txn/`、未推进的孤立松散修订、被封装后转为不可达的 `revs-loose/*`、被 deltification 重写的旧链。
+- 孤儿对象来源：崩溃残留的 `txn/`、未推进的孤立松散修订、被封装后转为不可达的 `revs-loose/*`、被 deltification 重写的旧链、超过保留窗口的 `journal/*`（WAL 记录很小，默认保留最近一段）。
 - GC 策略：后台扫描 + 引用标记（以 `current` 与各 `revs/<shard>.idx` 为根），标记-清扫不可达对象。低优先、可断点续跑，不做在线热点路径。
 - 1000 万规模下，GC 的**对象清单列举**（ListObjects）可能较慢，采用前缀分片 + 游标续列，以分片为单位批量处理。
 - 兼容弱一致 S3：GC 只删"确定不可达"对象，删除/覆盖一致性问题不影响正确性（根数据均不可变）。
@@ -271,6 +276,35 @@ auth:
 | 无部分更新/无追加写 | 用"松散修订对象 + 满片封装 + 原子 current 指针"替代 FSFS 追加写 |
 | 单次请求开销高 | 本地缓存 + Range 读 + 分片索引，降低 S3 往返 |
 | 千万级对象管理成本 | 分片封装把对象数从千万级降到万级 |
+
+### 5.9 提交 WAL 与写法定人数（2026-11 落地）
+
+吸收 etcd 的 WAL + quorum 思路，解决"多 svngod 进程 + 多 S3 副本"下的两个问题：崩溃窗口不可判定、不同进程各自选主导致 HEAD 分叉。
+
+**WAL 记录**（`internal/fs/journal.go`）：
+
+```
+偏移  内容
+0     "SVNGWAL1"（8 字节魔数）
+8     JSON 长度（uint32 大端）
+12    CRC32C（Castagnoli，覆盖 JSON）
+16    JSON：{v, rev, parent, lease, created, revblock, revblock_sha256, props, author, log, quorum}
+```
+
+- 记录在 `current` CAS **之前**写入；CRC 损坏、长度不符、魔数错误的记录一律拒绝回放。
+- 打开仓库、以及每次提交取得租约后，回放 `head+1 .. head+8`：若记录达到法定人数、revblock 在法定人数上存在且 SHA-256 匹配、`parent == HEAD`，则把 `current` **前滚**到该修订（覆盖"WAL 已写、CAS 未执行"的崩溃窗口）。
+- 可用性模式下把"法定人数"降为 1 份（读取所有可达副本取最新），既保留主备可用性，又避免陈旧节点复活旧 HEAD 造成重复修订号。
+
+**两种持久化策略**：
+
+| 模式 | 配置 | 提交确认条件 | 单节点故障 | RPO |
+|---|---|---|---|---|
+| 主备可用性（默认） | 不配 `quorum` | 主节点 + WAL | 仍可提交 | 最后一次提交可能只在一份（客户端失败可重试） |
+| 法定人数严格 | `"quorum": 2`（3 节点） | 数据与 WAL 达到 N 份 | 1/3 故障仍可提交 | 0 |
+
+> 2 节点配 `quorum: 2` 没有容错（任一节点故障返回 503）；2 节点在不配 `quorum` 时可保持可用性，但网络分区下无法同时保证可用与不分叉（共识理论限制），生产强一致建议 3 节点。
+
+`svnadmin journal -n 20 <repo>` 可查看 WAL 尾部，用于审计与故障定位。
 
 ---
 
@@ -312,11 +346,13 @@ svngod-admin gc   <repo>                          # 触发垃圾回收
 - **提交原子性**：`current` CAS 保证单次提交要么完全可见、要么完全不可见。
 - **修订线性化**：修订号严格递增，与 SVN 语义一致（一个修订 = 一次原子提交）。
 - **读一致性**：单请求读取基于固定 `current` 快照，避免读到半提交状态。
+- **多进程收敛**：quorum 模式下 `HeadFresh` 以 500ms 节流回放 WAL 尾部；陈旧副本（或进程内 fenced 状态）会读取所有可达副本并取**最新** HEAD，绝不返回比已确认值更旧的指针。
+- **发布可判定**：WAL + `revblock` 哈希使"提交是否已发布"在崩溃后可判定；未达法定人数的记录视为中止意图，其对象由 GC 回收，对客户端不可见。
 
 ### 7.2 并发
 
-- **单进程单实例**（已确认）：进程内互斥 + `current` CAS 双保险；读路径无锁（只读缓存 + 不可变对象）。
-- 多实例为**预留能力**：`current` CAS 本身即线性化点，但首期不启用、不承诺多活。
+- **单进程**：进程内 `r.mu` 串行化提交；读路径无锁（只读缓存 + 不可变对象）。
+- **多进程（已落地）**：跨进程提交租约 + `current` CAS + WAL 对账。租约在可用性模式下写"当前可达的全部副本"、在严格模式下写固定法定人数；实测两个 svngod 进程各选不同 mirror 主节点时，并发提交仍得到唯一修订号，陈旧节点恢复后由 WAL 前滚而不是重复提交。
 - **路径级 CAS / 交错提交**（已落地）：HTTP 层对每个仓库维护 **per-repo 单例 `Repo`**（共享 `r.mu`），提交经 `r.mu` 串行化后仍以**路径级 out-of-date 检查**判定：
   - **不同路径并发提交 → 全部成功**，成为连续修订（对齐标准 SVN 的交错提交）。
   - **同路径并发 → 1 胜 + N-1×`E160024`**（拒绝陈旧事务，不静默覆盖）。
@@ -329,7 +365,7 @@ svngod-admin gc   <repo>                          # 触发垃圾回收
 - **Label 请求头（回归修复 `6ac9d67`）**：svn 客户端 commit 时 PROPFIND `!svn/vcc/default` 携带 `Label: <WC基线修订号>`（数值修订，非命名标签）。早期「Label→400」误杀所有"修改已有文件"的 commit（E175002）。已修为**数值 Label → 解析为修订并覆盖 resolve 的 rev**（非数值仍 400）。注意：这是 svn HTTP 层一个易踩的坑——`Label` 头常被当作"版本标签名"，但客户端实际拿它传基线修订号。
 - **优化建议评估结论（②⑥）**：
   - ② update-report 逐路径 entry base：**低优先、不实施**——日常 update 已正常（E155017 修复后），逐路径 base 只影响混合修订 WC 边界；为极小边界场景增加复杂度过高。
-  - ⑥ CommitTxn 先 CAS 抢占 N / 失败重试：**不建议做**——单进程 `r.mu` 已串行提交 + 路径级 OOD 已达成并发目标（不同路径交错全成功、同路径 1 胜）；⑥ 面向多实例，单进程无增益，多实例跨进程锁属另一架构（本设计首期不启用多活）。
+  - ⑥ CommitTxn 先 CAS 抢占 N / 失败重试：**不建议做**——单进程 `r.mu` 已串行提交 + 路径级 OOD 已达成并发目标（不同路径交错全成功、同路径 1 胜）；⑥ 面向多实例；当前已用“租约 + WAL”实现多进程串行化，先 CAS 抢占修订号既无必要，也会让失败重试路径更复杂。
 
 ### 7.3 性能要点
 
@@ -447,7 +483,7 @@ repos:
     { "name": "demo",  "storage": { "type": "file", "root": "/srv/svn/repos" },
       "authz": "/etc/svngod/authz-demo",
       "auth": [ { "type": "local", "passwd": "/etc/svngod/passwd-demo" } ] },
-    { "name": "demo2", "storage": { "type": "s3", "endpoint": "http://rustfs:8333",
+    { "name": "demo2", "storage": { "type": "s3", "endpoint": "rustfs:8333",
          "bucket": "svn", "access-key": "k", "secret-key": "s", "prefix": "repos" },
       "authz": "/etc/svngod/authz-demo2",
       "auth": [ { "type": "ldap", "url": "ldap://ldap2:389",
@@ -472,9 +508,10 @@ repos:
 { "addr": "127.0.0.1:19994", "base-path": "/svn",
   "repos": [
     { "name": "demo",
-      "storage": { "type": "mirror", "mirrors": [
-          { "type": "s3", "endpoint": "http://rustfs-p:9000", "bucket": "svn", "prefix": "repos" },   // 主
-          { "type": "s3", "endpoint": "http://rustfs-s:9000", "bucket": "svn", "prefix": "repos" }    // 备
+      "storage": { "type": "mirror", "quorum": 2, "mirrors": [
+          { "type": "s3", "endpoint": "rustfs-p:9000", "bucket": "svn" },   // 主
+          { "type": "s3", "endpoint": "rustfs-s:9000", "bucket": "svn" },   // 备
+          { "type": "s3", "endpoint": "rustfs-t:9000", "bucket": "svn" }    // 第三副本（quorum=2 时容忍 1 节点故障）
       ] },
       "authz": "/etc/svngod/authz-demo",
       "auth": [ { "type": "local", "passwd": "/etc/svngod/passwd-demo" } ] }
@@ -488,6 +525,8 @@ repos:
 - **故障降级**：主 = 第一个健康副本；主故障自动选备，单 S3 挂不中断服务。
 - **恢复自动补齐**：后台 repair 周期（及启动时一次）枚举主全量对象 → 备缺失的复制；**可变 `current`（HEAD 指针）无条件镜像主值**（主权威）→ 补齐后重新在线。
 - **一致性**：不可变数据 `Head` 存在性检查即够（存在即正确）；唯一可变对象 `current` 由 CAS 写主并镜像备，故任何健康副本都能在故障切换后提供最新 HEAD。
+- **WAL 与法定人数（2026-11）**：每次提交写 `journal/<N>`；严格模式要求 `quorum` 份副本，可用性模式写主 + 尽力备。启动/提交前回放 WAL 前滚崩溃窗口；提交租约在可用性模式下要求"所有可达副本"（两节点都在时仍互斥），单节点故障自动降为一份，保持主备可用性。
+- **演进**：`NewMirror` 增加 quorum 选项、精确的"缺失对象计数"健康判定、快速恢复循环（节点恢复后秒级补齐）、有界备用写超时（8s）与故障主节点快速切换（ECONNREFUSED 不重试）。RustFS 1.0.4 上完成 3 节点混测：1 节点故障仍提交、2 节点故障 1s 内 503、恢复后无重复修订、三节点 verify 一致。
 
 E2E 验证（FileStore 模拟主/备 S3）：双写期 a/b 全量一致；备只读时 commit 成功（服务不中断）、备落后缺最新修订 + current 旧值；备恢复 + 重启触发 repair 后 loose 补齐、current 对齐、a/b 全量一致；恢复后继续提交双写立即一致。单测覆盖双写、备丢失读 failover、主故障备选举、并发安全。
 
@@ -504,6 +543,8 @@ E2E 验证（FileStore 模拟主/备 S3）：双写期 a/b 全量一致；备只
 | DeltaV 协议实现复杂，`svn` 客户端对响应严格 | 高 | 增量实现、以真实 svn CLI + TortoiseSVN 集成测试为门槛 |
 | svndiff 二进制格式 bug 导致数据损坏 | 高 | checksum 校验 + dump 往返 + 单元测试矩阵 |
 | S3 延迟拖累读性能 | 中 | 缓存 + Range 读 + 分片索引 |
+| 2 节点网络分区下的可用性/一致性取舍 | 中 | 默认可用性模式 + WAL 对账兜底崩溃场景；强一致用 3 节点 `quorum:2` |
+| WAL 记录增长 | 低 | 每条提交一个小对象，按保留窗口清理；`svnadmin journal` 可审计 |
 | 1000 万修订：对象数 / 历史重操作成本 | 高 | 分片封装降对象数 + deltification 限链长 + log/blame 分页 |
 | LDAP 认证模式多样性 | 中 | 两种模式 + 可配置过滤，测试覆盖 |
 | authz 规则兼容性 | 中 | 覆盖官方 authz 文档示例用例 |
@@ -517,6 +558,7 @@ E2E 验证（FileStore 模拟主/备 S3）：双写期 a/b 全量一致；备只
 | **P2 写协议** | MKACTIVITY / CHECKOUT / PUT / DELETE / COPY / MOVE / CHECKIN / MERGE、提交 | `svn commit` / `svn add/delete/mkdir/cp/mv` 通过 |
 | **P3 全功能** | 锁定、blame、mergeinfo、properties、authz 集成 | TortoiseSVN + IDE 插件全流程可用（验收覆盖所有客户端） |
 | **P4 硬化上线** | 缓存调优、可观测性、TLS、GC、性能压测、迁移工具打磨 | 生产就绪 |
+| **P5 一致性加固（已完成 2026-11）** | WAL 提交记录 + CRC、法定人数写、跨进程租约、崩溃前滚、RustFS 3 节点混测 | `go test -race` 全绿；三节点 verify 一致；1/3 故障可提交 |
 
 > 建议 P0 先行并可与协议层并行：后端存储引擎是自包含、可 headless 测试的模块，风险集中消解后再攻协议层。
 
@@ -528,11 +570,12 @@ E2E 验证（FileStore 模拟主/备 S3）：双写期 a/b 全量一致；备只
 
 | # | 决策 | 对方案的影响 |
 |---|---|---|
-| 1 | **单进程单实例（支持多库/多后端）** | 提交锁以进程内互斥 + `current` CAS 双保险；多库在同一进程内按库隔离存储/authz/认证（`--config`），多实例可各自连不同 S3（见 9.4） |
+| 1 | **单进程可多库/多后端；多进程已支持（2026-11）** | 进程内 `r.mu` + 跨进程租约 + `current` CAS + WAL 对账；多库在同一进程内按库隔离存储/authz/认证（`--config`），多实例可共享同一 mirror（见 9.5） |
 | 2 | **缓存规模取默认** | 内存 LRU 默认 1 GiB、磁盘缓存默认关闭，可按压测调 |
 | 3 | **OpenLDAP + authz 组在本地文件** | LDAP 仅做认证（search+bind / direct bind）；authz 组不从 LDAP 动态解析，只读本地 authz 文件 |
 | 4 | **单仓修订数 1000 万** | 存储引擎改"分片 + 封装"模型（见 5.0/5.1），对象数从千万级降到万级 |
 | 5 | **验收覆盖所有客户端** | svn CLI + TortoiseSVN + IDE 插件全纳入集成测试门槛 |
+| 6 | **默认主备可用性，严格模式可选** | mirror 默认不配 `quorum`：单节点故障不停写，WAL 对账保护崩溃场景；RPO=0 用 3 节点 + `quorum:2` |
 
 ### 11.2 待定（不阻塞设计，实施时按压测定）
 
