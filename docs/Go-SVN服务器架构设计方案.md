@@ -491,6 +491,11 @@ repos:
   ] }
 ```
 
+访问 URL（`addr=127.0.0.1:19993`，`base-path=/svn`）：
+
+- `http://127.0.0.1:19993/svn/demo`
+- `http://127.0.0.1:19993/svn/demo2`
+
 要点：
 
 - **每库独立存储后端**：`file`（本地目录）或 `s3`（独立 endpoint / bucket / 前缀，即独立 S3 兼容后端；多个 svngod 实例可各自连不同的 S3）。仓库对象前缀为 `repos/<name>`（S3 模式可经 `storage.prefix` 改基准）。
@@ -505,18 +510,27 @@ repos:
 与多库"一份数据多副本"同构但不拆数据：一个仓库的一份逻辑数据镜像到**主 S3 + 备 S3**（≥2 副本），每副本内是完整分片布局，互为冗余、可互相接管。目标是负载均衡 + 单后端故障不中断 + 故障恢复自动补齐。
 
 ```json
+```json
 { "addr": "127.0.0.1:19994", "base-path": "/svn",
   "repos": [
     { "name": "demo",
-      "storage": { "type": "mirror", "quorum": 2, "mirrors": [
-          { "type": "s3", "endpoint": "rustfs-p:9000", "bucket": "svn" },   // 主
-          { "type": "s3", "endpoint": "rustfs-s:9000", "bucket": "svn" },   // 备
-          { "type": "s3", "endpoint": "rustfs-t:9000", "bucket": "svn" }    // 第三副本（quorum=2 时容忍 1 节点故障）
+      "storage": { "type": "mirror", "prefix": "repos", "quorum": 2, "mirrors": [
+          { "type": "s3", "endpoint": "rustfs-p:9000", "bucket": "svn" },
+          { "type": "s3", "endpoint": "rustfs-s:9000", "bucket": "svn" },
+          { "type": "s3", "endpoint": "rustfs-t:9000", "bucket": "svn" }
       ] },
       "authz": "/etc/svngod/authz-demo",
       "auth": [ { "type": "local", "passwd": "/etc/svngod/passwd-demo" } ] }
   ] }
 ```
+
+前三项依次为主、备、第三副本；`quorum=2` 时容忍 1 节点故障。
+
+访问 URL（`addr=127.0.0.1:19994`，`base-path=/svn`）：
+
+- `http://127.0.0.1:19994/svn/demo`
+- trunk：`http://127.0.0.1:19994/svn/demo/trunk`
+- 若由 LB 提供：`https://svn.example.com/svn/demo`
 
 实现（`internal/fs/store/mirror.go`，commit `c27bf09`）——`MirrorStore` 是 store 层组合器，fs/协议层零改动：
 

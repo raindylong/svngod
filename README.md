@@ -25,6 +25,9 @@ svnadmin create /srv/svn/demo
 svngod --addr 127.0.0.1:8080 --base-path /svn --repo-root /srv/svn \
   --passwd /etc/svngod/passwd --authz /etc/svngod/authz &
 
+# 访问 URL（base-path=/svn + 仓库名 demo）
+svn co http://127.0.0.1:8080/svn/demo
+
 # 多库 / 多后端 / 主备镜像（JSON 配置）
 svngod --config svngod.json
 ```
@@ -57,6 +60,8 @@ quorum 模式示例（3 节点，任意 1 个节点故障仍可提交；2 个故
 ```json
 { "addr": "0.0.0.0:8081", "base-path": "/svn", "repos": [ /* 与 8080 实例完全相同 */ ] }
 ```
+
+实例直连：`http://10.0.0.21:8080/svn/assets`、`http://10.0.0.22:8080/svn/assets`；经 LB：`https://svn.example.com/svn/assets`。URL 只由 `base-path` + `repos[].name` 决定，存储类型/前缀/镜像拓扑不影响 URL。
 
 本地盘 + S3 镜像要求所有实例访问**同一个本地路径**（同机多端口或共享挂载）；跨主机容灾请用 S3 单后端或 S3 主备。
 
