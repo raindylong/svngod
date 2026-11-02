@@ -142,11 +142,14 @@ func loadConfig(path string) (*fileConfig, error) {
 }
 
 func (r *fileRepo) makeStore() (store.Store, error) {
-	return r.Storage.makeStore("repos/" + r.Name)
+	// Use the same prefix OpenRepo will use (storage.prefix + name); a mirror
+	// whose repair prefix did not match the data prefix silently "repaired"
+	// nothing while marking replicas healthy.
+	return r.Storage.makeStore(r.repoPrefix(r.Name))
 }
 
 func (r *fileRepo) repoPrefix(name string) string {
-	if r.Storage.Type == "s3" && r.Storage.Prefix != "" {
+	if (r.Storage.Type == "s3" || r.Storage.Type == "mirror") && r.Storage.Prefix != "" {
 		return r.Storage.Prefix + "/" + name
 	}
 	return "repos/" + name

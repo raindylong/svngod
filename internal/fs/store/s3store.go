@@ -194,7 +194,7 @@ func (s *S3Store) Get(ctx context.Context, key string, rng *Range) ([]byte, erro
 	})
 	if err != nil {
 		if isNotFound(err) {
-			return nil, ErrNotFound
+			return nil, fmt.Errorf("%w: %s", ErrNotFound, s.key(key))
 		}
 		return nil, err
 	}

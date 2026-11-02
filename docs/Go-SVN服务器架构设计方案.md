@@ -475,7 +475,7 @@ repos:
 
 ### 9.4 多仓库与多后端（多库架构，已落地）
 
-除单仓库模式（命令行 flag）外，svngod 支持以 JSON 配置文件启动**单进程多库**，每库在存储、授权与认证上完全独立（`--config svngod.json`）：
+除单仓库模式（命令行 flag）外，svngod 支持以 JSON 配置文件启动**单进程多库**，每库在存储、授权与认证上完全独立（`--config svngod.json`）。完整字段、建仓命令与多实例/LB 示例见 [`配置与多实例部署.md`](配置与多实例部署.md)。
 
 ```json
 { "addr": "127.0.0.1:19993", "base-path": "/svn",
@@ -532,6 +532,8 @@ repos:
 E2E 验证（FileStore 模拟主/备 S3）：双写期 a/b 全量一致；备只读时 commit 成功（服务不中断）、备落后缺最新修订 + current 旧值；备恢复 + 重启触发 repair 后 loose 补齐、current 对齐、a/b 全量一致；恢复后继续提交双写立即一致。单测覆盖双写、备丢失读 failover、主故障备选举、并发安全。
 
 > 单后端能力保留：`storage.type=file` / `s3`（单副本）与命令行 flag 模式不变，mirror 仅作为可选的冗余部署形态。
+>
+> 多实例：复制同一份 JSON 仅改 `addr`，实例共享 `storage`；跨进程租约 + WAL 保证唯一修订号，LB 无需粘滞。`storage.prefix` 会同时传给 MirrorStore 的 repair 作用域，配置与 `svnadmin create` 的前缀必须一致（详见部署文档）。
 
 ---
 

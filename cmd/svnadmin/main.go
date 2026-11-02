@@ -114,17 +114,22 @@ func (o *options) mirrorStore(name string) (store.Store, string, error) {
 	}
 	var entries []mirrorEntry
 	var quorum int
+	repoPrefix := "repos"
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
 		// Object form: {"mirrors":[...],"quorum":2}
 		var obj struct {
 			Mirrors []mirrorEntry `json:"mirrors"`
 			Quorum  int           `json:"quorum"`
+			Prefix  string        `json:"prefix"`
 		}
 		if err := json.Unmarshal(trimmed, &obj); err != nil {
 			return nil, "", fmt.Errorf("parse --mirror-file: %v", err)
 		}
 		entries, quorum = obj.Mirrors, obj.Quorum
+		if obj.Prefix != "" {
+			repoPrefix = obj.Prefix
+		}
 	} else if err := json.Unmarshal(data, &entries); err != nil {
 		return nil, "", fmt.Errorf("parse --mirror-file: %v", err)
 	}
@@ -154,11 +159,12 @@ func (o *options) mirrorStore(name string) (store.Store, string, error) {
 	if len(ms) < 2 {
 		return nil, "", fmt.Errorf("--mirror-file requires at least 2 backends (got %d)", len(ms))
 	}
-	opts := []store.MirrorOption{store.WithMutableOrder(fs.CompareMutable), store.WithRepoPrefix("repos/" + name)}
+	prefix := strings.Trim(repoPrefix, "/") + "/" + name
+	opts := []store.MirrorOption{store.WithMutableOrder(fs.CompareMutable), store.WithRepoPrefix(prefix)}
 	if quorum > 0 {
 		opts = append(opts, store.WithWriteQuorum(quorum))
 	}
-	return store.NewMirror(ms, opts...), "repos/" + name, nil
+	return store.NewMirror(ms, opts...), prefix, nil
 }
 
 func main() {

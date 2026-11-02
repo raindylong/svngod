@@ -1173,6 +1173,14 @@ func (m *MirrorStore) repairInternal() {
 	for i := range m.mirrors {
 		m.setHealthy(i, reachable[i] && !failed[i] && missing[i] <= 0)
 	}
+	if os.Getenv("SVNGOD_DEBUG_REPAIR") == "1" {
+		counts := make([]int, n)
+		for i := range sets {
+			counts[i] = len(sets[i])
+		}
+		log.Printf("repair: reachable=%v sets=%v keys=%d missing=%v failed=%v healthy=%v",
+			reachable, counts, len(keys), missing, failed, m.healthSnapshot())
+	}
 }
 
 // reconcileMutable picks the newest value of a mutable key and writes it to
@@ -1214,6 +1222,15 @@ func (m *MirrorStore) reconcileMutable(ctx context.Context, k string, sets []map
 	if k == m.controlName() {
 		m.noteAcked(best)
 	}
+}
+
+// healthSnapshot copies the health flags for diagnostics.
+func (m *MirrorStore) healthSnapshot() []bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]bool, len(m.healthy))
+	copy(out, m.healthy)
+	return out
 }
 
 // repairTimeout bounds one repair pass over all mirrors.
