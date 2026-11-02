@@ -346,3 +346,115 @@ func TestCheckCaughtUpAdoptsNewerHead(t *testing.T) {
 	}
 	m.Close()
 }
+
+func testHeadOrder(_ string, x, y []byte) int {
+	var nx, ny int
+	fmt.Sscanf(string(x), "HEAD=%d", &nx)
+	fmt.Sscanf(string(y), "HEAD=%d", &ny)
+	switch {
+	case nx < ny:
+		return -1
+	case nx > ny:
+		return 1
+	}
+	return 0
+}
+
+// TestNoteAckedMonotonic: the acknowledged HEAD is a high-water mark. A repair
+// that can only see a lagging replica must never lower it, otherwise fencing
+// clears and the lagging node can commit at an old revision number.
+func TestNoteAckedMonotonic(t *testing.T) {
+	m := NewMirror([]Store{NewMemoryStore(), NewMemoryStore()}, WithMutableOrder(testHeadOrder))
+	defer m.Close()
+	m.mu.Lock()
+	m.controlKey = "repos/demo/current"
+	m.ackedCurrent = []byte("HEAD=2")
+	m.mu.Unlock()
+	m.noteAcked([]byte("HEAD=1"))
+	if got := string(m.ackedCopy()); got != "HEAD=2" {
+		t.Fatalf("ack lowered to %q", got)
+	}
+	m.noteAcked([]byte("HEAD=3"))
+	if got := string(m.ackedCopy()); got != "HEAD=3" {
+		t.Fatalf("ack did not advance: %q", got)
+	}
+}
+
+// TestCheckCaughtUpUnknownHead: fenced with no known HEAD must refuse writes.
+func TestCheckCaughtUpUnknownHead(t *testing.T) {
+	a := NewMemoryStore()
+	m := NewMirror([]Store{a, NewMemoryStore()}, WithMutableOrder(testHeadOrder))
+	defer m.Close()
+	m.mu.Lock()
+	m.controlKey = "repos/demo/current"
+	m.fenced = true
+	m.ackedCurrent = nil
+	m.mu.Unlock()
+	if err := m.checkCaughtUp(a, 0); !errors.Is(err, ErrReplicaLagging) {
+		t.Fatalf("unknown HEAD accepted: %v", err)
+	}
+}
+
+// TestSetControlKeyRequiresMajority: a cold start that can reach only one of
+// two replicas cannot establish the acknowledged HEAD and must fence.
+func TestSetControlKeyRequiresMajority(t *testing.T) {
+	ctx := context.Background()
+	a := NewMemoryStore()
+	b := NewMemoryStore()
+	key := "repos/demo/current"
+	if err := a.Put(ctx, key, []byte("HEAD=2")); err != nil {
+		t.Fatal(err)
+	}
+	m := NewMirror([]Store{a, b}, WithMutableOrder(testHeadOrder))
+	defer m.Close()
+	// NewMirror's initial repair may have copied the pointer; remove it from
+	// the standby to model "only the lagging replica is reachable".
+	if err := b.Delete(ctx, []string{key}); err != nil {
+		t.Fatal(err)
+	}
+	m.SetControlKey(key)
+	m.mu.Lock()
+	fenced, ack := m.fenced, len(m.ackedCurrent)
+	m.mu.Unlock()
+	if !fenced || ack != 0 {
+		t.Fatalf("adopted a partial view: fenced=%v ack=%d", fenced, ack)
+	}
+	// With both replicas agreeing the baseline is adopted.
+	if err := b.Put(ctx, key, []byte("HEAD=2")); err != nil {
+		t.Fatal(err)
+	}
+	m.SetControlKey(key)
+	m.mu.Lock()
+	fenced, ack = m.fenced, len(m.ackedCurrent)
+	m.mu.Unlock()
+	if fenced || ack == 0 {
+		t.Fatalf("majority view not adopted: fenced=%v ack=%d", fenced, ack)
+	}
+}
+
+// TestRepairDoesNotLowerAck: reconcileMutable with only an older replica
+// reachable must leave both the pointer and the acknowledgement untouched.
+func TestRepairDoesNotLowerAck(t *testing.T) {
+	ctx := context.Background()
+	a := NewMemoryStore()
+	b := NewMemoryStore()
+	key := "repos/demo/current"
+	if err := a.Put(ctx, key, []byte("HEAD=1")); err != nil {
+		t.Fatal(err)
+	}
+	m := NewMirror([]Store{a, b}, WithMutableOrder(testHeadOrder))
+	defer m.Close()
+	m.mu.Lock()
+	m.controlKey = key
+	m.ackedCurrent = []byte("HEAD=2")
+	m.fenced = true
+	m.mu.Unlock()
+	m.RepairNow()
+	if got := string(m.ackedCopy()); got != "HEAD=2" {
+		t.Fatalf("repair lowered ack to %q", got)
+	}
+	got, err := a.Get(ctx, key, nil)
+	if err != nil || string(got) != "HEAD=1" {
+		t.Fatalf("repair rewrote the pointer: %q err=%v", got, err)
+	}
+}

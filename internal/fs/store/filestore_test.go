@@ -221,7 +221,7 @@ func TestCASAcrossInstances(t *testing.T) {
 		wg.Add(1)
 		go func(st *FileStore, i int) {
 			defer wg.Done()
-			if _, err := st.CAS(ctx, key, etag, []byte(fmt.Sprintf("v%d", i))); err == nil {
+			if _, err := st.CAS(ctx, key, etag, []byte(fmt.Sprintf("w%d", i))); err == nil {
 				atomic.AddInt32(&ok, 1)
 			}
 		}(st, i)

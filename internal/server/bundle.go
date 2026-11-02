@@ -442,6 +442,11 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 			writeBundleError(w, http.StatusConflict, "out-of-date", ood.Path+" is out of date")
 			return
 		}
+		if errors.Is(cerr, store.ErrReplicaLagging) || errors.Is(cerr, store.ErrQuorumUnmet) ||
+			errors.Is(cerr, fs.ErrCommitBusy) || errors.Is(cerr, fs.ErrLeaseLost) {
+			writeBundleError(w, http.StatusServiceUnavailable, "unavailable", cerr.Error())
+			return
+		}
 		writeBundleError(w, http.StatusConflict, "commit-failed", cerr.Error())
 		return
 	}

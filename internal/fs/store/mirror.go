@@ -329,33 +329,52 @@ func (m *MirrorStore) SetControlKey(key string) {
 	if key == "" {
 		return
 	}
-	// Adopt the HEAD only when every reachable mirror agrees. NewMirror's
-	// initial repair has already reconciled them (using mutableOrder), so a
-	// disagreement here means the state is genuinely uncertain and must not
-	// be used as an RPO baseline.
+	// Adopt the HEAD only when a majority of replicas agree. A cold start
+	// while too few mirrors are reachable cannot know the true acknowledged
+	// HEAD; adopting the survivor's stale pointer would allow a commit at an
+	// old revision number and overwrite a different revision's objects
+	// (observed at 800k objects). Fence until a majority agrees.
 	var agreed []byte
+	reachable := 0
+	mismatch := false
 	for _, s := range m.mirrors {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		b, err := s.Get(ctx, key, nil)
 		cancel()
 		if err != nil {
 			continue
 		}
+		reachable++
 		if agreed == nil {
 			agreed = append([]byte(nil), b...)
 			continue
 		}
 		if ContentETag(agreed) != ContentETag(b) {
-			return
+			mismatch = true
 		}
 	}
-	if len(agreed) > 0 {
-		m.noteAcked(agreed)
+	quorum := len(m.mirrors)/2 + 1
+	if agreed == nil || reachable < quorum || mismatch {
+		m.mu.Lock()
+		m.fenced = true
+		m.mu.Unlock()
+		return
 	}
+	m.noteAcked(agreed)
 }
 
 func (m *MirrorStore) noteAcked(b []byte) {
 	m.mu.Lock()
+	// The acknowledged HEAD is a high-water mark: a partial repair view (the
+	// newer replica unreachable, an older one still up) must never lower it.
+	// Doing so cleared fencing on a lagging node and let it commit at an old
+	// revision number, overwriting a different revision's objects (observed
+	// at 800k objects: rev728 existed with two contents).
+	if m.mutableOrder != nil && m.controlKey != "" && len(m.ackedCurrent) > 0 &&
+		m.mutableOrder(m.controlKey, b, m.ackedCurrent) < 0 {
+		m.mu.Unlock()
+		return
+	}
 	m.ackedCurrent = append([]byte(nil), b...)
 	m.fenced = false
 	m.mu.Unlock()
@@ -373,8 +392,14 @@ func (m *MirrorStore) checkCaughtUp(p Store, pi int) error {
 	m.mu.Lock()
 	key, want, fenced := m.controlKey, append([]byte(nil), m.ackedCurrent...), m.fenced
 	m.mu.Unlock()
-	if !fenced || key == "" || len(want) == 0 {
+	if !fenced {
 		return nil
+	}
+	if key == "" || len(want) == 0 {
+		// HEAD is unknown (e.g. a cold start while the peer is unreachable):
+		// refusing is the only safe answer. The recovery loop fills the ack
+		// once a majority of replicas agree.
+		return ErrReplicaLagging
 	}
 	// A recovering mirror is usually only seconds behind. Failing the write on
 	// the first mismatch turns a failover into a client-visible commit
@@ -1092,7 +1117,7 @@ func (m *MirrorStore) repairInternal() {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			ctx, cancel := context.WithTimeout(context.Background(), repairTimeout)
+			ctx, cancel := context.WithTimeout(context.Background(), repairListTimeout)
 			defer cancel()
 			ks, err := listAll(ctx, m.mirrors[i], m.repoPrefix)
 			if err != nil {
@@ -1131,7 +1156,7 @@ func (m *MirrorStore) repairInternal() {
 	}
 	failed := make([]bool, n)
 
-	ctx, cancel := context.WithTimeout(context.Background(), repairTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), repairCopyTimeout)
 	defer cancel()
 	for k := range keys {
 		if isMutableKey(k) {
@@ -1202,6 +1227,52 @@ func (m *MirrorStore) reconcileMutable(ctx context.Context, k string, sets []map
 	if best == nil {
 		return
 	}
+	if k == m.controlName() {
+		// Never adopt a HEAD from an uncertain view. The rules:
+		//  - if this process already acknowledged a HEAD, best must not be
+		//    older (repair may copy the known baseline or anything newer);
+		//  - with no baseline (cold start), only an all-reachable view or a
+		//    majority agreeing on best may establish it. Otherwise a lagging
+		//    survivor was adopted, fencing cleared and a commit overwrote an
+		//    old revision number (observed at 800k objects: rev728 had two
+		//    different contents).
+		m.mu.Lock()
+		ack := append([]byte(nil), m.ackedCurrent...)
+		m.mu.Unlock()
+		if len(ack) > 0 {
+			if m.mutableOrder != nil && m.mutableOrder(k, best, ack) < 0 {
+				return
+			}
+		} else {
+			allReachable := true
+			for i := range m.mirrors {
+				if !reachable[i] {
+					allReachable = false
+					break
+				}
+			}
+			if !allReachable {
+				holders, disagree := 0, false
+				for i := range m.mirrors {
+					if !reachable[i] || !sets[i][k] {
+						continue
+					}
+					b, err := m.mirrors[i].Get(ctx, k, nil)
+					if err != nil {
+						continue
+					}
+					if m.order(k, b, best) == 0 {
+						holders++
+					} else {
+						disagree = true
+					}
+				}
+				if holders < len(m.mirrors)/2+1 || disagree {
+					return
+				}
+			}
+		}
+	}
 	for i := range m.mirrors {
 		if !reachable[i] {
 			continue
@@ -1233,8 +1304,15 @@ func (m *MirrorStore) healthSnapshot() []bool {
 	return out
 }
 
-// repairTimeout bounds one repair pass over all mirrors.
-const repairTimeout = 5 * time.Second
+// repairListTimeout bounds one mirror's object listing. At 1M objects the
+// listing takes far longer than the old 5s budget; a short timeout made a
+// healthy peer look unreachable and triggered the stale-HEAD bug.
+const repairListTimeout = 90 * time.Second
+
+// repairCopyTimeout bounds the copy/reconcile phase of one pass. A full 1M
+// object repair needs minutes; partial progress is kept and the next pass
+// continues from the missing-object counts.
+const repairCopyTimeout = 10 * time.Minute
 
 // isMutableKey reports whether an object's content must always be mirrored
 // from the primary (the only mutable object today is the HEAD `current`).
