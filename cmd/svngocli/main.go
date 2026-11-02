@@ -19,6 +19,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -30,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -37,6 +39,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"svngod/internal/cdc"
@@ -243,7 +246,7 @@ func landedCommit(repoURL string, oldHead uint64, msg string, msgKnown bool) (ui
 	if !msgKnown {
 		return 0, false
 	}
-	out, err := runSvnOutput([]string{"log", "--xml", "-r", fmt.Sprintf("%d:HEAD", oldHead+1), "-l", "5", repoURL, "--non-interactive"})
+	out, err := runSvnOutputTimeout([]string{"log", "--xml", "-r", fmt.Sprintf("%d:HEAD", oldHead+1), "-l", "5", repoURL, "--non-interactive"}, 30*time.Second)
 	if err != nil {
 		return 0, false
 	}
@@ -267,7 +270,7 @@ func landedCommit(repoURL string, oldHead uint64, msg string, msgKnown bool) (ui
 }
 
 func svnURLAndHead(target string) (string, uint64) {
-	out, err := runSvnOutput([]string{"info", "--xml", "--non-interactive", target})
+	out, err := runSvnOutputTimeout([]string{"info", "--xml", "--non-interactive", target}, 30*time.Second)
 	if err != nil {
 		return "", 0
 	}
@@ -301,15 +304,49 @@ func authFlags() []string {
 }
 
 func runSvnOutput(args []string) ([]byte, error) {
+	return runSvnOutputTimeout(args, 0)
+}
+
+// runSvnOutputTimeout runs a metadata svn command with a deadline. Content
+// operations (ls -R of a huge tree) keep no deadline; metadata calls must not
+// hang the client when the server disappears mid-request.
+func runSvnOutputTimeout(args []string, timeout time.Duration) ([]byte, error) {
 	args = append(args, authFlags()...)
-	cmd := exec.Command(svnBin(), args...)
-	var errb bytes.Buffer
-	cmd.Stderr = &errb
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("svn %s: %v: %s", strings.Join(args, " "), err, errb.String())
+	ctx := context.Background()
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
 	}
-	return out, nil
+	// Use temp files instead of cmd.Output's pipes: if a helper process
+	// inherits a pipe and outlives svn, Wait blocks on the copier goroutine
+	// forever even after the context kills the direct child (observed as a
+	// client that never exits after the server is SIGKILLed mid-request).
+	outf, err := os.CreateTemp("", "svngocli-out-")
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(outf.Name())
+	defer outf.Close()
+	errf, err := os.CreateTemp("", "svngocli-err-")
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(errf.Name())
+	defer errf.Close()
+
+	cmd := exec.CommandContext(ctx, svnBin(), args...)
+	cmd.Stdout = outf
+	cmd.Stderr = errf
+	runErr := cmd.Run()
+	if runErr != nil {
+		errb, _ := os.ReadFile(errf.Name())
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, fmt.Errorf("svn %s: timed out after %v", strings.Join(args, " "), timeout)
+		}
+		return nil, fmt.Errorf("svn %s: %v: %s", strings.Join(args, " "), runErr, errb)
+	}
+	return os.ReadFile(outf.Name())
 }
 
 // --- bulk upload (svngod bundle channel) ---
@@ -427,7 +464,7 @@ func cmdUpload(args []string) int {
 	chunkParams := caps.chunkParams
 	if !bundleOK {
 		// Fall back to svn import when the target does not exist yet.
-		if _, err := runSvnOutput([]string{"ls", targetURL}); err != nil {
+		if _, err := runSvnOutputTimeout([]string{"ls", targetURL}, 30*time.Second); err != nil {
 			fmt.Fprintln(os.Stderr, "svngocli: server has no bulk commit channel; falling back to svn import")
 			ia := []string{"import", "-m", msg, localDir, targetURL}
 			ia = append(ia, authFlags()...)
@@ -713,10 +750,15 @@ func joinRepoPath(base, rel string) string {
 func resolveRepoRoot(targetURL string) (string, string, error) {
 	u := strings.TrimSuffix(targetURL, "/")
 	for {
-		out, err := runSvnOutput([]string{"info", "--show-item", "repos-root-url", u})
+		out, err := runSvnOutputTimeout([]string{"info", "--show-item", "repos-root-url", u}, 20*time.Second)
 		if err == nil {
 			root := strings.TrimSpace(string(out))
 			return root, repoPathOf(targetURL, root), nil
+		}
+		if svnTransportFailure(err) {
+			// The server is not answering or refused the connection; walking
+			// to the parent URL would only repeat the wait per level.
+			return "", "", err
 		}
 		parent := parentURL(u)
 		if parent == u || parent == "" {
@@ -724,6 +766,22 @@ func resolveRepoRoot(targetURL string) (string, string, error) {
 		}
 		u = parent
 	}
+}
+
+// svnTransportFailure reports whether a failed svn invocation failed because
+// the server could not be reached (as opposed to the path not existing, where
+// walking to the parent is the right move).
+func svnTransportFailure(err error) bool {
+	s := err.Error()
+	for _, needle := range []string{
+		"timed out after", "E170013", "E000111", "E670008",
+		"Unable to connect", "Connection refused", "Could not resolve",
+	} {
+		if strings.Contains(s, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func repoPathOf(target, root string) string {
@@ -801,7 +859,7 @@ func probeBundle(repoRoot, user, pass string) (serverCaps, error) {
 	}
 	caps.chunkParams = caps.chunkParams.Normalize()
 	if caps.head == 0 {
-		if out, err := runSvnOutput([]string{"info", "--show-item", "revision", "--non-interactive", repoRoot + "@HEAD"}); err == nil {
+		if out, err := runSvnOutputTimeout([]string{"info", "--show-item", "revision", "--non-interactive", repoRoot + "@HEAD"}, 20*time.Second); err == nil {
 			fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &caps.head)
 		}
 	}
@@ -976,11 +1034,18 @@ func postBundle(repoRoot string, hdr bundleHeader, files []uploadFile, params cd
 	var lastErr error
 	for attempt := 0; attempt < 5; attempt++ {
 		pr, pw := io.Pipe()
+		last := &atomic.Int64{}
+		last.Store(time.Now().UnixNano())
+		bodyDone := &atomic.Bool{}
 		go func() {
-			pw.CloseWithError(writeBundle(pw, hdr, files, params))
+			err := writeBundle(pw, hdr, files, params)
+			bodyDone.Store(true)
+			pw.CloseWithError(err)
 		}()
-		req, rerr := http.NewRequest("POST", endpoint, pr)
+		ctx, cancel := context.WithCancel(context.Background())
+		req, rerr := http.NewRequestWithContext(ctx, "POST", endpoint, &progressReader{r: pr, last: last})
 		if rerr != nil {
+			cancel()
 			pr.Close()
 			return 0, false, rerr
 		}
@@ -988,7 +1053,9 @@ func postBundle(repoRoot string, hdr bundleHeader, files []uploadFile, params cd
 		req.Header.Set("Content-Type", "application/x-svngod-bundle")
 		req.Header.Set("User-Agent", "svngocli/"+version)
 		setAuth(req, user, pass)
+		go watchSend(ctx, cancel, last, bodyDone, 30*time.Second)
 		resp, derr := httpClient().Do(req)
+		cancel()
 		pr.Close()
 		if derr != nil {
 			lastErr = derr
@@ -1036,6 +1103,44 @@ func setAuth(req *http.Request, user, pass string) {
 	}
 }
 
+// progressReader timestamps body reads so a stalled send can be detected.
+type progressReader struct {
+	r    io.Reader
+	last *atomic.Int64
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 {
+		p.last.Store(time.Now().UnixNano())
+	}
+	return n, err
+}
+
+// watchSend cancels a request whose body send made no progress for idle. It
+// disarms once the body is fully written: a server may legitimately spend
+// minutes committing before it responds, and ResponseHeaderTimeout covers
+// that wait. Without this, a SIGKILLed server left the client blocked on a
+// half-open TCP connection for the full header timeout (observed 2+ minutes).
+func watchSend(ctx context.Context, cancel context.CancelFunc, last *atomic.Int64, done *atomic.Bool, idle time.Duration) {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if done.Load() {
+				return
+			}
+			if time.Since(time.Unix(0, last.Load())) > idle {
+				cancel()
+				return
+			}
+		}
+	}
+}
+
 func httpClient() *http.Client {
 	return &http.Client{
 		// No overall timeout: multi-gigabyte bodies are expected. The header
@@ -1043,8 +1148,13 @@ func httpClient() *http.Client {
 		// responding, instead of hanging the client forever.
 		Timeout: 0,
 		Transport: &http.Transport{
-			Proxy:                 http.ProxyFromEnvironment,
-			TLSClientConfig:       &tls.Config{},
+			Proxy:           http.ProxyFromEnvironment,
+			TLSClientConfig: &tls.Config{},
+			// TCP keepalive bounds a peer that disappears mid-request (a
+			// SIGKILLed server previously left the client waiting for the
+			// 2-minute response-header timeout). It does not cap a long,
+			// healthy transfer.
+			DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 15 * time.Second}).DialContext,
 			MaxIdleConnsPerHost:   4,
 			IdleConnTimeout:       90 * time.Second,
 			ResponseHeaderTimeout: 2 * time.Minute,

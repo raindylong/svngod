@@ -444,7 +444,12 @@ func (s *S3Store) listPrefixOnce(ctx context.Context, prefix, continuation strin
 	// truncating every listing (mirror repair only saw the first page).
 	opts := minio.ListObjectsOptions{Prefix: s.key(prefix), Recursive: true, MaxKeys: max + 1}
 	if continuation != "" {
-		opts.StartAfter = continuation // minio v7 auto-pages internally; StartAfter skips to resume
+		// Callers pass keys relative to the store prefix (the same form
+		// ListedObj.Key uses). StartAfter is compared against the full object
+		// key, so it must be re-prefixed; passing the relative key made every
+		// page after the first repeat page one, silently truncating listings
+		// (journal tail, GC, repair) at 1000 objects.
+		opts.StartAfter = s.key(continuation)
 	}
 	var out []ListedObj
 	objs := s.client.ListObjects(ctx, s.bucket, opts)
