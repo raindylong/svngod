@@ -157,19 +157,21 @@ auth:
 ```
 
 1. **本地密码表**（`local`）
-   - 兼容 SVN `passwd` 文件与 Apache `htpasswd` 两种形态，支持明文透传与哈希（`{SHA}`、`bcrypt`、`argon2id`）。
-   - 用户条目以**哈希**存储为准；明文仅用于兼容迁移期，启动时告警。
-   - 支持加载重载（SIGHUP / 轮询 mtime），改密不重启。
+   - 兼容 SVN `passwd` 文件与 Apache `htpasswd` 两种形态，支持明文与哈希（`{SHA}`、`{CRYPT}$6$` SHA-512crypt；`$1$`/`$5$`/DES 明确拒绝）。
+   - 用户条目以**哈希**存储为准；明文仅用于兼容迁移期。
+   - 支持重载（SIGHUP / 轮询 mtime），改密不重启。
 2. **LDAP**（`ldap`）
    - `go-ldap/v3`。两种模式：
-     - **search+bind**：用服务账号在 `base_dn` 下按 `user_filter`（如 `uid=%s`）定位用户，再用该用户 DN 绑定时校验口令（推荐，避免泄露用户 DN 规则）。
-     - **direct bind**：用 `cn=%s,base_dn` 直接绑定校验（简单，需 LDAP 允许）。
-   - 配置：`url`、`tls`（startTLS/LDAPS）、`base_dn`、`user_filter`、`bind_dn`/`bind_password`（服务账号）、`group_filter`（可选，供授权组解析）。
+     - **search+bind**：在 `base-dn` 下用 `filter`（如 `(uid={{username}})`）定位用户；配置 `bind-dn`/`bind-password` 时用服务账号搜索，留空则匿名搜索；再用用户 DN 绑定校验口令。
+     - **direct bind**：用 `direct-bind-dn`（如 `uid={{username}},ou=people,dc=example,dc=com`）直接绑定，不做搜索。
+   - 配置字段：`url`（`ldap://`/`ldaps://`）、`starttls`、`base-dn`、`filter`、`bind-dn`、`bind-password`、`direct-bind-dn`。
+   - 搜索为**整棵子树**且要求恰好 1 条匹配；Apache `AuthLDAPURL` 的迁移对照见 [`配置与多实例部署.md`](配置与多实例部署.md) §7.1。
+   - **不做 LDAP 组授权**：`Require ldap-group`/`AuthLDAPGroupAttribute` 需改写为 SVN authz 文件。
 
 ### 4.3 授权层（Authz）
 
 - 兼容 SVN **authz 文件格式**：`[groups]`、`[/]`、`[/path]`、`@group = r/w`、`* = r`、`~` 排除规则、继承与覆盖语义。
-- 实现 `internal/authz`：解析 + 最长前缀路径匹配 + 组解析（组可来自 authz 静态定义或 LDAP 动态组）。
+- 实现 `internal/authz`：解析 + 最长前缀路径匹配 + 组解析（组仅来自 authz 静态定义；不支持 LDAP 动态组）。
 - 每个请求按（用户，路径，操作 read/write）做判定；目录操作需校验整条路径可达性。
 
 ### 4.4 安全设计

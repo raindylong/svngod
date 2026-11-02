@@ -5,7 +5,7 @@
 ## 特性
 
 - **协议层**：WebDAV/DeltaV HTTPv1，覆盖 `OPTIONS/PROPFIND/GET/REPORT/MKACTIVITY/PROPPATCH/CHECKOUT/PUT/DELETE/MKCOL/MERGE/COPY/MOVE/LOCK/UNLOCK` 与私有 `!svn/*` URL。svn CLI 常规命令（checkout/import/commit/update/status/log/ls/info/blame/diff）端到端打通。
-- **认证**：OpenLDAP（search+bind / direct-bind 两种模式）+ 本地密码表（`{SHA}` / `{CRYPT}` SHA-512crypt），按序首成功；真实 OpenLDAP 集成验证。
+- **认证**：OpenLDAP（search+bind / direct-bind 两种模式）+ 本地密码表（`{SHA}` / `{CRYPT}` SHA-512crypt），按序首成功；真实 OpenLDAP 集成验证。Apache `AuthLDAPURL` 迁移见 [`docs/配置与多实例部署.md`](docs/配置与多实例部署.md) §7.1。
 - **授权**：SVN authz 文件（组传递闭包、`~` 否定、max-of-matches），每库独立 authz。
 - **存储**：svndiff v0 编解码、FSFS 式分片（SHARD_SIZE 默认 4096）、自动打包、LRU 缓存；后端 `file`（本地）/ `s3`（RustFS/MinIO/AWS/OSS/COS）/ `mirror`（主备镜像）。
 - **规模**：单仓 1000 万修订级（分片+自动打包，loose 对象数 O(shards)）；实测 10 万修订 avg 0.44ms/rev 稳定不退化。
