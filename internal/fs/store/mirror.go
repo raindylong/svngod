@@ -315,6 +315,18 @@ func NewMirror(mirrors []Store, opts ...MirrorOption) *MirrorStore {
 	// Unit-test/custom stores (no repository prefix) keep the deterministic
 	// blocking alignment they assert: a test sees a fully replicated store as
 	// soon as NewMirror returns.
+	if m.lazy {
+		// Lazy startup trusts no replica until a full pass has verified it.
+		// Marking every mirror healthy and relying on the HEAD alone let a new
+		// or rebuilt replica become "healthy" as soon as `current` was copied,
+		// while data objects were still missing; upToDate then skipped the rest
+		// of the repair. verify forces the first background pass to complete.
+		m.mu.Lock()
+		for i := range m.verify {
+			m.verify[i] = true
+		}
+		m.mu.Unlock()
+	}
 	if !m.lazy {
 		reachable := make([]bool, len(m.mirrors))
 		var probeWG sync.WaitGroup
@@ -1751,7 +1763,7 @@ func (m *MirrorStore) anyDown() bool {
 // answer one list, which flapped a live standby every minute.
 const (
 	healthProbeInterval = 5 * time.Second
-	healthProbeTimeout  = 15 * time.Second
+	healthProbeTimeout  = 30 * time.Second
 	healthProbeStrikes  = 3
 )
 
