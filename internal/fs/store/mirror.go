@@ -238,6 +238,7 @@ func NewMirror(mirrors []Store, opts ...MirrorOption) *MirrorStore {
 	// electing it before it is caught up would hide committed revisions.
 	m.repairInternal()
 	go m.repairLoop()
+	go m.healthLoop()
 	if m.anyDown() {
 		m.mu.Lock()
 		m.recovering = true
@@ -374,15 +375,28 @@ func (m *MirrorStore) primary() (Store, int) {
 // markDown records a mirror as failed so it is excluded from service. Losing
 // the current primary fences writes until the newly elected standby proves it
 // has the acknowledged HEAD.
-func (m *MirrorStore) markDown(i int) {
+func (m *MirrorStore) markDown(i int) { m.takeDown(i, false) }
+
+// markDownHung takes a mirror out of service after it stopped answering
+// (health probe or read timeout) instead of reporting a write error. Writes
+// that "succeeded" into its socket buffer may never be processed if the
+// process is killed, so the next repair must list every object instead of
+// trusting the pending delta.
+func (m *MirrorStore) markDownHung(i int) { m.takeDown(i, true) }
+
+func (m *MirrorStore) takeDown(i int, hung bool) {
 	m.mu.Lock()
 	wasHealthy := m.healthy[i]
 	m.healthy[i] = false
 	m.repairable = true
 	if wasHealthy {
 		// It was complete a moment ago, so only keys written from now on can
-		// be missing. The delta is recorded by routeStandby.
-		m.wholeAtDown[i] = true
+		// be missing. The delta is recorded by routeStandby -- unless the node
+		// hung, where earlier buffered writes are unaccounted for.
+		m.wholeAtDown[i] = !hung
+		if hung {
+			m.pendingOverflow[i] = true
+		}
 	}
 	if i == m.prim {
 		m.fenced = true
@@ -393,7 +407,7 @@ func (m *MirrorStore) markDown(i int) {
 	}
 	m.mu.Unlock()
 	if wasHealthy {
-		log.Printf("mirror[%d] taken out of service (fenced=%v)", i, i == m.prim)
+		log.Printf("mirror[%d] taken out of service (hung=%v fenced=%v)", i, hung, i == m.prim)
 	}
 	if start {
 		go m.recoveryLoop()
@@ -676,7 +690,9 @@ func (m *MirrorStore) Get(ctx context.Context, key string, rng *Range) ([]byte, 
 	// in flight). Fall back to standbys without marking them down when they
 	// simply do not have the object yet.
 	p, pi := m.primary()
-	b, err := p.Get(ctx, key, rng)
+	pc, pcancel := context.WithTimeout(ctx, primaryReadTimeout)
+	b, err := p.Get(pc, key, rng)
+	pcancel()
 	if err == nil {
 		return b, nil
 	}
@@ -686,7 +702,7 @@ func (m *MirrorStore) Get(ctx context.Context, key string, rng *Range) ([]byte, 
 		return nil, err
 	}
 	if !errors.Is(err, ErrNotFound) {
-		m.markDown(pi)
+		m.markDownHung(pi)
 	}
 	n := len(m.mirrors)
 	for step := 1; step < n; step++ {
@@ -694,7 +710,9 @@ func (m *MirrorStore) Get(ctx context.Context, key string, rng *Range) ([]byte, 
 		if !m.isHealthy(idx) {
 			continue
 		}
-		bb, e := m.mirrors[idx].Get(ctx, key, rng)
+		c, cancel := context.WithTimeout(ctx, standbyReadTimeout)
+		bb, e := m.mirrors[idx].Get(c, key, rng)
+		cancel()
 		if e == nil {
 			if rng == nil && !isControlKey(key) {
 				go m.repairKey(idx, key)
@@ -702,7 +720,7 @@ func (m *MirrorStore) Get(ctx context.Context, key string, rng *Range) ([]byte, 
 			return bb, nil
 		}
 		if !errors.Is(e, ErrNotFound) {
-			m.markDown(idx)
+			m.markDownHung(idx)
 		}
 	}
 	return nil, err
@@ -769,7 +787,9 @@ func (m *MirrorStore) Exists(ctx context.Context, key string) (bool, error) {
 		return n >= q, nil
 	}
 	p, pi := m.primary()
-	ok, err := p.Exists(ctx, key)
+	pc, pcancel := context.WithTimeout(ctx, primaryReadTimeout)
+	ok, err := p.Exists(pc, key)
+	pcancel()
 	if err == nil && ok {
 		return true, nil
 	}
@@ -777,7 +797,7 @@ func (m *MirrorStore) Exists(ctx context.Context, key string) (bool, error) {
 		return false, nil
 	}
 	if err != nil && !errors.Is(err, ErrNotFound) {
-		m.markDown(pi)
+		m.markDownHung(pi)
 	}
 	n := len(m.mirrors)
 	for step := 1; step < n; step++ {
@@ -785,12 +805,14 @@ func (m *MirrorStore) Exists(ctx context.Context, key string) (bool, error) {
 		if !m.isHealthy(idx) {
 			continue
 		}
-		ok, e := m.mirrors[idx].Exists(ctx, key)
+		c, cancel := context.WithTimeout(ctx, standbyReadTimeout)
+		ok, e := m.mirrors[idx].Exists(c, key)
+		cancel()
 		if e == nil && ok {
 			return true, nil
 		}
 		if e != nil && !errors.Is(e, ErrNotFound) {
-			m.markDown(idx)
+			m.markDownHung(idx)
 		}
 	}
 	return false, err
@@ -945,6 +967,11 @@ func (m *MirrorStore) DeletePrefix(ctx context.Context, prefix string) error {
 // to be acknowledged (a 100MiB body over a LAN takes a couple of seconds).
 const quorumWriteTimeout = 15 * time.Second
 
+// quorumRegisterTimeout bounds one replica operation on a lease-sized object
+// (the commit lock is a few dozen bytes). It is shorter than the data budget
+// so a hung-but-still-"healthy" replica costs seconds, not a failed commit.
+const quorumRegisterTimeout = 5 * time.Second
+
 // quorumMirror writes fn to the healthy standbys after the primary has the
 // object, returning ErrQuorumUnmet unless at least quorum copies exist. When
 // track is set, a skipped or failed copy is recorded in the mirror's pending
@@ -1052,6 +1079,15 @@ const quorumReadTimeout = 5 * time.Second
 // far above a healthy write (tens of ms locally) but short enough that a dead
 // node costs a few seconds, not the S3 SDK's full retry budget.
 const standbyWriteTimeout = 8 * time.Second
+
+// Read budgets bound a replica that accepts a request but never answers (a
+// paused process, a black-holed path). Without them a commit that falls back
+// to read from such a replica hung for minutes; the request only completed when
+// the peer was resumed.
+const (
+	primaryReadTimeout = 60 * time.Second
+	standbyReadTimeout = 10 * time.Second
+)
 
 // mirrorWrites fans a standby write out to every healthy mirror in parallel:
 // standbys are best effort, so their latency must not add to the request. When
@@ -1176,6 +1212,7 @@ func (m *MirrorStore) fastRecoverMirror(i int) bool {
 	if len(m.pending[i]) == 0 {
 		m.healthy[i] = true
 		m.wholeAtDown[i] = false
+		m.pendingOverflow[i] = false
 		m.verify[i] = true
 		m.mu.Unlock()
 		log.Printf("mirror[%d] fast recovery complete", i)
@@ -1341,6 +1378,70 @@ func (m *MirrorStore) anyDown() bool {
 		}
 	}
 	return false
+}
+
+// healthProbeInterval / healthProbeTimeout bound how long a hung but still
+// connected replica (a paused process, a black-holed network path) can keep
+// receiving "successful" buffered writes before it is taken out of service.
+// Two strikes keep a single slow response from evicting a healthy node.
+const (
+	healthProbeInterval = 5 * time.Second
+	healthProbeTimeout  = 2 * time.Second
+)
+
+// healthLoop probes every healthy mirror with one cheap list request. A write
+// to a paused process can succeed into its socket buffer without ever being
+// persisted, so write errors alone do not detect a hang; a probe with a short
+// deadline does, in about ten seconds instead of waiting for the 60s repair.
+func (m *MirrorStore) healthLoop() {
+	t := time.NewTicker(healthProbeInterval)
+	defer t.Stop()
+	fails := make([]int, len(m.mirrors))
+	for {
+		select {
+		case <-m.stop:
+			return
+		case <-t.C:
+			m.probeOnce(fails)
+		}
+	}
+}
+
+// probeOnce runs one health round; exposed for tests.
+func (m *MirrorStore) probeOnce(fails []int) {
+	m.mu.Lock()
+	prefix := strings.Trim(m.repoPrefix, "/")
+	if prefix != "" {
+		prefix += "/"
+	}
+	mirrors := append([]Store(nil), m.mirrors...)
+	healthy := append([]bool(nil), m.healthy...)
+	m.mu.Unlock()
+	// Never evict the elected primary on a probe: its liveness is exercised by
+	// every read and write with their own budgets, and a 2s list under heavy
+	// load once fenced a healthy primary, turning the cluster read-only. The
+	// probe exists for standbys, where a write can otherwise look successful
+	// while the process is paused.
+	_, prim := m.primary()
+	for i, s := range mirrors {
+		if i == prim || !healthy[i] {
+			fails[i] = 0
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), healthProbeTimeout)
+		_, _, err := s.ListPrefix(ctx, prefix, "", 1)
+		cancel()
+		if err == nil {
+			fails[i] = 0
+			continue
+		}
+		fails[i]++
+		if fails[i] >= 2 {
+			log.Printf("mirror[%d] health probe failed twice: %v", i, err)
+			m.markDownHung(i)
+			fails[i] = 0
+		}
+	}
 }
 
 // recoveryLoop restores redundancy while a mirror is down. A mirror that was
@@ -1604,6 +1705,7 @@ send:
 			m.mu.Lock()
 			m.verify[i] = false
 			m.wholeAtDown[i] = false
+			m.pendingOverflow[i] = false
 			m.pending[i] = nil
 			m.mu.Unlock()
 		}
@@ -1867,7 +1969,14 @@ func (m *MirrorStore) CreateIfAbsentQuorum(ctx context.Context, key string, data
 		}
 	}
 	for i, s := range m.mirrors {
-		c, cancel := context.WithTimeout(ctx, quorumWriteTimeout)
+		if !m.isHealthy(i) {
+			// An out-of-service replica cannot contribute to the quorum and
+			// must not add its timeout to every lease operation (a paused
+			// process accepted the request but never answered; each attempt
+			// cost the full write budget and lost the lease mid-commit).
+			continue
+		}
+		c, cancel := context.WithTimeout(ctx, quorumRegisterTimeout)
 		err := s.CreateIfAbsent(c, key, data)
 		cancel()
 		switch {
@@ -1906,7 +2015,10 @@ func (m *MirrorStore) CASQuorum(ctx context.Context, key, expect string, data []
 		}
 	}
 	for i, s := range m.mirrors {
-		c, cancel := context.WithTimeout(ctx, quorumWriteTimeout)
+		if !m.isHealthy(i) {
+			continue
+		}
+		c, cancel := context.WithTimeout(ctx, quorumRegisterTimeout)
 		_, err := s.CAS(c, key, expect, data)
 		cancel()
 		switch {
@@ -1936,7 +2048,10 @@ func (m *MirrorStore) CASQuorum(ctx context.Context, key, expect string, data []
 func (m *MirrorStore) DeleteIfMatchQuorum(ctx context.Context, key, etag string, quorum int) error {
 	ok := 0
 	for i, s := range m.mirrors {
-		c, cancel := context.WithTimeout(ctx, quorumWriteTimeout)
+		if !m.isHealthy(i) {
+			continue
+		}
+		c, cancel := context.WithTimeout(ctx, quorumRegisterTimeout)
 		err := DeleteIfMatch(c, s, key, etag)
 		cancel()
 		switch {
