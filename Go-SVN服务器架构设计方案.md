@@ -288,3 +288,22 @@
 - **提交路径严格读 arbiter 的 HEAD**：`CommitTxn` 新增 `readCurrentStrict`。普通读路径在 arbiter 瞬时不可达时可回退到备用副本，但提交分配修订号前必须读 arbiter；否则一次瞬时读失败可能基于旧 HEAD 写出 `head+1`，覆盖 arbiter 上已存在的同号修订块（随后的 CAS 虽会失败，但块已被破坏）。
 - **RustFS 负载下的探活预算**：健康探测与“恢复中副本是否可达”的预算由 5s/2s 提高到 15s。并发恢复扫描时 RustFS 单次列表常超过 5s，旧预算会让健康备用副本每分钟被摘除一次，测试与线上都会表现为反复 503。调整后连续观察 3 分钟无摘除。
 - **第二轮完整五轮结果**：r1–r5 全部通过（fails=0，新增 71 个修订，双副本 verify 通过），故障轮中的 503 均由客户端重试收敛，无半成品修订。
+
+### 多用户日常操作流程测试与属性链路修复（2026-11-03，git 1f0845f）
+
+按 SVN Book 第 2–4、7 章的日常操作清单，用 alice/bob/carol 三个账号、独立工作副本、4 个服务实例，跑了 6 轮端到端流程（每轮独立 `daily/<tag>/rN` 布局）：
+
+1. **分支/合并/标签**：`svn cp` 建 feature 分支，bob 在分支提交，alice 合并到 trunk，bob 反向同步，二次合并，`svn cp` 打 tag；`svn mergeinfo --show-revs merged`、`svn log -g`、`svn blame`、tag 内容对账全部正确。
+2. **冲突**：同文件并发修改（update 文本冲突 + `resolve --accept=theirs-full`）、删除 vs 修改、重命名 vs 修改（树冲突 + `resolve --accept=working`），解决后提交均成功，无丢失更新。
+3. **属性/关键字/EOL**：`svn:executable`、`svn:keywords`（`$Id$` 展开）、`svn:eol-style native`（CRLF 归一化）、`svn:ignore`、自定义中文属性；`proplist -v -R`、`propdel` 及跨用户传播均正确。
+4. **锁**：alice 加锁、bob 加锁失败、无锁提交被拒、`unlock --force` 夺锁后提交、`svn:needs-lock` 只读检出→加锁→可写→提交→解锁。
+5. **切换/混合修订**：`svn switch` 到分支提交再切回、`update -r` 旧修订后提交被 E160024 拒绝、更新后重试成功；`cat file@rev`、`ls -r`、`diff -r A:B`、`diff --summarize`、`blame -r`、`export -r` 全部可用。
+6. **externals/导入/Unicode**：相对 `^/` externals 检出内容正确；`svn import` 嵌套树（含空目录、中文文件）成功；中文日常文件提交/更新；`export --native-eol CRLF` 正确。
+
+**发现并修复的 3 个属性缺陷**
+
+1. **自定义属性名被写成 `custom:NAME`**：更新报告 `set-prop name="custom:myprop"` 让客户端把属性名存成字面量 `custom:myprop`，`svn propget myprop` 在新检出的副本里失败。修复为原样输出属性名；DAV 序列化统一用 `<custom:NAME>`（客户端自身也用该 QName），解析器兼容带 `custom:` 转义的输入，`bugzilla:url` 这类含冒号的名字双向可用。
+2. **后续属性提交清空其他属性**：节点 PROPPATCH 以事务根基线合并并替换整个属性表，第一次改动后再次提交会静默丢掉 `svn:ignore`、`svn:keywords` 等。修复为按客户端**逐路径基线修订**合并（复制路径用 copyfrom 源），`ActionCopy` 也改为合并而非替换。
+3. **属性删除永远不生效**：客户端删除请求是 `<C:name V:absent="1"></C:name>`，解析器把属性也当作名字，闭合标签永远匹配不上，删除被丢弃（还产生无变更的空修订）。修复标签名解析；更新报告新增 `<S:remove-prop>`，删除会传播到其他工作副本。
+
+**结果**：第 6 轮结束 head=2380（37 个修订），6 轮全部检查通过（fails=0），双副本 `svnadmin verify` 通过，逐修订 revblock 一致。未覆盖：受限 authz 路径、`propset --revprop` 钩子流程、绝对 URL externals，可在后续流程测试中补充。
