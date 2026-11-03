@@ -2256,8 +2256,8 @@ send:
 		for i := range sets {
 			counts[i] = len(sets[i])
 		}
-		log.Printf("repair: reachable=%v sets=%v keys=%d missing=%v failed=%v healthy=%v",
-			reachable, counts, len(keys), missing, failed, m.healthSnapshot())
+		log.Printf("repair %s: reachable=%v sets=%v keys=%d missing=%v failed=%v healthy=%v",
+			strings.Trim(m.repoPrefix, "/"), reachable, counts, len(keys), missing, failed, m.healthSnapshot())
 	}
 }
 
@@ -2288,7 +2288,13 @@ func revisionNumber(key string) uint64 {
 // value held by a quorum wins, and a replica is never overwritten when no
 // authoritative copy exists.
 func (m *MirrorStore) reconcileRevisions(keys map[string]bool, sets []map[string]int64, reachable []bool) {
-	const recentWindow = 200
+	const recentWindow = 100
+	// One shared budget for the whole reconciliation. A per-key 2-minute
+	// timeout let a slow backend stall a repair pass for hours (100 keys x
+	// 2 min), holding repairOnce and the lease, so the rejoining mirror never
+	// became healthy.
+	budget, budgetCancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer budgetCancel()
 	var maxRev uint64
 	for k := range keys {
 		if isRevisionKey(k) {
@@ -2299,6 +2305,9 @@ func (m *MirrorStore) reconcileRevisions(keys map[string]bool, sets []map[string
 	}
 	arbiter := m.ArbiterRequired()
 	for k := range keys {
+		if budget.Err() != nil {
+			return
+		}
 		if !isRevisionKey(k) {
 			continue
 		}
@@ -2327,7 +2336,7 @@ func (m *MirrorStore) reconcileRevisions(keys map[string]bool, sets []map[string
 		if !recent && !sizeDiff {
 			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		ctx, cancel := context.WithTimeout(budget, 10*time.Second)
 		var want []byte
 		var err error
 		if arbiter {
@@ -2349,6 +2358,11 @@ func (m *MirrorStore) reconcileRevisions(keys map[string]bool, sets []map[string
 		}
 		for i := range m.mirrors {
 			if !reachable[i] || (arbiter && i == 0) {
+				continue
+			}
+			// Compare before rewriting: the normal case is identical bytes, and
+			// 100 unconditional PUTs per pass dominated recovery time on RustFS.
+			if cur, gerr := m.mirrors[i].Get(ctx, k, nil); gerr == nil && bytes.Equal(cur, want) {
 				continue
 			}
 			if perr := m.mirrors[i].Put(ctx, k, want); perr != nil {
