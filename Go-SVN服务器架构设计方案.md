@@ -251,6 +251,7 @@
 - 原生提交修改 + 新增 + `svn mv` 重命名 + `svn rm` → r1753；中文提交消息保留，另一实例 export 对账一致。
 - 原生 `svn mkdir --parents`（空目录）、`svn cp` 文件、`svn cp -r` 目录、`svn mv` 目录、二进制文件修改 → r1754；copyfrom 路径/修订正确，空目录可列出，13 个文件 MD5 全等。
 - 特殊字符文件修改提交 + 新增 `问号?文件.txt` → r1870/1871；export 对账 6/6 一致。
+- NFC/NFD 组合字符（`café 中文.txt` 两种 Unicode 正规化，字节不同）可同时存在并各自保留内容 → r1923；另一实例 export 两种名字与内容均正确。
 - 4 实例并发中文混合测试两轮：每轮 4 个 WC、各 15 轮（新增/修改/重命名/删除/空目录），共 100+ 修订；四实例 HEAD 一致、四份 export 与四份 WC 完全一致；两副本 verify 通过，新增修订 revblock SHA 逐条相等；服务端无 400/500。
 - 故障读取：停备用 RustFS 后从主实例 export 成功；恢复备用并确认可服务后停主，从另一实例 export 成功。
 - 终点校验：r1922 双副本 `verify` 均报 no integrity issues；r1868..1922 共 55 个 revblock SHA 全部一致。
