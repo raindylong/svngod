@@ -2114,6 +2114,10 @@ func (m *MirrorStore) upToDate() bool {
 // from it could hide revisions committed on the standby (and overwrite the
 // newer HEAD with its old one).
 func (m *MirrorStore) repairInternal() {
+	dbg := os.Getenv("SVNGOD_DEBUG_REPAIR") == "1"
+	if dbg {
+		log.Printf("repair %s: start", strings.Trim(m.repoPrefix, "/"))
+	}
 	// List every mirror in parallel with its own deadline: one unreachable
 	// backend must not consume the budget of the others (which previously left
 	// all mirrors marked down just because the primary was slow to fail).
@@ -2125,13 +2129,22 @@ func (m *MirrorStore) repairInternal() {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			// A mirror already marked down was failing probes; give it a short
-			// list budget so the pass (and its repair lease) is not held for the
-			// full large-repository timeout when it is still unreachable. A
-			// backend that just came back answers within seconds.
+			// A mirror marked down gets a cheap 5s probe first: a dead or hung
+			// backend fails (or times out) there, so the pass does not wait the
+			// full large-repository timeout. If the probe answers, the mirror is
+			// alive but may be slow (RustFS after a restart takes seconds for a
+			// full listing), so the real listing gets the normal budget. Giving
+			// every unhealthy mirror the short budget kept a live restarting
+			// standby failing its listing forever.
 			timeout := repairListTimeout
 			if !m.isHealthy(i) {
-				timeout = 5 * time.Second
+				pctx, pcancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_, _, perr := m.mirrors[i].ListPrefix(pctx, m.repoPrefix, "", 1)
+				pcancel()
+				if perr != nil {
+					log.Printf("mirror[%d] still unreachable during repair: %v", i, perr)
+					return
+				}
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
@@ -2145,6 +2158,9 @@ func (m *MirrorStore) repairInternal() {
 		}(i)
 	}
 	wg.Wait()
+	if dbg {
+		log.Printf("repair %s: listed reachable=%v", strings.Trim(m.repoPrefix, "/"), reachable)
+	}
 
 	keys := make(map[string]bool)
 	for i := range sets {
@@ -2184,7 +2200,13 @@ func (m *MirrorStore) repairInternal() {
 	// same number. The copy workers only fill missing keys, so reconcile the
 	// recent tail (where an outage can leave such an orphan) and any key whose
 	// listed size already differs.
+	if dbg {
+		log.Printf("repair %s: reconciling revisions (%d keys)", strings.Trim(m.repoPrefix, "/"), len(keys))
+	}
 	m.reconcileRevisions(keys, sets, reachable)
+	if dbg {
+		log.Printf("repair %s: copying objects", strings.Trim(m.repoPrefix, "/"))
+	}
 
 	// Copy immutable objects with a bounded worker pool. A serial loop was the
 	// recovery bottleneck: a 27-revision outage at 800k objects left ~50k
@@ -2215,6 +2237,9 @@ send:
 	}
 	close(jobs)
 	cw.Wait()
+	if dbg {
+		log.Printf("repair %s: copy done", strings.Trim(m.repoPrefix, "/"))
+	}
 
 	// A full pass is also the moment to drain keys recorded while a mirror was
 	// out of service. Some of them may have been deleted since (an abandoned
