@@ -536,6 +536,9 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 					b.WriteString("      <D:checked-in><D:href>" + xmlEscape(ver) + "</D:href></D:checked-in>\n")
 					writeEntryProps(b, revPropsFor(repo, c.ID.Rev), uuid, c.ID.Rev)
 					writeNodeProps(b, c.Props)
+					if bnr, berr := repo.Resolve(baseRev, cwcPath); berr == nil {
+						writePropRemovals(b, bnr.Props, c.Props)
+					}
 					b.WriteString(body)
 					b.WriteString("    </S:open-directory>\n")
 				}
@@ -631,6 +634,7 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 				b.WriteString("      <D:checked-in><D:href>" + xmlEscape(ver) + "</D:href></D:checked-in>\n")
 				writeEntryProps(b, nodeRevProps(repo, nr), uuid, nr.Node.Rev)
 				writeNodeProps(b, nr.Props)
+				writePropRemovals(b, baseNode.Props, nr.Props)
 				b.WriteString("    </S:open-file>\n")
 				continue
 			}
@@ -674,6 +678,7 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 			b.WriteString("      <D:checked-in><D:href>" + xmlEscape(ver) + "</D:href></D:checked-in>\n")
 			writeEntryProps(b, nodeRevProps(repo, nr), uuid, nr.Node.Rev)
 			writeNodeProps(b, nr.Props)
+			writePropRemovals(b, baseNode.Props, nr.Props)
 			b.WriteString("      <S:fetch-file base-checksum=\"" + hex.EncodeToString(bs[:]) + "\" sha1-checksum=\"" + hex.EncodeToString(ss[:]) + "\"/>\n")
 			b.WriteString("    </S:open-file>\n")
 			continue
@@ -744,6 +749,29 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 	return nil
 }
 
+// writePropRemovals tells the client which properties the target no longer
+// has. Without this a deleted property stays in every other working copy: the
+// report only lists the remaining set, and the client does not clear unlisted
+// properties.
+func writePropRemovals(b *strings.Builder, base, target map[string]string) {
+	if len(base) == 0 {
+		return
+	}
+	keys := make([]string, 0, len(base))
+	for k := range base {
+		if k != "svn:date" {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if _, ok := target[k]; ok {
+			continue
+		}
+		b.WriteString("      <S:remove-prop name=\"" + xmlEscape(k) + "\"/>\n")
+	}
+}
+
 // writeNodeProps emits <S:set-prop> for each node property (svn namespace and
 // custom props). svn:date is a revision property and is skipped here.
 func writeNodeProps(b *strings.Builder, props map[string]string) {
@@ -759,14 +787,11 @@ func writeNodeProps(b *strings.Builder, props map[string]string) {
 		if k == "svn:date" {
 			continue
 		}
-		// mod_dav_svn reports user properties under their DAV name
-		// ("custom:NAME"), and the client stores that name in the WC; sending
-		// the bare name would leave WC props inconsistent with the server.
-		name := k
-		if !strings.HasPrefix(k, "svn:") {
-			name = "custom:" + k
-		}
-		b.WriteString("      <S:set-prop name=\"" + xmlEscape(name) + "\">" + xmlEscape(props[k]) + "</S:set-prop>\n")
+		// The update report carries the property's own name. A "custom:"
+		// prefix here made the client store every user property under that
+		// literal name ("custom:myprop"), so svn propget myprop failed after a
+		// fresh checkout even though the repository copy was correct.
+		b.WriteString("      <S:set-prop name=\"" + xmlEscape(k) + "\">" + xmlEscape(props[k]) + "</S:set-prop>\n")
 	}
 }
 

@@ -476,3 +476,44 @@ func TestChunkedDeltaPUT(t *testing.T) {
 		t.Fatalf("committed text differs from client (len %d vs %d)", len(got), len(edited))
 	}
 }
+
+// TestProppatchKeepsUnrelatedProps covers a node-property commit: the client
+// sends only the changed property, and the server must merge it with the
+// node's existing properties instead of replacing the whole map (which
+// silently dropped svn:ignore and every other custom property).
+func TestProppatchKeepsUnrelatedProps(t *testing.T) {
+	ts, repo, base := testServer(t, "", "")
+	defer ts.Close()
+	if _, err := repo.CommitTxn(1, []fs.Change{{
+		Path: "/trunk/README.txt", Action: fs.ActionModify, Kind: fs.KindFile,
+		Props: map[string]string{"svn:ignore": "*.log", "keep": "v1"},
+	}}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	txnRoot := copyMoveSetup(t, base, "demo", "props-1")
+	body := `<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:" xmlns:C="http://subversion.tigris.org/xmlns/custom/">` +
+		`<D:set><D:prop><C:myprop>hello</C:myprop></D:prop></D:set></D:propertyupdate>`
+	resp := doRequest(t, "PROPPATCH", txnRoot+"/trunk/README.txt", body, "", "", nil)
+	if resp.StatusCode != http.StatusMultiStatus && resp.StatusCode != http.StatusOK {
+		t.Fatalf("PROPPATCH=%d body=%s", resp.StatusCode, bodyOf(t, resp))
+	}
+	resp.Body.Close()
+
+	merge := `<?xml version="1.0"?><D:merge xmlns:D="DAV:"><D:source><D:href>` +
+		base + `/svn/demo/!svn/act/props-1/</D:href></D:source></D:merge>`
+	resp = doRequest(t, "MERGE", base+"/svn/demo/!svn/vcc/default", merge, "", "", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("MERGE=%d body=%s", resp.StatusCode, bodyOf(t, resp))
+	}
+	resp.Body.Close()
+
+	head, _ := repo.Head()
+	nr, err := repo.Resolve(head, "/trunk/README.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nr.Props["myprop"] != "hello" || nr.Props["keep"] != "v1" || nr.Props["svn:ignore"] != "*.log" {
+		t.Fatalf("props after patch = %v; want myprop+keep+svn:ignore", nr.Props)
+	}
+}

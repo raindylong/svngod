@@ -573,3 +573,32 @@ func TestReportFetchURLUsesModificationRev(t *testing.T) {
 		t.Fatalf("fetch URL content=%q", b)
 	}
 }
+
+func TestUpdateReportNodePropNamesArePlain(t *testing.T) {
+	var b strings.Builder
+	writeNodeProps(&b, map[string]string{
+		"svn:mime-type": "text/plain",
+		"myprop":        "value",
+	})
+	out := b.String()
+	if !strings.Contains(out, `name="myprop"`) || !strings.Contains(out, `name="svn:mime-type"`) {
+		t.Fatalf("property names not plain:\n%s", out)
+	}
+	if strings.Contains(out, "custom:myprop") {
+		t.Fatalf("user property got a custom: prefix:\n%s", out)
+	}
+}
+
+func TestWritePropRemovals(t *testing.T) {
+	var b strings.Builder
+	writePropRemovals(&b,
+		map[string]string{"keep": "v", "svn:ignore": "*.log", "svn:date": "x"},
+		map[string]string{"svn:ignore": "*.log"})
+	out := b.String()
+	if !strings.Contains(out, `<S:remove-prop name="keep"/>`) {
+		t.Fatalf("missing remove-prop for deleted property:\n%s", out)
+	}
+	if strings.Contains(out, `name="svn:ignore"`) || strings.Contains(out, `name="svn:date"`) {
+		t.Fatalf("removed a still-present or revision property:\n%s", out)
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"net/url"
 	"sort"
 	"strconv"
@@ -238,6 +239,9 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request, res reso
 	}
 	// parse requested props (allprop if empty body / no propfind element)
 	pbody, _ := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	if os.Getenv("SVNGOD_DEBUG_PROPS") == "1" {
+		log.Printf("PROPFIND %s body=%s", r.URL.Path, pbody)
+	}
 	dprops, propnames := parsePropfindRequest(pbody)
 	props := make([]Name, len(dprops))
 	for i := range dprops {

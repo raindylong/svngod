@@ -321,6 +321,9 @@ func (s *Server) handleProppatch(w http.ResponseWriter, r *http.Request, res res
 	if res.typ == resTxn {
 		s.loadTxnChanges(repo, res.repo, res.uuid)
 	}
+	if os.Getenv("SVNGOD_DEBUG_PROPS") == "1" {
+		log.Printf("PROPPATCH %s body=%s", r.URL.Path, body)
+	}
 	sets, removes := parsePropertyUpdate(body)
 
 	switch res.typ {
@@ -403,18 +406,45 @@ func (s *Server) handleProppatch(w http.ResponseWriter, r *http.Request, res res
 		// PUT/MKCOL); inherit its kind from the base revision so the commit
 		// stores a file/dir rather than a zero-kind node (which would commit
 		// the file as a directory).
-		if ch.kind == 0 && tx.baseRev > 0 {
-			if r2, ok2 := s.openRepoOnly(w, res.repo); ok2 {
-				if nr, err := r2.Resolve(tx.baseRev, res.path); err == nil {
+		// The property base is the client's revision for this path, not the
+		// transaction root: a mixed-revision WC can hold the directory at an
+		// older revision than the txn, and merging against the wrong base
+		// silently drops properties.
+		baseRev := tx.baseRev
+		if br := clientBaseRevision(r); br > 0 {
+			baseRev = br
+		}
+		var baseNr *fs.NodeRev
+		if baseRev > 0 {
+			if nr, err := repo.Resolve(baseRev, res.path); err == nil {
+				baseNr = nr
+				if ch.kind == 0 {
 					ch.kind = nr.Kind
 				}
 			}
 		}
 		if ch.props == nil {
+			// The client sends only the properties it changed. The change must
+			// carry the node's full property map, or the commit replaces the
+			// node and silently drops every other property (svn:ignore,
+			// svn:keywords, other custom props). Start from the copy source for
+			// a path copied in this transaction, else from the base revision.
 			ch.props = map[string]string{}
+			var src map[string]string
+			if ch.copyFromPath != "" && ch.copyFromRev > 0 {
+				if nr, err := repo.Resolve(ch.copyFromRev, ch.copyFromPath); err == nil {
+					src = nr.Props
+				}
+			}
+			if src == nil && baseNr != nil {
+				src = baseNr.Props
+			}
+			for k, v := range src {
+				ch.props[k] = v
+			}
 		}
-		if br := clientBaseRevision(r); br > 0 {
-			ch.baseRev = br
+		if clientBaseRevision(r) > 0 {
+			ch.baseRev = clientBaseRevision(r)
 		}
 		for _, p := range sets {
 			ch.props[svnPropertyKey(p.ns, p.local)] = p.value

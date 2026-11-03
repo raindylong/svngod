@@ -209,7 +209,15 @@ func parsePropertyUpdate(body []byte) (sets, removes []davProp) {
 			if selfClose {
 				tag = strings.TrimSuffix(tag, "/")
 			}
-			prefix, local := splitQName(strings.TrimSpace(tag))
+			// Remove entries carry attributes (subversion sends
+			// <C:name V:absent="1">); the name is the part before them, not the
+			// whole tag body. Including them never matched the closing tag, so
+			// every property deletion was silently dropped.
+			name := tag
+			if i := strings.IndexAny(name, " \t\r\n"); i >= 0 {
+				name = name[:i]
+			}
+			prefix, local := splitQName(strings.TrimSpace(name))
 			switch local {
 			case "set":
 				mode = "set"
@@ -324,14 +332,18 @@ func xmlUnescape(s string) string {
 }
 
 // davPropElement renders a property as a DAV element for a multistatus body:
-// svn:* props use the svn namespace, user props use the custom namespace with
-// the "custom:" name prefix that subversion expects.
+// svn:* props use the svn namespace, user props use the custom namespace.
+// A user property is sent under its own name when that is a valid XML NCName
+// (the client sends and expects <C:myprop>); names that cannot be an NCName
+// (a colon, space, ...) are escaped with the "custom:" prefix the client
+// strips back off.
 func davPropElement(key, value string) string {
 	if strings.HasPrefix(key, "svn:") {
 		local := strings.TrimPrefix(key, "svn:")
 		return "<" + local + ` xmlns="` + NS_SVN + `">` + xmlEscape(value) + "</" + local + ">"
 	}
-	return "<C:custom:" + key + ` xmlns:C="` + NS_CSVN + `">` + xmlEscape(value) + "</C:custom:" + key + ">"
+	name := davCustomName(key)
+	return "<custom:" + name + ` xmlns:custom="` + NS_CSVN + `">` + xmlEscape(value) + "</custom:" + name + ">"
 }
 
 // davPropNameTag renders just the property element name (for propnames).
@@ -340,8 +352,14 @@ func davPropNameTag(key string) string {
 		local := strings.TrimPrefix(key, "svn:")
 		return "<" + local + ` xmlns="` + NS_SVN + `"/>`
 	}
-	return "<C:custom:" + key + ` xmlns:C="` + NS_CSVN + `"/>`
+	return "<custom:" + davCustomName(key) + ` xmlns:custom="` + NS_CSVN + `"/>`
 }
+
+// davCustomName is the name used in the custom namespace. The client is
+// lenient about QNames (it sends <C:bugzilla:url> itself), and it matches the
+// property by the local name after the custom prefix, so the name is sent
+// verbatim; adding a second "custom:" prefix made svn propget miss it.
+func davCustomName(key string) string { return key }
 
 // davRevPropElement renders a revision property the way mod_dav_svn does:
 // svn:* props use the svn namespace, user props become <C:name> (the name may

@@ -1728,7 +1728,15 @@ func (r *Repo) applyChange(root *tnode, ch *Change) error {
 			cp.deltaDepth = 0
 		}
 		if len(ch.Props) > 0 {
-			cp.props = copyProps(ch.Props)
+			// ch.Props is the full map for a property change handled by the
+			// server, but a PROPPATCH that arrived before the COPY carries only
+			// the patched entries; merge so inherited props are not lost.
+			if cp.props == nil {
+				cp.props = map[string]string{}
+			}
+			for k, v := range ch.Props {
+				cp.props[k] = v
+			}
 		}
 		// copyfrom is the source as of the revision the client asked for
 		// (the COPY URL's peg). Resolving that revision gives the node svn

@@ -1,6 +1,9 @@
 package server
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParsePropertyUpdateCustomProp(t *testing.T) {
 	// subversion sends user properties as <C:custom:NAME>; the local name
@@ -53,5 +56,33 @@ func TestParsePropfindRequestCustomProps(t *testing.T) {
 	}
 	if !keys["myprop"] || !keys["getcontentlength"] {
 		t.Fatalf("parsed props = %v", keys)
+	}
+}
+
+func TestUserPropSerializationName(t *testing.T) {
+	if got := davPropElement("myprop", "v"); !strings.Contains(got, "<custom:myprop ") ||
+		!strings.Contains(got, "</custom:myprop>") {
+		t.Fatalf("plain user prop name not preserved: %s", got)
+	}
+	if got := davPropElement("bugzilla:url", "v"); !strings.Contains(got, "<custom:bugzilla:url ") {
+		t.Fatalf("colon name not preserved: %s", got)
+	}
+	if got := davPropNameTag("myprop"); !strings.Contains(got, "<custom:myprop ") {
+		t.Fatalf("propname tag not preserved: %s", got)
+	}
+}
+
+func TestParsePropertyUpdateRemoveWithAttributes(t *testing.T) {
+	// svn 1.14 sends removals as <C:name V:absent="1"></C:name>.
+	body := []byte(`<?xml version="1.0" encoding="utf-8"?>` +
+		`<D:propertyupdate xmlns:D="DAV:" xmlns:V="http://subversion.tigris.org/xmlns/dav/" ` +
+		`xmlns:C="http://subversion.tigris.org/xmlns/custom/">` +
+		`<D:remove><D:prop><C:delme V:absent="1"></C:delme></D:prop></D:remove></D:propertyupdate>`)
+	sets, removes := parsePropertyUpdate(body)
+	if len(sets) != 0 || len(removes) != 1 || removes[0].local != "delme" {
+		t.Fatalf("sets=%+v removes=%+v; want one remove of delme", sets, removes)
+	}
+	if removes[0].ns != NS_CSVN {
+		t.Fatalf("remove namespace = %q", removes[0].ns)
 	}
 }
