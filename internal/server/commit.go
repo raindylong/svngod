@@ -712,7 +712,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 				case errors.Is(cerr, errBodyTooLarge):
 					http.Error(w, cerr.Error(), http.StatusRequestEntityTooLarge)
 				case errors.Is(cerr, errChunkStore):
-					http.Error(w, cerr.Error(), http.StatusInternalServerError)
+					writePutStoreError(w, cerr)
 				default:
 					http.Error(w, "svndiff decode: "+cerr.Error(), http.StatusBadRequest)
 				}
@@ -825,7 +825,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 						f.Close()
 						os.Remove(outPath)
 						if cerr != nil {
-							http.Error(w, cerr.Error(), http.StatusInternalServerError)
+							writePutStoreError(w, cerr)
 							return
 						}
 						if !bytes.Equal(hCheck.Sum(nil), sum[:]) {
@@ -839,7 +839,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 					} else {
 						ref, refSize, xerr := storeText(outPath, sum)
 						if xerr != nil {
-							http.Error(w, xerr.Error(), http.StatusInternalServerError)
+							writePutStoreError(w, xerr)
 							return
 						}
 						dataTextRef, dataTextSize, dataSize = ref, uint64(refSize), refSize
@@ -873,7 +873,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 			f.Close()
 			os.Remove(bodyFile)
 			if cerr != nil {
-				http.Error(w, cerr.Error(), http.StatusInternalServerError)
+				writePutStoreError(w, cerr)
 				return
 			}
 			if !bytes.Equal(hCheck.Sum(nil), bodyMD5[:]) {
@@ -887,7 +887,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 		} else {
 			ref, size, xerr := storeText(bodyFile, bodyMD5)
 			if xerr != nil {
-				http.Error(w, xerr.Error(), http.StatusInternalServerError)
+				writePutStoreError(w, xerr)
 				return
 			}
 			dataTextRef, dataTextSize, dataSize = ref, uint64(size), size
@@ -1174,6 +1174,18 @@ func hashSource(src svndiff.SourceFunc, size int64) ([16]byte, error) {
 // client delta), so the handler can answer 500 instead of 400.
 var errChunkStore = errors.New("chunk store")
 
+// writePutStoreError reports a storage failure from a PUT. A mirror that is
+// behind the acknowledged head or lost quorum is transient (the upload can be
+// retried); only real failures are 500s.
+func writePutStoreError(w http.ResponseWriter, err error) {
+	if storageUnavailable(err) {
+		w.Header().Set("Retry-After", "2")
+		http.Error(w, "repository backend is catching up; retry the upload", http.StatusServiceUnavailable)
+		return
+	}
+	http.Error(w, err.Error(), http.StatusInternalServerError)
+}
+
 // decodeDeltaToChunks applies a svndiff stream and feeds the decoded text
 // directly into the chunker through a pipe. Nothing is written to a temp file
 // and the text is hashed once, as it is read.
@@ -1205,14 +1217,14 @@ func decodeDeltaToChunks(repo *fs.Repo, baseLen int64, baseSrc svndiff.SourceFun
 		pw.CloseWithError(derr)
 		r := <-done
 		if r.err != nil {
-			return nil, 0, sum, sha, fmt.Errorf("%w: %v", errChunkStore, r.err)
+			return nil, 0, sum, sha, fmt.Errorf("%w: %w", errChunkStore, r.err)
 		}
 		return nil, 0, sum, sha, derr
 	}
 	pw.Close()
 	r := <-done
 	if r.err != nil {
-		return nil, 0, sum, sha, fmt.Errorf("%w: %v", errChunkStore, r.err)
+		return nil, 0, sum, sha, fmt.Errorf("%w: %w", errChunkStore, r.err)
 	}
 	return r.manifest, r.total, r.sum, r.sha, nil
 }

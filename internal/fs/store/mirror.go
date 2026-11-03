@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -289,7 +290,34 @@ func NewMirror(mirrors []Store, opts ...MirrorOption) *MirrorStore {
 	// Align the mirrors before serving: a mirror that comes back after an
 	// outage may be missing objects or (worse) hold an older HEAD pointer, and
 	// electing it before it is caught up would hide committed revisions.
-	m.repairInternal()
+	// Probe first: a backend that cannot answer a trivial list within the
+	// startup budget must not hold every repository's initialization for a
+	// full repair timeout (with one S3 node down, a six-repo process used to
+	// take ~90s before listening). It is marked down and the recovery loop
+	// catches it up instead.
+	reachable := make([]bool, len(m.mirrors))
+	var probeWG sync.WaitGroup
+	for i, s := range m.mirrors {
+		probeWG.Add(1)
+		go func(i int, s Store) {
+			defer probeWG.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), startupProbeTimeout)
+			defer cancel()
+			_, _, err := s.ListPrefix(ctx, m.repoPrefix, "", 1)
+			reachable[i] = err == nil
+		}(i, s)
+	}
+	probeWG.Wait()
+	allReachable := true
+	for i := range m.mirrors {
+		if !reachable[i] {
+			allReachable = false
+			m.setHealthy(i, false)
+		}
+	}
+	if allReachable {
+		m.repairInternal()
+	}
 	go m.repairLoop()
 	go m.healthLoop()
 	if m.anyDown() {
@@ -631,6 +659,9 @@ func (m *MirrorStore) writePrimary(fn func(Store) error) (int, error) {
 // --- Store interface ---
 
 func (m *MirrorStore) Put(ctx context.Context, key string, data []byte) error {
+	if isRevisionKey(key) {
+		return m.putRevision(ctx, key, data)
+	}
 	pi, err := m.writePrimary(func(s Store) error { return s.Put(ctx, key, data) })
 	if err != nil {
 		return err
@@ -643,6 +674,68 @@ func (m *MirrorStore) Put(ctx context.Context, key string, data []byte) error {
 	}
 	// Best-effort mirror to healthy standbys.
 	m.mirrorWrites(ctx, pi, key, true, func(ctx context.Context, s Store) error { return s.Put(ctx, key, data) })
+	return nil
+}
+
+// isRevisionKey reports whether key names a revision (or its properties)
+// rather than content-addressed data. Two writers can produce different bytes
+// for the same revision number (node ids follow a walk order), so these keys
+// must be written to the same authoritative replica as the HEAD pointer and
+// must never be left divergent between replicas.
+func isRevisionKey(key string) bool {
+	for _, marker := range []string{"/revs-loose/", "/revs/", "/revprops-loose/", "/revprops/"} {
+		if strings.Contains(key, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// putRevision writes a revision object in configuration order, so a
+// two-node pair always has it on the arbiter (the replica that holds the
+// commit lease and the HEAD pointer) before any standby. A commit that cannot
+// reach the arbiter fails instead of publishing a revision only on a standby,
+// which used to let a retry write different bytes for the same revision on
+// each replica.
+func (m *MirrorStore) putRevision(ctx context.Context, key string, data []byte) error {
+	// A replica that missed commits must not publish, even when this process
+	// marked the arbiter down: the elected standby has to prove it reached
+	// the acknowledged HEAD first (the original fencing rule).
+	p, pi := m.primary()
+	if err := m.checkCaughtUp(p, pi); err != nil {
+		return err
+	}
+	arbiter := m.ArbiterRequired()
+	q := m.RegisterQuorum()
+	wrote := 0
+	for i, s := range m.mirrors {
+		if i == 0 {
+			if !arbiter && !m.isHealthy(0) {
+				continue
+			}
+		} else if !m.isHealthy(i) {
+			continue
+		}
+		c, cancel := context.WithTimeout(ctx, quorumWriteTimeout)
+		err := s.Put(c, key, data)
+		cancel()
+		if err != nil {
+			m.markDown(i)
+			m.noteError(i, err)
+			m.skipWrite(i, key)
+			if i == 0 && arbiter {
+				// The arbiter is authoritative for revisions; a standby copy
+				// alone must not become visible.
+				return fmt.Errorf("%w: arbiter unavailable: %v", ErrQuorumUnmet, err)
+			}
+			continue
+		}
+		m.noteWrite(i)
+		wrote++
+	}
+	if wrote < q {
+		return fmt.Errorf("%w: %d of %d copies (need %d)", ErrQuorumUnmet, wrote, len(m.mirrors), q)
+	}
 	return nil
 }
 
@@ -952,6 +1045,18 @@ func (m *MirrorStore) CreateIfAbsent(ctx context.Context, key string, data []byt
 }
 
 func (m *MirrorStore) CAS(ctx context.Context, key string, expectETag string, data []byte) (string, error) {
+	if key == m.controlName() {
+		// HEAD publication must agree with the commit lease: on a two-node
+		// pair the arbiter holds both, so a CAS based on a stale standby value
+		// is refused. The old "elected primary + unconditional mirror" path
+		// let a retry publish the same revision number on a different replica.
+		if err := m.CASQuorum(ctx, key, expectETag, data, m.RegisterQuorum()); err != nil {
+			return "", err
+		}
+		m.noteAcked(data)
+		m.mirrorWrites(ctx, 0, key, true, func(ctx context.Context, s Store) error { return s.Put(ctx, key, data) })
+		return ContentETag(data), nil
+	}
 	var newEtag string
 	pi, err := m.writePrimary(func(s Store) error {
 		var cerr error
@@ -960,9 +1065,6 @@ func (m *MirrorStore) CAS(ctx context.Context, key string, expectETag string, da
 	})
 	if err != nil {
 		return "", err
-	}
-	if key == m.controlName() {
-		m.noteAcked(data)
 	}
 	// Standbys mirror the current value unconditionally (their own etag does
 	// not matter; they only serve reads after failover).
@@ -1074,6 +1176,9 @@ func (m *MirrorStore) quorumMirror(ctx context.Context, pi, quorum int, key stri
 // them. Revision-property updates use it so two processes cannot leave the
 // replicas with different copies of the same mutable object.
 func (m *MirrorStore) PutAll(ctx context.Context, key string, data []byte) error {
+	if isRevisionKey(key) && m.ArbiterRequired() {
+		return m.putRevisionAll(ctx, key, data)
+	}
 	n := m.LiveCount()
 	if n <= 1 {
 		return m.Put(ctx, key, data)
@@ -1085,6 +1190,41 @@ func (m *MirrorStore) PutAll(ctx context.Context, key string, data []byte) error
 	return m.quorumMirror(ctx, pi, n, key, true, func(ctx context.Context, s Store) error {
 		return s.Put(ctx, key, data)
 	})
+}
+
+// putRevisionAll writes a revision object to the arbiter and every live
+// standby, requiring each of them. Revision-property updates use it so two
+// processes cannot leave the replicas with different bytes for the same
+// revision.
+func (m *MirrorStore) putRevisionAll(ctx context.Context, key string, data []byte) error {
+	p, pi := m.primary()
+	if err := m.checkCaughtUp(p, pi); err != nil {
+		return err
+	}
+	wrote := 0
+	for i, s := range m.mirrors {
+		if i != 0 && !m.isHealthy(i) {
+			continue
+		}
+		c, cancel := context.WithTimeout(ctx, quorumWriteTimeout)
+		err := s.Put(c, key, data)
+		cancel()
+		if err != nil {
+			m.markDown(i)
+			m.noteError(i, err)
+			m.skipWrite(i, key)
+			if i == 0 {
+				return fmt.Errorf("%w: arbiter unavailable: %v", ErrQuorumUnmet, err)
+			}
+			return err
+		}
+		m.noteWrite(i)
+		wrote++
+	}
+	if wrote == 0 {
+		return errors.New("mirror: no replica accepted the revision")
+	}
+	return nil
 }
 
 // QuorumGet returns the value held by the largest number of mirrors and that
@@ -1199,6 +1339,10 @@ const standbyWriteTimeout = 8 * time.Second
 const (
 	primaryReadTimeout = 60 * time.Second
 	standbyReadTimeout = 10 * time.Second
+	// startupProbeTimeout bounds the reachability check NewMirror runs before
+	// its blocking alignment pass. A down backend must delay startup by
+	// seconds, not by a full list/repair timeout.
+	startupProbeTimeout = 5 * time.Second
 )
 
 // mirrorWrites fans a standby write out to every healthy mirror in parallel:
@@ -1248,6 +1392,13 @@ func (m *MirrorStore) mirrorWrites(ctx context.Context, pi int, key string, trac
 // huge texts are left to the streaming repair pass.
 func (m *MirrorStore) repairKey(src int, key string) {
 	const maxRepairObject = 16 << 20
+	if isRevisionKey(key) || isControlKey(key) {
+		// Only content-addressed objects may be repaired from any replica.
+		// A revision-numbered object on a standby can be an orphan from a
+		// failed attempt, and copying it onto the arbiter would publish the
+		// wrong revision. Ordered revision writes and copyKeyTo handle those.
+		return
+	}
 	m.mu.Lock()
 	if m.repairing[key] {
 		m.mu.Unlock()
@@ -1388,6 +1539,42 @@ var errRepairKeyGone = errors.New("repair: object was deleted")
 func (m *MirrorStore) copyKeyTo(dst int, key string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	// Revision-numbered objects can differ in bytes between replicas when a
+	// failed attempt left an orphan block and a later commit reused the
+	// number. Such a key must be overwritten (not treated as "already
+	// present"), but only in the direction arbiter -> standby: the arbiter is
+	// the authoritative publisher.
+	overwrite := isRevisionKey(key) || key == m.controlName()
+	arbiter := m.ArbiterRequired()
+	if overwrite {
+		// Publish the authoritative copy: the arbiter for a pair, the value
+		// held by a quorum for 3+. Never overwrite the arbiter from a standby.
+		if arbiter && dst == 0 {
+			return nil
+		}
+		var b []byte
+		var gerr error
+		if arbiter {
+			b, gerr = m.mirrors[0].Get(ctx, key, nil)
+		} else {
+			var n int
+			b, n, gerr = m.QuorumGet(ctx, key)
+			if gerr == nil && n < m.RegisterQuorum() {
+				return nil // no authoritative value to publish
+			}
+		}
+		if errors.Is(gerr, ErrNotFound) {
+			return nil // the destination copy is an orphan; nothing to publish
+		}
+		if gerr != nil {
+			return gerr
+		}
+		if perr := m.mirrors[dst].Put(ctx, key, b); perr != nil {
+			return perr
+		}
+		m.noteWrite(dst)
+		return nil
+	}
 	if _, ok, err := m.mirrors[dst].Head(ctx, key); err == nil && ok {
 		return nil // already present (for example copied by a read repair)
 	}
@@ -1775,6 +1962,12 @@ func (m *MirrorStore) repairInternal() {
 			m.reconcileMutable(ctx, k, sets, reachable)
 		}
 	}
+	// Revision blocks are numbered, not content-addressed: a failed attempt
+	// can leave bytes that differ from the later successful commit under the
+	// same number. The copy workers only fill missing keys, so reconcile the
+	// recent tail (where an outage can leave such an orphan) and any key whose
+	// listed size already differs.
+	m.reconcileRevisions(keys, sets, reachable)
 
 	// Copy immutable objects with a bounded worker pool. A serial loop was the
 	// recovery bottleneck: a 27-revision outage at 800k objects left ~50k
@@ -1855,6 +2048,101 @@ send:
 // serial loop was the recovery bottleneck (48s for a 27-revision outage at
 // 800k objects); objects are immutable, so copies can run in parallel.
 const repairCopyConcurrency = 12
+
+// revisionNumber returns the revision encoded in a revision key's last path
+// segment (0 when it is not a plain number, e.g. a packed shard name).
+func revisionNumber(key string) uint64 {
+	i := strings.LastIndexByte(key, '/')
+	if i < 0 || i+1 >= len(key) {
+		return 0
+	}
+	n, err := strconv.ParseUint(key[i+1:], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// reconcileRevisions rewrites numbered revision objects that differ from the
+// authoritative copy. Comparing every revision byte-for-byte on every repair
+// would re-read the whole history, so only the recent tail (where an outage
+// can leave an orphan block) and keys whose listed sizes already differ are
+// checked. For a two-node pair the arbiter's bytes win; with three or more the
+// value held by a quorum wins, and a replica is never overwritten when no
+// authoritative copy exists.
+func (m *MirrorStore) reconcileRevisions(keys map[string]bool, sets []map[string]int64, reachable []bool) {
+	const recentWindow = 200
+	var maxRev uint64
+	for k := range keys {
+		if isRevisionKey(k) {
+			if n := revisionNumber(k); n > maxRev {
+				maxRev = n
+			}
+		}
+	}
+	arbiter := m.ArbiterRequired()
+	for k := range keys {
+		if !isRevisionKey(k) {
+			continue
+		}
+		copies := 0
+		sizeDiff := false
+		var size int64 = -1
+		for i := range sets {
+			if !reachable[i] {
+				continue
+			}
+			s, ok := sets[i][k]
+			if !ok {
+				continue
+			}
+			copies++
+			if size < 0 {
+				size = s
+			} else if s != size {
+				sizeDiff = true
+			}
+		}
+		if copies < 2 {
+			continue // a missing copy is the copy workers' job
+		}
+		recent := maxRev > 0 && revisionNumber(k)+recentWindow >= maxRev
+		if !recent && !sizeDiff {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		var want []byte
+		var err error
+		if arbiter {
+			if !reachable[0] {
+				cancel()
+				continue
+			}
+			want, err = m.mirrors[0].Get(ctx, k, nil)
+		} else {
+			var n int
+			want, n, err = m.QuorumGet(ctx, k)
+			if err == nil && n < m.RegisterQuorum() {
+				err = ErrQuorumUnmet
+			}
+		}
+		if err != nil {
+			cancel()
+			continue
+		}
+		for i := range m.mirrors {
+			if !reachable[i] || (arbiter && i == 0) {
+				continue
+			}
+			if perr := m.mirrors[i].Put(ctx, k, want); perr != nil {
+				log.Printf("mirror[%d] revision reconcile %s: %v", i, k, perr)
+				continue
+			}
+			m.noteWrite(i)
+		}
+		cancel()
+	}
+}
 
 // repairStreamThreshold keeps large objects out of the workers' heap: above
 // this size a copy streams through a temp file instead of buffering the whole

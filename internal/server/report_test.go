@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
+	"io"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -506,5 +508,68 @@ func TestReportUpdateSubdirTargetBaseline(t *testing.T) {
 	out := doReport(t, base, body)
 	if strings.Contains(out, `name="README.txt"`) {
 		t.Fatalf("file already at the target revision was sent again:\n%s", out)
+	}
+}
+
+// TestReportFetchURLUsesModificationRev covers a copy that was edited later:
+// the update report must point the client at a revision that holds the current
+// text. It used to point at the copy revision, so a fresh export received the
+// copy source's bytes and the client reported a checksum mismatch.
+func TestReportFetchURLUsesModificationRev(t *testing.T) {
+	ts, repo, base := testServer(t, "", "")
+	defer ts.Close()
+	props := func(msg string) map[string]string {
+		return map[string]string{"svn:log": msg, "svn:author": "u", "svn:date": "2026-01-01T00:00:00Z"}
+	}
+	if _, err := repo.CommitTxn(1, []fs.Change{{
+		Path: "/trunk/copied.txt", Action: fs.ActionCopy, Kind: fs.KindFile,
+		CopyFromPath: "/trunk/README.txt", CopyFromRev: 1,
+	}}, props("copy")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.CommitTxn(2, []fs.Change{{
+		Path: "/trunk/copied.txt", Action: fs.ActionModify, Kind: fs.KindFile,
+		Data: []byte("changed after copy\n"),
+	}}, props("edit")); err != nil {
+		t.Fatal(err)
+	}
+	body := `<?xml version="1.0" encoding="utf-8"?>` +
+		`<S:update-report xmlns:S="http://subversion.tigris.org/xmlns/dav/" xmlns:V="DAV:">` +
+		`<S:src-path>` + base + `/svn/demo/</S:src-path>` +
+		`<S:recurse>yes</S:recurse>` +
+		`<S:target-revision>3</S:target-revision>` +
+		`<S:update-target rev="0"/>` +
+		`<S:ignore-ancestry>no</S:ignore-ancestry>` +
+		`<S:text-deltas>yes</S:text-deltas>` +
+		`</S:update-report>`
+	out := doReport(t, base, body)
+
+	i := strings.Index(out, `add-file name="copied.txt"`)
+	if i < 0 {
+		t.Fatalf("copied.txt missing from update report:\n%s", out)
+	}
+	rest := out[i:]
+	j := strings.Index(rest, `!svn/rvr/`)
+	if j < 0 {
+		t.Fatalf("no rvr URL for copied.txt:\n%s", rest[:400])
+	}
+	href := rest[j:]
+	revEnd := strings.IndexByte(href[len("!svn/rvr/"):], '/')
+	gotRev := href[len("!svn/rvr/") : len("!svn/rvr/")+revEnd]
+	if gotRev != "3" {
+		t.Fatalf("copied.txt fetch rev=%s, want 3 (copy was edited at r3)", gotRev)
+	}
+	// The advertised URL must actually serve the edited text.
+	k := strings.Index(rest, "http")
+	urlEnd := strings.Index(rest[k:], "</D:href>")
+	url := rest[k : k+urlEnd]
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if string(b) != "changed after copy\n" {
+		t.Fatalf("fetch URL content=%q", b)
 	}
 }

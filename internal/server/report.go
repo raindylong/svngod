@@ -383,14 +383,19 @@ func writeEntryProps(b *strings.Builder, rp *fs.RevProps, uuid string, rev uint6
 }
 
 // pathCreatedRev is the revision in which a node appeared at its current path:
-// the copy root's revision for copied nodes (their node-rev id points at the
-// source and would produce an rvr URL that does not contain the new path),
-// else the node revision.
+// the copy root's revision for a node that is still inherited unchanged from
+// the copy (its node-rev id predates the new path, so an rvr URL at that
+// revision would not contain the path), else the node's own revision.
+//
+// A copied node that was edited afterwards keeps the copy metadata in every
+// later node-rev, but its own revision is both at the new path and carries the
+// current text. Returning the copy revision there made a checkout/update fetch
+// the copy source's bytes and fail with a checksum mismatch.
 func pathCreatedRev(repo *fs.Repo, nr *fs.NodeRev) uint64 {
 	if nr == nil {
 		return 0
 	}
-	if cr, _, _, ok := copyOrigin(repo, nr); ok {
+	if cr, _, _, ok := copyOrigin(repo, nr); ok && cr > nr.Node.Rev {
 		return cr
 	}
 	return nr.Node.Rev

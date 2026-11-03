@@ -351,9 +351,25 @@ func (r *Repo) setHead(rev uint64) {
 
 func (r *Repo) readCurrent() (*Current, string, error) {
 	ctx := context.Background()
-	// A single GET is enough: a missing object reports ErrNotFound. The extra
-	// HEAD doubled the request count for every Head()/commit on S3.
-	b, err := r.store.Get(ctx, r.keys.Current(), nil)
+	key := r.keys.Current()
+	var b []byte
+	var err error
+	// The commit lease and the HEAD pointer are authoritative on the arbiter
+	// of a two-node pair. A standby that missed a publication used to make a
+	// retry believe HEAD was older and republish the same revision number on
+	// the other replica; reading the arbiter first closes that split. When it
+	// cannot answer, fall back to the normal read path: commits still fail at
+	// the lease (which requires the arbiter), so a stale answer cannot publish
+	// anything.
+	if ar, ok := r.store.(store.ArbiterReader); ok && ar.ArbiterRequired() {
+		b, err = ar.ArbiterGet(ctx, key)
+		if err != nil {
+			b = nil
+		}
+	}
+	if b == nil {
+		b, err = r.store.Get(ctx, key, nil)
+	}
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, "", errors.New("fs: repository not initialized (missing current)")
