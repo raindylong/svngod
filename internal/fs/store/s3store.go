@@ -95,7 +95,12 @@ func NewS3Store(cfg S3Config) (*S3Store, error) {
 		}
 	}
 	if !exists {
-		if err := cl.MakeBucket(ctx, cfg.Bucket, minio.MakeBucketOptions{Region: cfg.Region}); err != nil {
+		// BucketExists already canceled its context; creating the bucket needs
+		// a live one. Using the canceled ctx made the first create on a fresh
+		// node fail with "context canceled".
+		mctx, mcancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer mcancel()
+		if err := cl.MakeBucket(mctx, cfg.Bucket, minio.MakeBucketOptions{Region: cfg.Region}); err != nil {
 			return nil, fmt.Errorf("store: create bucket %s: %w", cfg.Bucket, err)
 		}
 	}
@@ -458,7 +463,7 @@ func (s *S3Store) listPrefixOnce(ctx context.Context, prefix, continuation strin
 			return nil, "", obj.Err
 		}
 		rel := strings.TrimPrefix(obj.Key, s.prefix+"/")
-		out = append(out, ListedObj{Key: rel, Size: obj.Size})
+		out = append(out, ListedObj{Key: rel, Size: obj.Size, ModTime: obj.LastModified})
 	}
 	var next string
 	if len(out) > max {

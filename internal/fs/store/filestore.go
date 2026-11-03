@@ -541,7 +541,7 @@ func (s *FileStore) ListPrefix(_ context.Context, prefix, continuation string, m
 		if err != nil {
 			return nil
 		}
-		out = append(out, ListedObj{Key: filepath.ToSlash(rel), Size: fi.Size()})
+		out = append(out, ListedObj{Key: filepath.ToSlash(rel), Size: fi.Size(), ModTime: fi.ModTime()})
 		return nil
 	})
 	if err != nil {

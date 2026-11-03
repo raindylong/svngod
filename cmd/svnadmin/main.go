@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"svngod/internal/cdc"
 	"svngod/internal/dump"
@@ -48,6 +49,7 @@ type options struct {
 	toRev           uint64
 	journalLimit    int
 	keepJournal     uint64
+	gcGrace         int
 	chunkAvg        uint64
 	dirBuckets      bool
 	migrateDirs     string
@@ -200,6 +202,7 @@ func main() {
 	}
 	if cmd == "gc" {
 		fs.Uint64Var(&o.keepJournal, "keep-journal", 4096, "number of recent WAL records to keep")
+		fs.IntVar(&o.gcGrace, "gc-grace", 3600, "seconds an unreferenced text/chunk must be old before collection (0 disables)")
 	}
 	shardSize := uint64(defaultShardSize)
 	maxDelta := uint64(defaultMaxDelta)
@@ -381,11 +384,11 @@ func doGC(o *options, repoName string) {
 	if err != nil {
 		fatal(err)
 	}
-	tn, err := repo.CollectTxnData(context.Background())
+	tn, err := repo.CollectTxnDataGrace(context.Background(), time.Duration(o.gcGrace)*time.Second)
 	if err != nil {
 		fatal(err)
 	}
-	tx, err := repo.CollectTexts(context.Background())
+	tx, err := repo.CollectTextsGrace(context.Background(), time.Duration(o.gcGrace)*time.Second)
 	if err != nil {
 		fatal(err)
 	}

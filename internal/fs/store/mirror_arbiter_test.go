@@ -30,6 +30,44 @@ func (s *regFailStore) CAS(ctx context.Context, key, expect string, data []byte)
 	return s.Store.CAS(ctx, key, expect, data)
 }
 
+// TestMajorityQuorumIntersects: with three nodes a strict majority is enough,
+// so one node outage keeps commits possible, while two writers with different
+// health views still cannot both hold the lease.
+func TestMajorityQuorumIntersects(t *testing.T) {
+	ctx := context.Background()
+	a, b, c := NewMemoryStore(), NewMemoryStore(), NewMemoryStore()
+	m1 := NewMirror([]Store{a, b, c})
+	defer m1.Close()
+	m2 := NewMirror([]Store{a, b, c})
+	defer m2.Close()
+	if got := m1.RegisterQuorum(); got != 2 {
+		t.Fatalf("RegisterQuorum(3) = %d, want 2", got)
+	}
+	// One node down: a majority still exists.
+	m1.mu.Lock()
+	m1.healthy[2] = false
+	m1.mu.Unlock()
+	key := "repos/x/locks/commit"
+	if err := m1.CreateIfAbsentQuorum(ctx, key, []byte("owner1 1"), 2); err != nil {
+		t.Fatalf("create with 2/3 nodes: %v", err)
+	}
+	// The second writer sees a different node down. Its majority must overlap
+	// the first writer's, so it cannot acquire a second lease.
+	m2.mu.Lock()
+	m2.healthy[0] = false
+	m2.mu.Unlock()
+	if err := m2.CreateIfAbsentQuorum(ctx, key, []byte("owner2 2"), 2); !errors.Is(err, ErrPreconditionFailed) {
+		t.Fatalf("second lease = %v, want ErrPreconditionFailed", err)
+	}
+	// Two nodes down leaves no majority.
+	m2.mu.Lock()
+	m2.healthy[1] = false
+	m2.mu.Unlock()
+	if err := m2.CreateIfAbsentQuorum(ctx, "repos/x/locks/other", []byte("x"), 2); !errors.Is(err, ErrQuorumUnmet) {
+		t.Fatalf("create with 1/3 nodes = %v, want ErrQuorumUnmet", err)
+	}
+}
+
 // TestLeaseRegisterUsesArbiter pins the split-lease fix: two processes with
 // different health views must still contend on the configured first mirror.
 // Skipping a "down" arbiter let each process create a lease on a different

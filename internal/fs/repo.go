@@ -927,6 +927,24 @@ func (r *Repo) ListDir(rev uint64, path string) ([]NodeInfo, error) {
 
 // --- commit ---
 
+// ensureNoPendingPublication refuses to assign head+1 while a WAL record for
+// that revision is visible. Such a record means a commit may have been
+// acknowledged but not rolled forward (one of its quorum copies is on an
+// unavailable replica); reusing the number would overwrite it.
+func (r *Repo) ensureNoPendingPublication(head uint64) error {
+	if !r.journal {
+		return nil
+	}
+	_, err := r.store.Get(context.Background(), r.keys.Journal(head+1), nil)
+	if err == nil {
+		return fmt.Errorf("%w: revision %d is pending in the WAL", store.ErrReplicaLagging, head+1)
+	}
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	return err
+}
+
 // CommitTxn applies the changes as a single new revision and returns its number.
 func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]string) (uint64, error) {
 	r.mu.Lock()
@@ -953,6 +971,13 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 	cur, etag, err := r.readCurrent()
 	if err != nil {
 		return 0, err
+	}
+	// Never assign head+1 while a WAL record for that revision is visible: a
+	// commit may have been acknowledged but not rolled forward because one of
+	// its quorum copies is unavailable. Reusing the number would overwrite a
+	// different revision's data (the split-lease class of failure).
+	if perr := r.ensureNoPendingPublication(cur.Head); perr != nil {
+		return 0, perr
 	}
 	// Optimistic concurrency control: the client commits against a base
 	// revision. If the repository head has moved past it (another writer won
@@ -1878,14 +1903,19 @@ func (r *Repo) CollectLoose(ctx context.Context) (int, error) {
 }
 
 // CollectTxnData deletes content-addressed commit-session bodies that no
-// activity manifest references any more (aborted or finished commits leave
-// them behind because bodies are shared by hash). Manifests are scanned with
-// a small regexp so this layer does not depend on the server's JSON schema.
+// activity manifest references any more, with no grace period.
 func (r *Repo) CollectTxnData(ctx context.Context) (int, error) {
+	return r.CollectTxnDataGrace(ctx, 0)
+}
+
+// CollectTxnDataGrace is CollectTxnData with a minimum object age. A fragment
+// body is written before the manifest that references it is updated, so a GC
+// pass racing a native commit could otherwise delete a live body.
+func (r *Repo) CollectTxnDataGrace(ctx context.Context, grace time.Duration) (int, error) {
 	prefix := r.keys.Prefix + "/dav-txns/"
 	refRe := regexp.MustCompile(`"dataRef":"([0-9a-f]+)"`)
 	referenced := map[string]bool{}
-	var dataKeys []string
+	var dataKeys []store.ListedObj
 	next := ""
 	for {
 		objs, n, err := r.store.ListPrefix(ctx, prefix, next, 500)
@@ -1895,7 +1925,7 @@ func (r *Repo) CollectTxnData(ctx context.Context) (int, error) {
 		for _, o := range objs {
 			rel := strings.TrimPrefix(o.Key, prefix)
 			if strings.HasPrefix(rel, "data/") {
-				dataKeys = append(dataKeys, o.Key)
+				dataKeys = append(dataKeys, o)
 				continue
 			}
 			if !strings.HasSuffix(rel, ".json") {
@@ -1916,9 +1946,12 @@ func (r *Repo) CollectTxnData(ctx context.Context) (int, error) {
 	}
 	var victims []string
 	for _, k := range dataKeys {
-		ref := strings.TrimPrefix(k, prefix+"data/")
+		ref := strings.TrimPrefix(k.Key, prefix+"data/")
 		if !referenced[ref] {
-			victims = append(victims, k)
+			if tooYoung(k, grace) {
+				continue
+			}
+			victims = append(victims, k.Key)
 		}
 	}
 	if len(victims) == 0 {
@@ -1930,11 +1963,24 @@ func (r *Repo) CollectTxnData(ctx context.Context) (int, error) {
 	return len(victims), nil
 }
 
-// CollectTexts deletes external text objects that no node-rev references.
-// Every historical revision is scanned (a text removed from HEAD but present
-// in older revisions must be kept), so this is an offline maintenance pass:
-// run it while the repository is idle.
+// tooYoung reports whether an un-referenced object is too new to collect. A
+// zero ModTime means the backend cannot report age; those objects are treated
+// as old so tests and stores without metadata keep deterministic behaviour.
+func tooYoung(o store.ListedObj, grace time.Duration) bool {
+	return grace > 0 && !o.ModTime.IsZero() && time.Since(o.ModTime) < grace
+}
+
+// CollectTexts deletes external text objects that no node-rev references,
+// with no grace period (tests and an explicit offline pass).
 func (r *Repo) CollectTexts(ctx context.Context) (int, error) {
+	return r.CollectTextsGrace(ctx, 0)
+}
+
+// CollectTextsGrace is CollectTexts with a minimum object age. An upload
+// writes its texts and chunks before the commit that references them, so a
+// GC pass racing an upload would otherwise delete live data. Objects younger
+// than grace are left for the next pass.
+func (r *Repo) CollectTextsGrace(ctx context.Context, grace time.Duration) (int, error) {
 	head, err := r.Head()
 	if err != nil {
 		return 0, err
@@ -1992,6 +2038,9 @@ func (r *Repo) CollectTexts(ctx context.Context) (int, error) {
 		for _, o := range objs {
 			ref := strings.TrimPrefix(o.Key, prefix)
 			if !refs[ref] {
+				if tooYoung(o, grace) {
+					continue
+				}
 				victims = append(victims, o.Key)
 			}
 		}
@@ -2010,6 +2059,9 @@ func (r *Repo) CollectTexts(ctx context.Context) (int, error) {
 		for _, o := range objs {
 			ref := strings.TrimPrefix(o.Key, chunkPrefix)
 			if !chunkRefs[ref] {
+				if tooYoung(o, grace) {
+					continue
+				}
 				victims = append(victims, o.Key)
 			}
 		}
@@ -2029,6 +2081,9 @@ func (r *Repo) CollectTexts(ctx context.Context) (int, error) {
 			for _, o := range objs {
 				ref := strings.TrimPrefix(o.Key, dirPrefix)
 				if !dirRefs[ref] {
+					if tooYoung(o, grace) {
+						continue
+					}
 					victims = append(victims, o.Key)
 				}
 			}

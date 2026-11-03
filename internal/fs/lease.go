@@ -88,6 +88,13 @@ func (l *commitLease) effectiveQuorum() int {
 	if !l.dynamic {
 		return l.quorum
 	}
+	// Two-node pair: one arbiter copy is safe. Three or more: strict majority,
+	// so any two writers' quorums intersect.
+	if rq, ok := l.qr.(interface{ RegisterQuorum() int }); ok {
+		if n := rq.RegisterQuorum(); n > 0 {
+			return n
+		}
+	}
 	if lc, ok := l.qr.(interface{ LiveCount() int }); ok {
 		if n := lc.LiveCount(); n > 0 {
 			return n
@@ -100,12 +107,13 @@ func (l *commitLease) payload() []byte {
 	return []byte(fmt.Sprintf("%s %d", l.token, time.Now().UnixNano()))
 }
 
-// readOwn returns the current lease payload. Lease state is authoritative on
-// the arbiter mirror; reading another replica after a failover could confirm a
-// stale lease (two processes once held "the" lease on different mirrors).
+// readOwn returns the current lease payload. With a two-node pair lease state
+// is authoritative on the arbiter mirror; reading another replica after a
+// failover could confirm a stale lease. With three or more nodes the lease is
+// held on a majority, and QuorumGet already requires that many copies.
 func (l *commitLease) readOwn(ctx context.Context, st store.Store) ([]byte, error) {
 	if l.useQuorum() {
-		if ar, ok := l.qr.(store.ArbiterReader); ok {
+		if ar, ok := l.qr.(store.ArbiterReader); ok && ar.ArbiterRequired() {
 			return ar.ArbiterGet(ctx, l.key)
 		}
 		b, count, err := l.qr.QuorumGet(ctx, l.key)
@@ -223,6 +231,11 @@ func (r *Repo) effectiveQuorum() int {
 	if r.writeQuorum > 1 {
 		return r.writeQuorum
 	}
+	if rq, ok := r.store.(interface{ RegisterQuorum() int }); ok {
+		if n := rq.RegisterQuorum(); n > 0 {
+			return n
+		}
+	}
 	if lc, ok := r.store.(interface{ LiveCount() int }); ok {
 		if n := lc.LiveCount(); n > 0 {
 			return n
@@ -238,10 +251,11 @@ func (r *Repo) createLease(ctx context.Context, key string, payload []byte) erro
 	return r.store.CreateIfAbsent(ctx, key, payload)
 }
 
-// readLease returns the lease payload from the arbiter (or the single store).
+// readLease returns the lease payload from the arbiter (two-node pair) or the
+// largest copy held by a majority (three or more nodes).
 func (r *Repo) readLease(ctx context.Context, key string) ([]byte, bool) {
-	if qr, ok := r.store.(store.ArbiterReader); ok {
-		b, err := qr.ArbiterGet(ctx, key)
+	if ar, ok := r.store.(store.ArbiterReader); ok && ar.ArbiterRequired() {
+		b, err := ar.ArbiterGet(ctx, key)
 		return b, err == nil
 	}
 	if qr, ok := r.store.(store.QuorumRegister); ok {

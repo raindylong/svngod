@@ -185,6 +185,30 @@ func WithWriteQuorum(n int) MirrorOption {
 // WriteQuorum reports the configured number of copies (0 = best effort).
 func (m *MirrorStore) WriteQuorum() int { return m.writeQuorum }
 
+// RegisterQuorum returns the number of copies a commit-lease operation must
+// reach. A two-node pair uses the arbiter rule (one copy on the configured
+// first mirror is safe because a second writer cannot commit without that
+// mirror). Three or more nodes require a strict majority, so any two writers'
+// quorums intersect and cannot both hold the lease.
+func (m *MirrorStore) RegisterQuorum() int {
+	m.mu.Lock()
+	n := len(m.mirrors)
+	m.mu.Unlock()
+	if n <= 2 {
+		return 1
+	}
+	return n/2 + 1
+}
+
+// ArbiterRequired reports whether register operations must always target the
+// configured first mirror. Only the two-node pair needs that rule; with a
+// majority quorum a health-view difference cannot produce two disjoint sets.
+func (m *MirrorStore) ArbiterRequired() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.mirrors) <= 2
+}
+
 // Journaling reports that commits should be described by a WAL record. The
 // record is written even in availability mode (single-copy ack): it is what
 // lets a restarted/rejoined replica reconcile HEAD instead of trusting a stale
@@ -2037,14 +2061,18 @@ func (m *MirrorStore) CreateIfAbsentQuorum(ctx context.Context, key string, data
 			cancel()
 		}
 	}
+	arbiter := m.ArbiterRequired()
 	for i, s := range m.mirrors {
-		// The first mirror is the arbiter: it is always attempted, even when
-		// this process marked it down. Skipping it made two processes with
-		// different health views create leases on different mirrors and both
-		// publish the same revision (observed as two rev 1419 records).
-		if i > 0 && !m.isHealthy(i) {
-			// An out-of-service replica cannot contribute to the quorum and
-			// must not add its timeout to every lease operation.
+		// Two-node pair: the first mirror is the arbiter and is always
+		// attempted, even when this process marked it down (skipping it once
+		// let two processes create leases on different mirrors and publish the
+		// same revision). Three or more nodes use a majority quorum instead;
+		// any two majorities intersect, so unhealthy nodes may be skipped.
+		if i == 0 {
+			if !arbiter && !m.isHealthy(0) {
+				continue
+			}
+		} else if !m.isHealthy(i) {
 			continue
 		}
 		c, cancel := context.WithTimeout(ctx, quorumRegisterTimeout)
@@ -2063,9 +2091,9 @@ func (m *MirrorStore) CreateIfAbsentQuorum(ctx context.Context, key string, data
 		default:
 			m.markDown(i)
 			m.noteError(i, err)
-			if i == 0 {
-				// Lease state is only authoritative on the arbiter; using the
-				// standby would reopen the split-lease window.
+			if i == 0 && arbiter {
+				// Lease state is only authoritative on the arbiter; using
+				// another replica would reopen the split-lease window.
 				rollback()
 				return fmt.Errorf("%w: arbiter unavailable: %v", ErrQuorumUnmet, err)
 			}
@@ -2091,9 +2119,13 @@ func (m *MirrorStore) CASQuorum(ctx context.Context, key, expect string, data []
 			cancel()
 		}
 	}
+	arbiter := m.ArbiterRequired()
 	for i, s := range m.mirrors {
-		// Arbiter first, always (see CreateIfAbsentQuorum).
-		if i > 0 && !m.isHealthy(i) {
+		if i == 0 {
+			if !arbiter && !m.isHealthy(0) {
+				continue
+			}
+		} else if !m.isHealthy(i) {
 			continue
 		}
 		c, cancel := context.WithTimeout(ctx, quorumRegisterTimeout)
@@ -2112,7 +2144,7 @@ func (m *MirrorStore) CASQuorum(ctx context.Context, key, expect string, data []
 		default:
 			m.markDown(i)
 			m.noteError(i, err)
-			if i == 0 {
+			if i == 0 && arbiter {
 				rollback()
 				return fmt.Errorf("%w: arbiter unavailable: %v", ErrQuorumUnmet, err)
 			}
@@ -2129,10 +2161,13 @@ func (m *MirrorStore) CASQuorum(ctx context.Context, key, expect string, data []
 // successes (an already-gone replica counts as released).
 func (m *MirrorStore) DeleteIfMatchQuorum(ctx context.Context, key, etag string, quorum int) error {
 	ok := 0
+	arbiter := m.ArbiterRequired()
 	for i, s := range m.mirrors {
-		// Arbiter first, always: a release must be decided on the node that
-		// authoritatively holds the lease.
-		if i > 0 && !m.isHealthy(i) {
+		if i == 0 {
+			if !arbiter && !m.isHealthy(0) {
+				continue
+			}
+		} else if !m.isHealthy(i) {
 			continue
 		}
 		c, cancel := context.WithTimeout(ctx, quorumRegisterTimeout)
@@ -2148,7 +2183,7 @@ func (m *MirrorStore) DeleteIfMatchQuorum(ctx context.Context, key, etag string,
 		default:
 			m.markDown(i)
 			m.noteError(i, err)
-			if i == 0 {
+			if i == 0 && arbiter {
 				return fmt.Errorf("%w: arbiter unavailable: %v", ErrQuorumUnmet, err)
 			}
 		}

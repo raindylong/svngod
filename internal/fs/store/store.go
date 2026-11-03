@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ErrNotFound is returned for reads of a missing object.
@@ -99,6 +100,9 @@ type RepairingGetter interface {
 // different mirrors during a node kill and both committed the same revision.
 type ArbiterReader interface {
 	ArbiterGet(ctx context.Context, key string) ([]byte, error)
+	// ArbiterRequired reports whether the store still needs the single-arbiter
+	// rule (a two-node pair). A majority quorum (three or more nodes) does not.
+	ArbiterRequired() bool
 }
 
 // QuorumRegister is implemented by stores that can run a small register's
@@ -188,8 +192,9 @@ type PrefixDeleter interface {
 
 // ListedObj is one object returned by ListPrefix.
 type ListedObj struct {
-	Key  string
-	Size int64
+	Key     string
+	Size    int64
+	ModTime time.Time // zero when the backend cannot report it
 }
 
 // Store is the object-storage abstraction. All objects are treated as
@@ -395,7 +400,7 @@ func (m *MemoryStore) ListPrefix(_ context.Context, prefix, continuation string,
 func (m *MemoryStore) toListed(keys []string) []ListedObj {
 	out := make([]ListedObj, 0, len(keys))
 	for _, k := range keys {
-		out = append(out, ListedObj{Key: k, Size: int64(len(m.data[k]))})
+		out = append(out, ListedObj{Key: k, Size: int64(len(m.data[k])), ModTime: time.Now()})
 	}
 	return out
 }
