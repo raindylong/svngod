@@ -30,6 +30,52 @@ func (s *regFailStore) CAS(ctx context.Context, key, expect string, data []byte)
 	return s.Store.CAS(ctx, key, expect, data)
 }
 
+// getFailStore models a replica that accepts connections but cannot serve a
+// read (for example a paused process).
+type getFailStore struct {
+	Store
+	fail atomic.Bool
+}
+
+func (s *getFailStore) Get(ctx context.Context, key string, rng *Range) ([]byte, error) {
+	if s.fail.Load() {
+		return nil, errors.New("store: no answer")
+	}
+	return s.Store.Get(ctx, key, rng)
+}
+
+// TestCopyKeyToMissingIsGoneDespiteDownPeer: a pending key that no reachable
+// replica holds must be dropped even if another replica is unreachable;
+// otherwise one down node blocks the recovery of a different replica forever.
+func TestCopyKeyToMissingIsGoneDespiteDownPeer(t *testing.T) {
+	a := NewMemoryStore()
+	b := NewMemoryStore()
+	c := &getFailStore{Store: NewMemoryStore()}
+	m := NewMirror([]Store{a, b, c})
+	defer m.Close()
+	c.fail.Store(true)
+	err := m.copyKeyTo(1, "repos/x/texts/absent")
+	if !errors.Is(err, errRepairKeyGone) {
+		t.Fatalf("copyKeyTo = %v, want errRepairKeyGone", err)
+	}
+}
+
+// TestCopyKeyToUnknownWhenAllSourcesFail: with no reachable source at all the
+// key is not declared gone (we cannot know whether it still exists).
+func TestCopyKeyToUnknownWhenAllSourcesFail(t *testing.T) {
+	a := &getFailStore{Store: NewMemoryStore()}
+	b := NewMemoryStore()
+	c := &getFailStore{Store: NewMemoryStore()}
+	m := NewMirror([]Store{a, b, c})
+	defer m.Close()
+	a.fail.Store(true)
+	c.fail.Store(true)
+	err := m.copyKeyTo(1, "repos/x/texts/unknown")
+	if err == nil || errors.Is(err, errRepairKeyGone) {
+		t.Fatalf("copyKeyTo = %v, want a transport error", err)
+	}
+}
+
 // TestMajorityQuorumIntersects: with three nodes a strict majority is enough,
 // so one node outage keeps commits possible, while two writers with different
 // health views still cannot both hold the lease.

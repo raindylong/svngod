@@ -1363,7 +1363,7 @@ func (m *MirrorStore) copyKeyTo(dst int, key string) error {
 		return nil // already present (for example copied by a read repair)
 	}
 	var last error
-	seen := 0
+	seen, missing := 0, 0
 	for idx, src := range m.mirrors {
 		if idx == dst {
 			continue
@@ -1371,7 +1371,9 @@ func (m *MirrorStore) copyKeyTo(dst int, key string) error {
 		seen++
 		b, err := src.Get(ctx, key, &Range{Offset: 0, Length: repairStreamThreshold + 1})
 		if err != nil {
-			if !errors.Is(err, ErrNotFound) {
+			if errors.Is(err, ErrNotFound) {
+				missing++
+			} else {
 				last = err
 			}
 			continue
@@ -1381,6 +1383,13 @@ func (m *MirrorStore) copyKeyTo(dst int, key string) error {
 		}
 		// The probe read a truncated object: stream the whole one.
 		return m.copyFullStream(ctx, src, dst, key)
+	}
+	// A reachable replica that does not hold the key means it was deleted (or
+	// never quorum-published): an unreachable third replica must not keep this
+	// key in pending forever, which used to block recovery whenever one node
+	// was down.
+	if missing > 0 {
+		return errRepairKeyGone
 	}
 	if last != nil {
 		return last

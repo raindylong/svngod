@@ -382,11 +382,13 @@ func (r *Repo) isPacked(shard uint64) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	var b byte
+	// Cache only the positive result: a shard never becomes loose again, but
+	// another process can pack a shard at any time. Caching "not packed" left
+	// revprop updates writing to the loose copy after a concurrent pack, so
+	// the update was silently invisible to readers.
 	if exists {
-		b = 1
+		r.cache.Put(k, []byte{1})
 	}
-	r.cache.Put(k, []byte{b})
 	return exists, nil
 }
 
@@ -1352,7 +1354,7 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 	// repository at ~O(shards) loose objects instead of O(revisions) — required
 	// to scale to millions of revisions.
 	if N > 0 && N%r.shardSz == 0 {
-		if err := r.PackShard(r.shard(N) - 1); err != nil {
+		if err := r.packShardLocked(r.shard(N) - 1); err != nil {
 			return N, err
 		}
 	}
@@ -1779,6 +1781,21 @@ var _ = strings.TrimSpace
 // packed via the .done marker. Reads before .done still use loose objects;
 // loose objects become unreachable after the marker and are GC's later.
 func (r *Repo) PackShard(shard uint64) error {
+	// Packing moves revprops from loose objects into the shard pack. Serialise
+	// with commits and revprop updates: a concurrent update that saw "loose"
+	// would write the object the pack is about to replace, and its change would
+	// be invisible afterwards.
+	lease, lerr := r.acquireCommitLease(context.Background())
+	if lerr != nil {
+		return lerr
+	}
+	defer lease.Release(r.store)
+	return r.packShardLocked(shard)
+}
+
+// packShardLocked is PackShard for callers that already hold the commit lease
+// (CommitTxn auto-packs a completed shard while still holding it).
+func (r *Repo) packShardLocked(shard uint64) error {
 	ctx := context.Background()
 	// Repacking an already packed shard would rewrite its revprops pack from
 	// the loose copies, discarding a revprop change made while packed. Packing
