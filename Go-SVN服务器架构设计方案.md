@@ -237,7 +237,7 @@
 
 测试基线：chaos1m 仓库，4 个 svngod 进程（18600–18603）+ 主备 RustFS（19111/19112，主备模式、无仲裁），逐文件 MD5 对账、双副本 `svnadmin verify`、逐修订 revblock SHA 跨副本比较。覆盖 UTF-8 树：中文/繁體/日本語/한국어/emoji 目录，`# ? % &`、空格、全角括号、中文+ASCII 混合文件名，以及空目录。
 
-**发现并修复的 4 个协议缺陷**
+**发现并修复的 5 个缺陷（4 个服务端协议缺陷 + 1 个客户端上传缺陷）**
 
 1. **COPY 源 `!svn/rvr/<rev>` 返回 400**（`internal/server/dav.go`）：`svn mv`/`svn cp` 的 COPY 源是 `!svn/rvr/<peg>`，解析为 `resRev`，但 `handleCopyMove` 只接受 `resBaseline/resBaselineColl/resTxn`，落入 default → 400。现将 `resRev`、`resVersion` 与 baseline 同视为版本化源。
 2. **复制后修改的文件 PUT 解码失败**（`internal/server/commit.go`）：`svn mv` 一个已修改文件时，COPY 把源文本放进事务，随后 PUT 的 svndiff 相对**复制源**、且不带 `X-SVN-Version-Name`；原实现按空 base 解码 → `source window out of bounds` → 400。现以事务内该路径的 copyFrom（或同事务复制的内存字节）作为 delta base，并对其校验 `X-SVN-Base-Fulltext-MD5`。
