@@ -100,24 +100,31 @@ func (l *commitLease) payload() []byte {
 	return []byte(fmt.Sprintf("%s %d", l.token, time.Now().UnixNano()))
 }
 
+// readOwn returns the current lease payload. Lease state is authoritative on
+// the arbiter mirror; reading another replica after a failover could confirm a
+// stale lease (two processes once held "the" lease on different mirrors).
+func (l *commitLease) readOwn(ctx context.Context, st store.Store) ([]byte, error) {
+	if l.useQuorum() {
+		if ar, ok := l.qr.(store.ArbiterReader); ok {
+			return ar.ArbiterGet(ctx, l.key)
+		}
+		b, count, err := l.qr.QuorumGet(ctx, l.key)
+		if err != nil || count < l.effectiveQuorum() {
+			return nil, ErrLeaseLost
+		}
+		return b, nil
+	}
+	return st.Get(ctx, l.key, nil)
+}
+
 // Verify fails once the lease was lost (expired, broken, or replaced).
 func (l *commitLease) Verify(ctx context.Context, st store.Store) error {
 	if l.lost.Load() {
 		return ErrLeaseLost
 	}
-	var cur []byte
-	if l.useQuorum() {
-		b, count, err := l.qr.QuorumGet(ctx, l.key)
-		if err != nil || count < l.effectiveQuorum() {
-			return ErrLeaseLost
-		}
-		cur = b
-	} else {
-		b, err := st.Get(ctx, l.key, nil)
-		if err != nil {
-			return ErrLeaseLost
-		}
-		cur = b
+	cur, err := l.readOwn(ctx, st)
+	if err != nil {
+		return ErrLeaseLost
 	}
 	if !strings.HasPrefix(string(cur), l.token+" ") {
 		return ErrLeaseLost
@@ -148,30 +155,18 @@ func (l *commitLease) keepAlive(ctx context.Context, st store.Store) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			var cur []byte
+			cur, err := l.readOwn(ctx, st)
+			if err != nil || !strings.HasPrefix(string(cur), l.token+" ") {
+				l.lost.Store(true)
+				return
+			}
 			if l.useQuorum() {
-				b, count, err := l.qr.QuorumGet(ctx, l.key)
-				if err != nil || count < l.effectiveQuorum() {
-					l.lost.Store(true)
-					return
-				}
-				cur = b
-				if !strings.HasPrefix(string(cur), l.token+" ") {
-					l.lost.Store(true)
-					return
-				}
 				if err := l.qr.CASQuorum(ctx, l.key, store.ContentETag(cur), l.payload(), l.effectiveQuorum()); err != nil {
 					l.lost.Store(true)
 					return
 				}
 				continue
 			}
-			b, err := st.Get(ctx, l.key, nil)
-			if err != nil || !strings.HasPrefix(string(b), l.token+" ") {
-				l.lost.Store(true)
-				return
-			}
-			cur = b
 			// CAS keeps the same owner while refreshing the timestamp.
 			if _, err := st.CAS(ctx, l.key, store.ContentETag(cur), l.payload()); err != nil {
 				l.lost.Store(true)
@@ -243,8 +238,12 @@ func (r *Repo) createLease(ctx context.Context, key string, payload []byte) erro
 	return r.store.CreateIfAbsent(ctx, key, payload)
 }
 
-// readLease returns the lease payload held by a quorum (or the single store).
+// readLease returns the lease payload from the arbiter (or the single store).
 func (r *Repo) readLease(ctx context.Context, key string) ([]byte, bool) {
+	if qr, ok := r.store.(store.ArbiterReader); ok {
+		b, err := qr.ArbiterGet(ctx, key)
+		return b, err == nil
+	}
 	if qr, ok := r.store.(store.QuorumRegister); ok {
 		b, count, err := qr.QuorumGet(ctx, key)
 		return b, err == nil && count >= 1
@@ -262,8 +261,12 @@ func (r *Repo) breakCommitLease(ctx context.Context, key, token string) {
 	marker := key + ".break"
 	payload := []byte(fmt.Sprintf("%s %d", token, time.Now().UnixNano()))
 	created := false
-	if qr, ok := r.store.(store.QuorumRegister); ok && r.writeQuorum > 1 {
-		created = qr.CreateIfAbsentQuorum(ctx, marker, payload, r.writeQuorum) == nil
+	if qr, ok := r.store.(store.QuorumRegister); ok {
+		q := r.writeQuorum
+		if q < 1 {
+			q = r.effectiveQuorum()
+		}
+		created = qr.CreateIfAbsentQuorum(ctx, marker, payload, q) == nil
 	} else {
 		created = r.store.CreateIfAbsent(ctx, marker, payload) == nil
 	}

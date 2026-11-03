@@ -158,6 +158,27 @@ type chunkStream struct {
 	buf  bytes.Buffer
 }
 
+func chunkValid(b []byte, ref cdc.Ref) bool {
+	return uint32(len(b)) == ref.Size && sha256.Sum256(b) == ref.Hash
+}
+
+// repairChunk asks a multi-copy store for a valid copy of a corrupt chunk and
+// lets it overwrite the bad replicas (chunk keys are content addressed).
+func (r *Repo) repairChunk(ref cdc.Ref) []byte {
+	rg, ok := r.store.(store.RepairingGetter)
+	if !ok {
+		return nil
+	}
+	want := ref
+	b, err := rg.GetRepairing(context.Background(), r.chunkKey(ref), func(cand []byte) bool {
+		return chunkValid(cand, want)
+	})
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
 func (c *chunkStream) Read(p []byte) (int, error) {
 	for c.buf.Len() == 0 {
 		if c.idx >= len(c.refs) {
@@ -168,6 +189,11 @@ func (c *chunkStream) Read(p []byte) (int, error) {
 		b, err := c.repo.store.Get(context.Background(), c.repo.chunkKey(ref), nil)
 		if err != nil {
 			return 0, err
+		}
+		if !chunkValid(b, ref) {
+			if fixed := c.repo.repairChunk(ref); fixed != nil {
+				b = fixed
+			}
 		}
 		if uint32(len(b)) != ref.Size {
 			return 0, fmt.Errorf("fs: chunk %s size %d, want %d", cdc.HashHex(ref), len(b), ref.Size)

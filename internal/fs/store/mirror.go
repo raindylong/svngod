@@ -1070,6 +1070,65 @@ func (m *MirrorStore) QuorumGet(ctx context.Context, key string) ([]byte, int, e
 	return best.val, best.n, nil
 }
 
+// ArbiterGet reads key from the configured first mirror. Lease state lives
+// there even when the replica is marked down: another process may still be
+// using it as its arbiter, and failing over to another node for register
+// operations would let both hold a lease and publish the same revision.
+func (m *MirrorStore) ArbiterGet(ctx context.Context, key string) ([]byte, error) {
+	m.mu.Lock()
+	a := m.mirrors[0]
+	m.mu.Unlock()
+	return a.Get(ctx, key, nil)
+}
+
+// GetRepairing returns the first replica copy of key that passes verify and
+// overwrites the corrupt copies it observed. Used when a read fails its
+// content checksum: without this a single bit flip on one replica stayed
+// forever and a failover turned it into an unreadable revision.
+func (m *MirrorStore) GetRepairing(ctx context.Context, key string, verify func([]byte) bool) ([]byte, error) {
+	m.mu.Lock()
+	mirrors := append([]Store(nil), m.mirrors...)
+	healthy := append([]bool(nil), m.healthy...)
+	m.mu.Unlock()
+	var bad []int
+	var lastErr error
+	for i, s := range mirrors {
+		if !healthy[i] {
+			continue
+		}
+		c, cancel := context.WithTimeout(ctx, standbyReadTimeout)
+		b, err := s.Get(c, key, nil)
+		cancel()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if verify != nil && !verify(b) {
+			bad = append(bad, i)
+			lastErr = fmt.Errorf("store: replica %d holds an invalid %q", i, key)
+			continue
+		}
+		for _, j := range bad {
+			wc, wcancel := context.WithTimeout(context.Background(), standbyWriteTimeout)
+			err := mirrors[j].Put(wc, key, b)
+			wcancel()
+			if err == nil {
+				m.noteWrite(j)
+			} else {
+				m.noteError(j, err)
+			}
+		}
+		if len(bad) > 0 {
+			log.Printf("store: healed %q from replica %d (%d corrupt copies)", key, i, len(bad))
+		}
+		return b, nil
+	}
+	if lastErr == nil {
+		lastErr = ErrNotFound
+	}
+	return nil, lastErr
+}
+
 // quorumReadTimeout bounds one replica read in QuorumGet. It is shorter than
 // the write budget because a read has no durable side effect and a slow
 // replica can be excluded from the count instead of holding the request.
@@ -1979,11 +2038,13 @@ func (m *MirrorStore) CreateIfAbsentQuorum(ctx context.Context, key string, data
 		}
 	}
 	for i, s := range m.mirrors {
-		if !m.isHealthy(i) {
+		// The first mirror is the arbiter: it is always attempted, even when
+		// this process marked it down. Skipping it made two processes with
+		// different health views create leases on different mirrors and both
+		// publish the same revision (observed as two rev 1419 records).
+		if i > 0 && !m.isHealthy(i) {
 			// An out-of-service replica cannot contribute to the quorum and
-			// must not add its timeout to every lease operation (a paused
-			// process accepted the request but never answered; each attempt
-			// cost the full write budget and lost the lease mid-commit).
+			// must not add its timeout to every lease operation.
 			continue
 		}
 		c, cancel := context.WithTimeout(ctx, quorumRegisterTimeout)
@@ -2002,6 +2063,12 @@ func (m *MirrorStore) CreateIfAbsentQuorum(ctx context.Context, key string, data
 		default:
 			m.markDown(i)
 			m.noteError(i, err)
+			if i == 0 {
+				// Lease state is only authoritative on the arbiter; using the
+				// standby would reopen the split-lease window.
+				rollback()
+				return fmt.Errorf("%w: arbiter unavailable: %v", ErrQuorumUnmet, err)
+			}
 		}
 	}
 	if len(created) < quorum {
@@ -2025,7 +2092,8 @@ func (m *MirrorStore) CASQuorum(ctx context.Context, key, expect string, data []
 		}
 	}
 	for i, s := range m.mirrors {
-		if !m.isHealthy(i) {
+		// Arbiter first, always (see CreateIfAbsentQuorum).
+		if i > 0 && !m.isHealthy(i) {
 			continue
 		}
 		c, cancel := context.WithTimeout(ctx, quorumRegisterTimeout)
@@ -2044,6 +2112,10 @@ func (m *MirrorStore) CASQuorum(ctx context.Context, key, expect string, data []
 		default:
 			m.markDown(i)
 			m.noteError(i, err)
+			if i == 0 {
+				rollback()
+				return fmt.Errorf("%w: arbiter unavailable: %v", ErrQuorumUnmet, err)
+			}
 		}
 	}
 	if len(done) < quorum {
@@ -2058,7 +2130,9 @@ func (m *MirrorStore) CASQuorum(ctx context.Context, key, expect string, data []
 func (m *MirrorStore) DeleteIfMatchQuorum(ctx context.Context, key, etag string, quorum int) error {
 	ok := 0
 	for i, s := range m.mirrors {
-		if !m.isHealthy(i) {
+		// Arbiter first, always: a release must be decided on the node that
+		// authoritatively holds the lease.
+		if i > 0 && !m.isHealthy(i) {
 			continue
 		}
 		c, cancel := context.WithTimeout(ctx, quorumRegisterTimeout)
@@ -2074,6 +2148,9 @@ func (m *MirrorStore) DeleteIfMatchQuorum(ctx context.Context, key, etag string,
 		default:
 			m.markDown(i)
 			m.noteError(i, err)
+			if i == 0 {
+				return fmt.Errorf("%w: arbiter unavailable: %v", ErrQuorumUnmet, err)
+			}
 		}
 	}
 	if ok < quorum {

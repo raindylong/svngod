@@ -613,8 +613,7 @@ func (r *Repo) StreamText(id NodeID, w io.Writer) (uint64, error) {
 	}
 	switch nr.TextRep {
 	case TextRepExternal:
-		n, serr := r.store.GetTo(context.Background(), r.keys.Text(nr.TextRef), w)
-		return uint64(n), serr
+		return r.streamExternalText(nr, w)
 	case TextRepDelta:
 		if nr.Base == nil {
 			return 0, errors.New("fs: delta node missing base")
@@ -642,6 +641,49 @@ func (r *Repo) StreamText(id NodeID, w io.Writer) (uint64, error) {
 		n, werr := w.Write(nr.Text)
 		return uint64(n), werr
 	}
+}
+
+// externalStreamVerifyLimit: up to this size an external text is loaded,
+// verified (and repaired) in memory before any byte reaches the client.
+// Larger texts are spooled to a temp file first, so a corrupted replica can
+// never stream bad bytes to a client.
+const externalStreamVerifyLimit = 32 << 20
+
+// streamExternalText sends an external text after verifying its checksum,
+// repairing a corrupt replica from a healthy copy when possible.
+func (r *Repo) streamExternalText(nr *NodeRev, w io.Writer) (uint64, error) {
+	if nr.TextSize <= externalStreamVerifyLimit {
+		b, err := r.GetText(nr.Node)
+		if err != nil {
+			return 0, err
+		}
+		n, werr := w.Write(b)
+		return uint64(n), werr
+	}
+	f, err := os.CreateTemp("", "svngod-stream-")
+	if err != nil {
+		return 0, err
+	}
+	name := f.Name()
+	defer os.Remove(name)
+	defer f.Close()
+	h := md5.New()
+	n, gerr := r.store.GetTo(context.Background(), r.keys.Text(nr.TextRef), io.MultiWriter(f, h))
+	if gerr == nil && uint64(n) == nr.TextSize && bytes.Equal(h.Sum(nil), nr.TextMD5[:]) {
+		if _, serr := f.Seek(0, io.SeekStart); serr != nil {
+			return 0, serr
+		}
+		m, cerr := io.Copy(w, f)
+		return uint64(m), cerr
+	}
+	// The primary copy is corrupt. Fetch a verified copy (this also heals the
+	// bad replicas) and send that instead.
+	b := r.repairExternalText(nr)
+	if b == nil {
+		return 0, errors.New("fs: external text checksum mismatch")
+	}
+	m, werr := w.Write(b)
+	return uint64(m), werr
 }
 
 // countWriter counts bytes written through it.
@@ -736,6 +778,11 @@ func (r *Repo) GetText(id NodeID) ([]byte, error) {
 		if gerr != nil {
 			return nil, gerr
 		}
+		if uint64(len(b)) != nr.TextSize || md5.Sum(b) != nr.TextMD5 {
+			if fixed := r.repairExternalText(nr); fixed != nil {
+				b = fixed
+			}
+		}
 		if uint64(len(b)) != nr.TextSize {
 			return nil, errors.New("fs: external text size mismatch")
 		}
@@ -774,6 +821,24 @@ func (r *Repo) GetText(id NodeID) ([]byte, error) {
 		cachePut(r.cache, k, text)
 	}
 	return text, nil
+}
+
+// repairExternalText asks a multi-copy store for a valid copy of an external
+// text object and lets it overwrite corrupt replicas. Returns nil when the
+// store cannot repair (single copy) or no valid copy exists.
+func (r *Repo) repairExternalText(nr *NodeRev) []byte {
+	rg, ok := r.store.(store.RepairingGetter)
+	if !ok {
+		return nil
+	}
+	want := nr.TextMD5
+	b, err := rg.GetRepairing(context.Background(), r.keys.Text(nr.TextRef), func(cand []byte) bool {
+		return uint64(len(cand)) == nr.TextSize && md5.Sum(cand) == want
+	})
+	if err != nil {
+		return nil
+	}
+	return b
 }
 
 // --- tree resolution ---

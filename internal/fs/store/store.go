@@ -83,6 +83,24 @@ type QuorumGetter interface {
 	QuorumGet(ctx context.Context, key string) ([]byte, int, error)
 }
 
+// RepairingGetter is implemented by stores that hold more than one copy of an
+// immutable object. When a read fails its content checksum, the caller asks
+// the store to find a valid copy on another replica, overwrite the corrupt
+// ones and return the good bytes. Keys are content addressed, so a copy that
+// fails verification can be replaced unconditionally.
+type RepairingGetter interface {
+	GetRepairing(ctx context.Context, key string, verify func([]byte) bool) ([]byte, error)
+}
+
+// ArbiterReader reads a register value from the configured arbiter replica
+// (the first mirror in configuration order). Commit leases use it so a
+// process whose health view differs from its peer cannot act on a lease copy
+// held by a non-arbiter replica -- two processes once created leases on
+// different mirrors during a node kill and both committed the same revision.
+type ArbiterReader interface {
+	ArbiterGet(ctx context.Context, key string) ([]byte, error)
+}
+
 // QuorumRegister is implemented by stores that can run a small register's
 // operations on a majority of replicas. Commit leases use it so two svngod
 // processes electing different mirror nodes cannot both hold the lease.
