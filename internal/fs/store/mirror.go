@@ -99,6 +99,15 @@ type MirrorStore struct {
 	// fast recovery, so a path that bypassed pending accounting is still caught.
 	wholeAtDown []bool
 	verify      []bool
+
+	// repairOwner identifies this process in the cross-process repair lease,
+	// so only one svngod instance runs the expensive full listing at a time.
+	repairOwner string
+
+	// lazy makes NewMirror return immediately and lets the leased background
+	// repair catch up. The server enables it; tests and custom stores keep the
+	// deterministic blocking alignment.
+	lazy bool
 }
 
 // ReplicaStatus is a snapshot of one mirror's health.
@@ -176,6 +185,14 @@ func WithMutableOrder(fn func(key string, a, b []byte) int) MirrorOption {
 // same bucket or local directory.
 func WithRepoPrefix(prefix string) MirrorOption {
 	return func(m *MirrorStore) { m.repoPrefix = strings.Trim(prefix, "/") }
+}
+
+// WithLazyRepair makes NewMirror return without a blocking alignment pass; a
+// leased background repair catches up. The server uses it so a restart does
+// not wait for a full object scan (and so four processes do not each scan the
+// bucket). Tests leave it off for deterministic construction.
+func WithLazyRepair() MirrorOption {
+	return func(m *MirrorStore) { m.lazy = true }
 }
 
 // WithWriteQuorum requires every write to reach n copies before it returns.
@@ -280,6 +297,7 @@ func NewMirror(mirrors []Store, opts ...MirrorOption) *MirrorStore {
 		prim:            0,
 		stop:            make(chan struct{}),
 		done:            make(chan struct{}),
+		repairOwner:     fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano()),
 	}
 	for i := range m.healthy {
 		m.healthy[i] = true
@@ -287,36 +305,39 @@ func NewMirror(mirrors []Store, opts ...MirrorOption) *MirrorStore {
 	for _, opt := range opts {
 		opt(m)
 	}
-	// Align the mirrors before serving: a mirror that comes back after an
-	// outage may be missing objects or (worse) hold an older HEAD pointer, and
-	// electing it before it is caught up would hide committed revisions.
-	// Probe first: a backend that cannot answer a trivial list within the
-	// startup budget must not hold every repository's initialization for a
-	// full repair timeout (with one S3 node down, a six-repo process used to
-	// take ~90s before listening). It is marked down and the recovery loop
-	// catches it up instead.
-	reachable := make([]bool, len(m.mirrors))
-	var probeWG sync.WaitGroup
-	for i, s := range m.mirrors {
-		probeWG.Add(1)
-		go func(i int, s Store) {
-			defer probeWG.Done()
-			ctx, cancel := context.WithTimeout(context.Background(), startupProbeTimeout)
-			defer cancel()
-			_, _, err := s.ListPrefix(ctx, m.repoPrefix, "", 1)
-			reachable[i] = err == nil
-		}(i, s)
-	}
-	probeWG.Wait()
-	allReachable := true
-	for i := range m.mirrors {
-		if !reachable[i] {
-			allReachable = false
-			m.setHealthy(i, false)
+	// A real repository serves immediately. Alignment is the repair loop's
+	// job: it runs in the background under a cross-process lease, so four
+	// svngod instances no longer each block startup on a full scan (and no
+	// longer hammer S3 with four simultaneous listings). Reads prefer the
+	// primary; writes are fenced until a failover target has caught up, so
+	// serving before alignment cannot publish a stale revision.
+	//
+	// Unit-test/custom stores (no repository prefix) keep the deterministic
+	// blocking alignment they assert: a test sees a fully replicated store as
+	// soon as NewMirror returns.
+	if !m.lazy {
+		reachable := make([]bool, len(m.mirrors))
+		var probeWG sync.WaitGroup
+		for i, s := range m.mirrors {
+			probeWG.Add(1)
+			go func(i int, s Store) {
+				defer probeWG.Done()
+				ctx, cancel := context.WithTimeout(context.Background(), startupProbeTimeout)
+				defer cancel()
+				_, _, err := s.ListPrefix(ctx, m.repoPrefix, "", 1)
+				reachable[i] = err == nil
+			}(i, s)
 		}
-	}
-	if allReachable {
-		m.repairInternal()
+		probeWG.Wait()
+		allReachable := true
+		for i := range m.mirrors {
+			if !reachable[i] {
+				allReachable = false
+			}
+		}
+		if allReachable {
+			m.repairInternal()
+		}
 	}
 	go m.repairLoop()
 	go m.healthLoop()
@@ -325,6 +346,9 @@ func NewMirror(mirrors []Store, opts ...MirrorOption) *MirrorStore {
 		m.recovering = true
 		m.mu.Unlock()
 		go m.recoveryLoop()
+	}
+	if m.lazy {
+		go m.repair()
 	}
 	return m
 }
@@ -376,9 +400,20 @@ func (m *MirrorStore) setHealthy(i int, ok bool) {
 	if !ok {
 		m.repairable = true
 	}
+	// A repair pass can be the first to notice that a mirror is unreachable
+	// (lazy startup has no blocking probe). Without starting the recovery loop
+	// here, the health loop skips the now-unhealthy mirror and nothing ever
+	// re-admits it -- the standby stayed down until another process healed it.
+	needRecovery := !ok && was && !m.recovering
+	if needRecovery {
+		m.recovering = true
+	}
 	m.mu.Unlock()
 	if was != ok {
 		log.Printf("mirror[%d] healthy=%v (head caught up: %v)", i, ok, ok)
+	}
+	if needRecovery {
+		go m.recoveryLoop()
 	}
 }
 
@@ -432,14 +467,18 @@ func (m *MirrorStore) skipWrite(i int, key string) {
 	m.mu.Unlock()
 }
 
-// primary returns the current primary store. The elected mirror stays primary
-// while it is healthy, so a mirror that just finished catching up never starts
-// serving ahead of the one that has been taking writes.
+// primary returns the current primary store. The canonical arbiter (mirror 0)
+// is preferred whenever it is healthy: it holds the commit lease and the HEAD
+// pointer, and revision writes target it first. Keeping a standby elected
+// after a transient primary timeout left write leadership on mirror 1, so
+// killing that standby fenced every commit even though mirror 0 was healthy.
+// A returning arbiter is only marked healthy after recovery has caught it up.
 func (m *MirrorStore) primary() (Store, int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.healthy[m.prim] {
-		return m.mirrors[m.prim], m.prim
+	if m.healthy[0] {
+		m.prim = 0
+		return m.mirrors[0], 0
 	}
 	for i, h := range m.healthy {
 		if h {
@@ -503,6 +542,22 @@ func (m *MirrorStore) SetControlKey(key string) {
 	m.mu.Unlock()
 	if key == "" {
 		return
+	}
+	// For a two-node pair the arbiter (mirror 0) is authoritative: every
+	// commit publishes the revision and the HEAD pointer there first, so its
+	// current value is safe to adopt even when the standby is unreachable.
+	// The old majority rule fenced a cold start with the standby down, which
+	// turned a routine restart into a commit outage. With three or more nodes
+	// (or when the arbiter itself is unreachable) fall back to the majority
+	// agreement below.
+	if m.ArbiterRequired() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		b, err := m.mirrors[0].Get(ctx, key, nil)
+		cancel()
+		if err == nil {
+			m.noteAcked(b)
+			return
+		}
 	}
 	// Adopt the HEAD only when a majority of replicas agree. A cold start
 	// while too few mirrors are reachable cannot know the true acknowledged
@@ -1862,7 +1917,157 @@ func (m *MirrorStore) repair() {
 		return
 	}
 	defer m.repairOnce.Unlock()
+	ctx := context.Background()
+	if !m.acquireRepairLease(ctx) {
+		return
+	}
+	// Renew while the pass runs: a full scan of a large repository can exceed
+	// the TTL, and a killed holder must block recovery for at most one TTL.
+	stopRenew := make(chan struct{})
+	go m.renewRepairLease(stopRenew)
 	m.repairInternal()
+	close(stopRenew)
+	m.releaseRepairLease(context.Background())
+}
+
+// repairLeaseTTL bounds how long one process may hold the repair lease. It is
+// short on purpose: a crashed or paused process leaves the lease behind, and
+// every other instance skips repair until it expires. The holder renews every
+// 30s, so a healthy long pass keeps the lease while recovery is never delayed
+// by more than this window.
+const repairLeaseTTL = 60 * time.Second
+
+// renewRepairLease extends the lease while repairInternal runs.
+func (m *MirrorStore) renewRepairLease(stop <-chan struct{}) {
+	t := time.NewTicker(20 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-m.stop:
+			return
+		case <-t.C:
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			m.renewRepairLeaseOnce(ctx)
+			cancel()
+		}
+	}
+}
+
+// renewRepairLeaseOnce replaces the lease only if this process still owns it.
+func (m *MirrorStore) renewRepairLeaseOnce(ctx context.Context) bool {
+	key := m.repairLeaseKey()
+	payload := []byte(fmt.Sprintf("%s %d", m.repairOwner, time.Now().Add(repairLeaseTTL).UnixNano()))
+	for i := range m.mirrors {
+		if !m.isHealthy(i) {
+			continue
+		}
+		cur, err := m.mirrors[i].Get(ctx, key, nil)
+		if err != nil {
+			continue
+		}
+		if !strings.HasPrefix(string(cur), m.repairOwner+" ") {
+			return false
+		}
+		_, err = m.mirrors[i].CAS(ctx, key, ContentETag(cur), payload)
+		return err == nil
+	}
+	return false
+}
+
+// repairLeaseKey names the cross-process repair lease. It lives outside the
+// repository prefix so full repair listings never treat it as repository
+// data.
+func (m *MirrorStore) repairLeaseKey() string {
+	prefix := strings.Trim(m.repoPrefix, "/")
+	if prefix == "" {
+		prefix = "default"
+	}
+	return "repair-leases/" + prefix
+}
+
+// acquireRepairLease lets one process perform the expensive full repair at a
+// time. Without it, every svngod instance sharing the store ran its own full
+// listing and reconciliation pass after a failover -- four simultaneous scans
+// of the same bucket, which is what pushed RustFS into list timeouts. The
+// lease is best effort: if no replica accepts it, the caller repairs anyway;
+// duplicated work is safe, only slower.
+func (m *MirrorStore) acquireRepairLease(ctx context.Context) bool {
+	if !m.lazy || strings.Trim(m.repoPrefix, "/") == "" {
+		// Test/custom stores have no repository namespace to scope the lease;
+		// keep their single-process behaviour and do not inject a lease object
+		// into a whole-store listing.
+		return true
+	}
+	key := m.repairLeaseKey()
+	payload := []byte(fmt.Sprintf("%s %d", m.repairOwner, time.Now().Add(repairLeaseTTL).UnixNano()))
+	_, pi := m.primary()
+	candidates := []int{pi}
+	for i := range m.mirrors {
+		if i != pi && m.isHealthy(i) {
+			candidates = append(candidates, i)
+		}
+	}
+	for _, i := range candidates {
+		c, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err := m.mirrors[i].CreateIfAbsent(c, key, payload)
+		cancel()
+		if err == nil {
+			return true
+		}
+		if !errors.Is(err, ErrPreconditionFailed) {
+			continue
+		}
+		// A lease exists. Take it over only when its deadline has passed.
+		c, cancel = context.WithTimeout(ctx, 5*time.Second)
+		cur, gerr := m.mirrors[i].Get(c, key, nil)
+		cancel()
+		if gerr != nil {
+			return false
+		}
+		fields := strings.Fields(string(cur))
+		if len(fields) != 2 {
+			return false
+		}
+		var deadline int64
+		if _, perr := fmt.Sscanf(fields[1], "%d", &deadline); perr != nil {
+			return false
+		}
+		if deadline > time.Now().UnixNano() {
+			return false
+		}
+		c, cancel = context.WithTimeout(ctx, 5*time.Second)
+		_, cerr := m.mirrors[i].CAS(c, key, ContentETag(cur), payload)
+		cancel()
+		return cerr == nil
+	}
+	// No replica accepted the lease (backend unreachable): allow the pass. It
+	// will hit the same backend anyway, and duplicate repair is harmless.
+	return true
+}
+
+// releaseRepairLease removes the lease only when this process still owns it,
+// so a timed-out holder cannot delete a lease another process just took.
+func (m *MirrorStore) releaseRepairLease(ctx context.Context) {
+	if !m.lazy || strings.Trim(m.repoPrefix, "/") == "" {
+		return
+	}
+	key := m.repairLeaseKey()
+	for i := range m.mirrors {
+		if !m.isHealthy(i) {
+			continue
+		}
+		c, cancel := context.WithTimeout(ctx, 5*time.Second)
+		cur, err := m.mirrors[i].Get(c, key, nil)
+		cancel()
+		if err != nil || !strings.HasPrefix(string(cur), m.repairOwner+" ") {
+			continue
+		}
+		c, cancel = context.WithTimeout(ctx, 5*time.Second)
+		_ = DeleteIfMatch(c, m.mirrors[i], key, ContentETag(cur))
+		cancel()
+	}
 }
 
 // upToDate reports whether every mirror is in service and already holds the
@@ -1920,9 +2125,17 @@ func (m *MirrorStore) repairInternal() {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			ctx, cancel := context.WithTimeout(context.Background(), repairListTimeout)
+			// A mirror already marked down was failing probes; give it a short
+			// list budget so the pass (and its repair lease) is not held for the
+			// full large-repository timeout when it is still unreachable. A
+			// backend that just came back answers within seconds.
+			timeout := repairListTimeout
+			if !m.isHealthy(i) {
+				timeout = 5 * time.Second
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
-			ks, err := listAll(ctx, m.mirrors[i], m.repoPrefix)
+			ks, err := listRepairObjects(ctx, m.mirrors[i], m.repoPrefix)
 			if err != nil {
 				log.Printf("mirror[%d] unreachable during repair: %v", i, err)
 				return
@@ -2347,6 +2560,54 @@ const repairCopyTimeout = 10 * time.Minute
 // from the primary (the only mutable object today is the HEAD `current`).
 func isMutableKey(key string) bool {
 	return strings.HasSuffix(key, "/current")
+}
+
+// repairPrefixes are the object classes a full repair must reconcile. Session
+// and idempotency metadata (bundles/, dav-activities/, dav-txns/, txn/) is
+// excluded: it is recreated on demand, and listing it made a repository with
+// many uploads page through thousands of intent records — the scans that timed
+// out on RustFS and kept a live standby out of service.
+var repairPrefixes = []string{
+	"revs/", "revs-loose/", "revprops/", "revprops-loose/",
+	"texts/", "chunks/", "dirs/", "journal/", "locks/",
+}
+
+// listRepairObjects lists the repository objects repair needs, without the
+// ephemeral prefixes that dominate object counts in a long-lived repository.
+func listRepairObjects(ctx context.Context, s Store, repoPrefix string) (map[string]int64, error) {
+	base := strings.Trim(repoPrefix, "/")
+	if base == "" {
+		// Test/custom stores have no repository namespace; keep the whole-store
+		// listing they expect.
+		return listAll(ctx, s, "")
+	}
+	out := make(map[string]int64)
+	for _, p := range repairPrefixes {
+		ks, err := listAll(ctx, s, base+"/"+strings.TrimSuffix(p, "/"))
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range ks {
+			out[k] = v
+		}
+	}
+	for _, k := range []string{"format", "uuid", "current", "locks.json"} {
+		ks, err := listAll(ctx, s, base+"/"+k)
+		if err != nil {
+			return nil, err
+		}
+		for key, v := range ks {
+			out[key] = v
+		}
+	}
+	if len(out) == 0 {
+		// A custom/test repository may store objects directly under its prefix
+		// (no standard revision/text tree). Fall back to the unscoped listing so
+		// those stores keep the old behaviour; real repositories always have at
+		// least the format/current markers.
+		return listAll(ctx, s, base)
+	}
+	return out, nil
 }
 
 // listAll returns every object under prefix with its size. Repair needs the

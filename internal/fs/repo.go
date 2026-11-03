@@ -1345,16 +1345,32 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 	}
 	sh := r.shard(N)
 	rbBytes := rb.Marshal()
-	if err := r.store.Put(ctx, r.keys.LooseRev(sh, N), rbBytes); err != nil {
-		return 0, err
-	}
 	rp := NewRevProps()
 	rp.Props = revProps
 	if rp.Props == nil {
 		rp.Props = map[string]string{"svn:author": "svngod", "svn:date": time.Now().UTC().Format("2006-01-02T15:04:05.000000Z")}
 	}
-	if err := r.store.Put(ctx, r.keys.LooseRevProps(sh, N), rp.Marshal()); err != nil {
-		return 0, err
+	rpBytes := rp.Marshal()
+	// The revision block and its properties are independent objects; writing
+	// them concurrently saves one ordered write round trip per mirror on the
+	// commit path (each Put itself targets the arbiter before the standby).
+	var rbErr, rpErr error
+	var writeWG sync.WaitGroup
+	writeWG.Add(2)
+	go func() {
+		defer writeWG.Done()
+		rbErr = r.store.Put(ctx, r.keys.LooseRev(sh, N), rbBytes)
+	}()
+	go func() {
+		defer writeWG.Done()
+		rpErr = r.store.Put(ctx, r.keys.LooseRevProps(sh, N), rpBytes)
+	}()
+	writeWG.Wait()
+	if rbErr != nil {
+		return 0, rbErr
+	}
+	if rpErr != nil {
+		return 0, rpErr
 	}
 	nc := &Current{Head: N, Created: cur.Created}
 	if nc.Created == 0 {

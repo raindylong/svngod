@@ -102,7 +102,7 @@ func (s *fileStore) makeStore(prefix string) (store.Store, error) {
 		if len(ms) < 2 {
 			return nil, fmt.Errorf("mirror storage requires at least 2 backends (got %d)", len(ms))
 		}
-		opts := []store.MirrorOption{store.WithMutableOrder(fs.CompareMutable), store.WithRepoPrefix(prefix)}
+		opts := []store.MirrorOption{store.WithMutableOrder(fs.CompareMutable), store.WithRepoPrefix(prefix), store.WithLazyRepair()}
 		if s.Quorum > 0 {
 			opts = append(opts, store.WithWriteQuorum(s.Quorum))
 		}

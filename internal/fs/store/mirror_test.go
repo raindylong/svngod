@@ -395,40 +395,46 @@ func TestCheckCaughtUpUnknownHead(t *testing.T) {
 	}
 }
 
-// TestSetControlKeyRequiresMajority: a cold start that can reach only one of
-// two replicas cannot establish the acknowledged HEAD and must fence.
-func TestSetControlKeyRequiresMajority(t *testing.T) {
+// TestSetControlKeyArbiterAuthority: for a two-node pair the arbiter's HEAD is
+// authoritative, so a cold start with the standby unreachable adopts it instead
+// of fencing; when the arbiter is the unreachable one, the survivor cannot be
+// trusted and writes stay fenced.
+func TestSetControlKeyArbiterAuthority(t *testing.T) {
 	ctx := context.Background()
-	a := NewMemoryStore()
-	b := NewMemoryStore()
 	key := "repos/demo/current"
+
+	a, b := NewMemoryStore(), NewMemoryStore()
 	if err := a.Put(ctx, key, []byte("HEAD=2")); err != nil {
 		t.Fatal(err)
 	}
-	m := NewMirror([]Store{a, b}, WithMutableOrder(testHeadOrder))
-	defer m.Close()
-	// NewMirror's initial repair may have copied the pointer; remove it from
-	// the standby to model "only the lagging replica is reachable".
-	if err := b.Delete(ctx, []string{key}); err != nil {
-		t.Fatal(err)
+	m := &MirrorStore{
+		mirrors: []Store{a, b}, healthy: []bool{true, true},
+		repoPrefix: "repos/demo", controlKey: key, mutableOrder: testHeadOrder,
 	}
 	m.SetControlKey(key)
 	m.mu.Lock()
-	fenced, ack := m.fenced, len(m.ackedCurrent)
+	fenced, ack := m.fenced, string(m.ackedCurrent)
 	m.mu.Unlock()
-	if !fenced || ack != 0 {
-		t.Fatalf("adopted a partial view: fenced=%v ack=%d", fenced, ack)
+	if fenced || ack != "HEAD=2" {
+		t.Fatalf("arbiter view not adopted: fenced=%v ack=%q", fenced, ack)
 	}
-	// With both replicas agreeing the baseline is adopted.
-	if err := b.Put(ctx, key, []byte("HEAD=2")); err != nil {
+
+	badArbiter := &getFailStore{Store: NewMemoryStore()}
+	standby := NewMemoryStore()
+	if err := standby.Put(ctx, key, []byte("HEAD=2")); err != nil {
 		t.Fatal(err)
 	}
-	m.SetControlKey(key)
-	m.mu.Lock()
-	fenced, ack = m.fenced, len(m.ackedCurrent)
-	m.mu.Unlock()
-	if fenced || ack == 0 {
-		t.Fatalf("majority view not adopted: fenced=%v ack=%d", fenced, ack)
+	badArbiter.fail.Store(true)
+	m2 := &MirrorStore{
+		mirrors: []Store{badArbiter, standby}, healthy: []bool{true, true},
+		repoPrefix: "repos/demo", controlKey: key, mutableOrder: testHeadOrder,
+	}
+	m2.SetControlKey(key)
+	m2.mu.Lock()
+	fenced = m2.fenced
+	m2.mu.Unlock()
+	if !fenced {
+		t.Fatal("survivor adopted a HEAD without the arbiter")
 	}
 }
 

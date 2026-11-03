@@ -3,7 +3,9 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
+	"time"
 )
 
 // putFailStore fails Put while leaving reads and CAS intact, simulating a
@@ -178,4 +180,133 @@ func TestRepairReconcilesDivergentRevisionTail(t *testing.T) {
 	if got, _ := a.Get(ctx, key, nil); string(got) != "arbiter-A" {
 		t.Fatalf("arbiter changed during reconcile: %q", got)
 	}
+}
+
+// Only one process may hold the repair lease, so four svngod instances do not
+// run the same full bucket scan after a failover. A crashed holder's lease is
+// taken over once its deadline passes.
+func TestRepairLeaseSerialisesProcesses(t *testing.T) {
+	ctx := context.Background()
+	a, b := NewMemoryStore(), NewMemoryStore()
+	mk := func(owner string) *MirrorStore {
+		return &MirrorStore{
+			mirrors: []Store{a, b}, healthy: []bool{true, true},
+			repoPrefix: "repos/x", repairOwner: owner, lazy: true,
+		}
+	}
+	m1, m2 := mk("p1"), mk("p2")
+	if !m1.acquireRepairLease(ctx) {
+		t.Fatal("first process did not acquire the lease")
+	}
+	if m2.acquireRepairLease(ctx) {
+		t.Fatal("second process acquired a held lease")
+	}
+	m1.releaseRepairLease(ctx)
+	if !m2.acquireRepairLease(ctx) {
+		t.Fatal("lease not acquired after release")
+	}
+	m2.releaseRepairLease(ctx)
+
+	// A crashed holder leaves the payload behind; the deadline allows takeover.
+	if err := a.Put(ctx, m2.repairLeaseKey(), []byte("dead 1")); err != nil {
+		t.Fatal(err)
+	}
+	if !m2.acquireRepairLease(ctx) {
+		t.Fatal("expired lease was not taken over")
+	}
+	m2.releaseRepairLease(ctx)
+	if _, ok, err := a.Head(ctx, m2.repairLeaseKey()); err != nil || ok {
+		t.Fatalf("lease still present after release: ok=%v err=%v", ok, err)
+	}
+}
+
+// A long repair pass renews its lease; a process that does not own it cannot.
+func TestRepairLeaseRenewedByOwnerOnly(t *testing.T) {
+	ctx := context.Background()
+	a, b := NewMemoryStore(), NewMemoryStore()
+	mk := func(owner string) *MirrorStore {
+		return &MirrorStore{
+			mirrors: []Store{a, b}, healthy: []bool{true, true},
+			repoPrefix: "repos/x", repairOwner: owner, lazy: true,
+		}
+	}
+	m1, m2 := mk("p1"), mk("p2")
+	if !m1.acquireRepairLease(ctx) {
+		t.Fatal("acquire")
+	}
+	before, err := a.Get(ctx, m1.repairLeaseKey(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if !m1.renewRepairLeaseOnce(ctx) {
+		t.Fatal("owner could not renew")
+	}
+	after, err := a.Get(ctx, m1.repairLeaseKey(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) == string(after) || !strings.HasPrefix(string(after), "p1 ") {
+		t.Fatalf("lease not renewed: before=%q after=%q", before, after)
+	}
+	if m2.renewRepairLeaseOnce(ctx) {
+		t.Fatal("non-owner renewed the lease")
+	}
+	m1.releaseRepairLease(ctx)
+}
+
+// Write leadership must return to the arbiter whenever it is healthy; keeping
+// a standby elected after a transient timeout made a standby outage fence all
+// commits even though mirror 0 was serving.
+func TestPrimaryPrefersArbiter(t *testing.T) {
+	a, b := NewMemoryStore(), NewMemoryStore()
+	m := NewMirror([]Store{a, b})
+	defer m.Close()
+	m.mu.Lock()
+	m.prim = 1
+	m.mu.Unlock()
+	if _, pi := m.primary(); pi != 0 {
+		t.Fatalf("primary = %d, want the healthy arbiter 0", pi)
+	}
+}
+
+// A cold start with the standby unreachable must not fence commits: the
+// arbiter's HEAD is authoritative because every commit publishes there first.
+func TestControlKeyAdoptsArbiterWhenStandbyDown(t *testing.T) {
+	ctx := context.Background()
+	a := NewMemoryStore()
+	b := &getFailStore{Store: NewMemoryStore()}
+	key := "repos/x/current"
+	if err := a.Put(ctx, key, []byte("head=5")); err != nil {
+		t.Fatal(err)
+	}
+	m := NewMirror([]Store{a, b}, WithRepoPrefix("repos/x"), WithMutableOrder(compareCurrentBytes))
+	defer m.Close()
+	b.fail.Store(true)
+	m.SetControlKey(key)
+	if got := string(m.ackedCopy()); got != "head=5" {
+		t.Fatalf("acked head = %q, want the arbiter's value", got)
+	}
+	if err := m.checkCaughtUp(a, 0); err != nil {
+		t.Fatalf("commit fenced with a healthy arbiter: %v", err)
+	}
+}
+
+// A repair pass that finds a mirror unreachable must start the recovery loop;
+// the health loop skips unhealthy mirrors, so nothing else would re-admit it.
+func TestSetHealthyStartsRecovery(t *testing.T) {
+	a, b := NewMemoryStore(), NewMemoryStore()
+	m := &MirrorStore{
+		mirrors: []Store{a, b}, healthy: []bool{true, true},
+		repoPrefix: "repos/x", repairOwner: "p1", lazy: true,
+		stop: make(chan struct{}),
+	}
+	m.setHealthy(1, false)
+	m.mu.Lock()
+	rec := m.recovering
+	m.mu.Unlock()
+	if !rec {
+		t.Fatal("marking a mirror down did not start recovery")
+	}
+	close(m.stop)
 }
