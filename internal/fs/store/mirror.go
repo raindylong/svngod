@@ -2129,16 +2129,15 @@ func (m *MirrorStore) repairInternal() {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			// A mirror marked down gets a cheap 5s probe first: a dead or hung
-			// backend fails (or times out) there, so the pass does not wait the
-			// full large-repository timeout. If the probe answers, the mirror is
-			// alive but may be slow (RustFS after a restart takes seconds for a
-			// full listing), so the real listing gets the normal budget. Giving
-			// every unhealthy mirror the short budget kept a live restarting
-			// standby failing its listing forever.
+			// A mirror marked down gets a cheap probe first: a dead backend fails
+			// fast, so the pass does not wait the full large-repository timeout.
+			// A live but slow backend (RustFS right after a restart) can take
+			// longer than a couple of seconds even for a tiny list, so the probe
+			// gets 30s; it then receives the normal full-listing budget. The
+			// previous 5s probe kept a live restarting standby failing forever.
 			timeout := repairListTimeout
 			if !m.isHealthy(i) {
-				pctx, pcancel := context.WithTimeout(context.Background(), 5*time.Second)
+				pctx, pcancel := context.WithTimeout(context.Background(), 30*time.Second)
 				_, _, perr := m.mirrors[i].ListPrefix(pctx, m.repoPrefix, "", 1)
 				pcancel()
 				if perr != nil {
