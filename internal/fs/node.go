@@ -16,10 +16,14 @@ const (
 
 // Change is one requested path change in CommitTxn.
 type Change struct {
-	Path         string
-	Action       ChangeAction
-	Kind         byte
-	Data         []byte
+	Path   string
+	Action ChangeAction
+	Kind   byte
+	Data   []byte
+	// TextSet marks a change that carries new text even when Data is empty
+	// (a PUT that truncated a file to zero bytes, or one on a copied node
+	// whose inherited text must be replaced).
+	TextSet      bool
 	Props        map[string]string
 	CopyFromPath string // ActionCopy
 	CopyFromRev  uint64 // ActionCopy (rev of copy source)

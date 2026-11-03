@@ -710,9 +710,10 @@ func writeSvnEntryProps(b *strings.Builder, nr *fs.NodeRev, rev uint64, path str
 // later increments; these stubs keep the router complete.
 
 // handleCopyMove implements COPY/MOVE into a transaction working resource.
-// Source is either a version baseline (!svn/bc/<rev>/<path>) or an already
-// checked-out resource inside the same transaction. Destination header names
-// the target working resource.
+// Source is either a versioned node at a fixed revision (!svn/bc/<rev>/<path>,
+// !svn/rvr/<rev>/<path> or !svn/ver/<rev>/<path>) or an already checked-out
+// resource inside the same transaction. Destination header names the target
+// working resource.
 func (s *Server) handleCopyMove(w http.ResponseWriter, r *http.Request, res resource) {
 	dst := r.Header.Get("Destination")
 	if dst == "" {
@@ -741,7 +742,7 @@ func (s *Server) handleCopyMove(w http.ResponseWriter, r *http.Request, res reso
 	// srcPlans accumulates the materializations needed in the destination txn.
 	var srcPlans []srcPlan
 	switch res.typ {
-	case resBaseline, resBaselineColl:
+	case resBaseline, resBaselineColl, resRev, resVersion:
 		repo, ok := s.repo(w, res)
 		if !ok {
 			return

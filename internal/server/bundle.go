@@ -483,6 +483,7 @@ type bundleStatRequest struct {
 type bundleStatEntry struct {
 	SHA1 string `json:"sha1,omitempty"`
 	Size int64  `json:"size,omitempty"`
+	Kind string `json:"kind,omitempty"` // "dir" for directories
 }
 
 // handleBundleStat serves POST <repo>/!svngod/stat: for each requested path,
@@ -542,7 +543,14 @@ func (s *Server) handleBundleStat(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		nr, rerr := repo.Resolve(head, path)
-		if rerr != nil || nr.Kind != fs.KindFile {
+		if rerr != nil {
+			continue
+		}
+		if nr.Kind == fs.KindDir {
+			out[path] = bundleStatEntry{Kind: "dir"}
+			continue
+		}
+		if nr.Kind != fs.KindFile {
 			continue
 		}
 		if nr.TextSHA1 == ([20]byte{}) {

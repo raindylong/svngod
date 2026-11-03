@@ -1619,8 +1619,9 @@ func (r *Repo) applyChange(root *tnode, ch *Change) error {
 				t.copyFromPath = old.copyFromPath
 				// A props-only change (PROPPATCH) carries no new text; keep the
 				// base revision's content so the commit does not empty the file.
-				// A chunk manifest is new text and must not be replaced.
-				if len(t.data) == 0 && t.dataFile == "" && !t.deltaRep && len(t.chunkManifest) == 0 {
+				// A chunk manifest is new text and must not be replaced, and an
+				// explicit text-less PUT (TextSet) means the file is now empty.
+				if !ch.TextSet && len(t.data) == 0 && t.dataFile == "" && !t.deltaRep && len(t.chunkManifest) == 0 {
 					t.data = append([]byte(nil), old.data...)
 				}
 				// A content-only change (PUT with no PROPPATCH) carries no
@@ -1671,6 +1672,28 @@ func (r *Repo) applyChange(root *tnode, ch *Change) error {
 		}
 		cp := deepCopy(src)
 		cp.dirty = true
+		if ch.TextSet && cp.kind == KindFile {
+			// The client edited the copied file after the COPY (svn mv of a
+			// modified file): the PUT text replaces the inherited content. The
+			// representations are mutually exclusive, so clear the source's.
+			cp.data = append([]byte(nil), ch.Data...)
+			cp.dataFile = ch.DataFile
+			cp.dataMD5, cp.hasMD5 = ch.DataMD5, ch.HasMD5
+			cp.dataSHA1, cp.hasSHA1 = ch.DataSHA1, ch.HasSHA1
+			cp.textRef, cp.textSize = ch.TextRef, ch.TextSize
+			cp.chunkManifest = append([]byte(nil), ch.ChunkManifest...)
+			cp.chunkTotal = ch.ChunkTotal
+			cp.deltaRep = len(ch.Delta) > 0
+			cp.delta = append([]byte(nil), ch.Delta...)
+			cp.deltaBase = ch.DeltaBase
+			cp.deltaTotal = ch.TextTotal
+			cp.base = nil
+			cp.textRep = 0
+			cp.deltaDepth = 0
+		}
+		if len(ch.Props) > 0 {
+			cp.props = copyProps(ch.Props)
+		}
 		// copyfrom is the source as of the revision the client asked for
 		// (the COPY URL's peg). Resolving that revision gives the node svn
 		// would have recorded; children updated after it then differ from the

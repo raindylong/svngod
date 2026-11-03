@@ -38,6 +38,7 @@ type txnChange struct {
 	action       fs.ChangeAction
 	kind         byte
 	data         []byte
+	textSet      bool // a PUT replaced the text (even with an empty body)
 	props        map[string]string
 	copyFromPath string
 	copyFromRev  uint64
@@ -546,6 +547,18 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 	}
 	actID := strings.TrimPrefix(tx.id, "txn-")
 	txnBase := tx.baseRev
+	// A path already present in the transaction may carry a copy source
+	// (svn mv / svn cp). Its text is the base for a PUT that has no
+	// X-SVN-Version-Name header.
+	var cfPath string
+	var cfRev uint64
+	var copyData []byte
+	txnHasNode := false
+	if ch, ok := tx.changes[res.path]; ok {
+		txnHasNode = ch.action != fs.ActionDelete
+		cfPath, cfRev = ch.copyFromPath, ch.copyFromRev
+		copyData = ch.data
+	}
 	s.mu.Unlock()
 
 	if s.blockingLock(res.repo, repo, res.path, r.Header.Get("If")) != nil {
@@ -576,54 +589,76 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 		if nr, err := repo.Resolve(clientRev, res.path); err == nil && nr.Kind == fs.KindFile {
 			isNew = false
 			baseNode = nr
-			baseLen, _ = repo.TextSizeOf(nr)
-			if nr.DeltaDepth == 0 {
-				// A full text can be read window-by-window straight from the
-				// store: applying a 1 MiB delta to a 1 GiB base costs ~50 MiB
-				// of memory instead of loading the whole base.
-				baseSrc = rangeSource(repo, nr, baseLen)
-			} else {
-				// The stored node is itself a delta, and an edit may have
-				// shifted bytes: source windows must come from the
-				// reconstructed text. Rebuild it level by level into a temp
-				// file so a chain of edits stays memory-bounded.
-				path, size, cleanup, merr := materializeText(repo, nr)
-				if merr != nil {
-					http.Error(w, "read base text: "+merr.Error(), http.StatusInternalServerError)
-					return
-				}
-				defer cleanup()
-				f, oerr := os.Open(path)
-				if oerr != nil {
-					http.Error(w, "read base text: "+oerr.Error(), http.StatusInternalServerError)
-					return
-				}
-				defer f.Close()
-				baseLen = size
-				baseSrc = func(off, length int64) ([]byte, error) {
-					if off < 0 || length < 0 || off+length > size {
-						return nil, errors.New("svndiff: base range out of bounds")
-					}
-					b := make([]byte, length)
-					if _, rerr := f.ReadAt(b, off); rerr != nil {
-						return nil, rerr
-					}
-					return b, nil
-				}
-			}
-			if want := r.Header.Get("X-SVN-Base-Fulltext-MD5"); want != "" {
-				sum, herr := hashSource(baseSrc, baseLen)
-				if herr != nil {
-					http.Error(w, "read base text: "+herr.Error(), http.StatusInternalServerError)
-					return
-				}
-				if !strings.EqualFold(hex.EncodeToString(sum[:]), want) {
-					writeOutOfDate(w, res.path)
-					return
-				}
-			}
 		} else if err != nil {
 			clientRev = 0 // not present at the client's base: a new file
+		}
+	}
+	// A path copied into this transaction (svn mv / svn cp) arrives without an
+	// X-SVN-Version-Name header: the client diffs against the copy source, not
+	// against an empty file, so that text is the delta base.
+	if baseNode == nil && cfPath != "" && cfRev > 0 {
+		if nr, err := repo.Resolve(cfRev, cfPath); err == nil && nr.Kind == fs.KindFile {
+			baseNode = nr
+		}
+	}
+	switch {
+	case baseNode != nil:
+		baseLen, _ = repo.TextSizeOf(baseNode)
+		if baseNode.DeltaDepth == 0 {
+			// A full text can be read window-by-window straight from the
+			// store: applying a 1 MiB delta to a 1 GiB base costs ~50 MiB
+			// of memory instead of loading the whole base.
+			baseSrc = rangeSource(repo, baseNode, baseLen)
+		} else {
+			// The stored node is itself a delta, and an edit may have
+			// shifted bytes: source windows must come from the
+			// reconstructed text. Rebuild it level by level into a temp
+			// file so a chain of edits stays memory-bounded.
+			path, size, cleanup, merr := materializeText(repo, baseNode)
+			if merr != nil {
+				http.Error(w, "read base text: "+merr.Error(), http.StatusInternalServerError)
+				return
+			}
+			defer cleanup()
+			f, oerr := os.Open(path)
+			if oerr != nil {
+				http.Error(w, "read base text: "+oerr.Error(), http.StatusInternalServerError)
+				return
+			}
+			defer f.Close()
+			baseLen = size
+			baseSrc = func(off, length int64) ([]byte, error) {
+				if off < 0 || length < 0 || off+length > size {
+					return nil, errors.New("svndiff: base range out of bounds")
+				}
+				b := make([]byte, length)
+				if _, rerr := f.ReadAt(b, off); rerr != nil {
+					return nil, rerr
+				}
+				return b, nil
+			}
+		}
+	case len(copyData) > 0:
+		// Copy within the same transaction: the source bytes are already
+		// materialised in the destination change.
+		baseLen = int64(len(copyData))
+		src := copyData
+		baseSrc = func(off, length int64) ([]byte, error) {
+			if off < 0 || length < 0 || off+length > int64(len(src)) {
+				return nil, errors.New("svndiff: base range out of bounds")
+			}
+			return src[off : off+length], nil
+		}
+	}
+	if want := r.Header.Get("X-SVN-Base-Fulltext-MD5"); want != "" && (baseNode != nil || len(copyData) > 0) {
+		sum, herr := hashSource(baseSrc, baseLen)
+		if herr != nil {
+			http.Error(w, "read base text: "+herr.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !strings.EqualFold(hex.EncodeToString(sum[:]), want) {
+			writeOutOfDate(w, res.path)
+			return
 		}
 	}
 	_ = txnBase
@@ -707,7 +742,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 			}
 			outPath, sum, sha, derr := decodeDeltaToFileSource(baseLen, baseSrc, bodyReader, maxPutBody)
 			if os.Getenv("SVNGOD_DEBUG_PUT") == "1" {
-				log.Printf("put-debug path=%s baseRev=%d baseLen=%d contentLen=%d isNew=%v decodedMD5=%x want=%q deltaBuf=%d", res.path, clientRev, baseLen, r.ContentLength, isNew, sum, r.Header.Get("X-SVN-Result-Fulltext-MD5"), deltaBuf.Len())
+				log.Printf("put-debug path=%s baseRev=%d baseLen=%d contentLen=%d isNew=%v decodedMD5=%x want=%q deltaBuf=%d err=%v", res.path, clientRev, baseLen, r.ContentLength, isNew, sum, r.Header.Get("X-SVN-Result-Fulltext-MD5"), deltaBuf.Len(), derr)
 			}
 			if derr == nil {
 				if want := r.Header.Get("X-SVN-Result-Fulltext-MD5"); want != "" &&
@@ -892,6 +927,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 	ch.kind = fs.KindFile
 	ch.gen++
 	ch.data = data
+	ch.textSet = true
 	ch.dataFile = ""
 	ch.dataSize = dataSize
 	ch.streamed = false
@@ -916,7 +952,11 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, res resource)
 	s.persistChange(repo, actID, res.path)
 
 	w.Header().Set("Location", s.absURL(r, res.repo, "/!svn/txn/"+tx.id+res.path))
-	if isNew {
+	// A PUT to a path the transaction already has (a prior COPY, or a retried
+	// upload) updates an existing working resource, so the answer is 204; only
+	// a node the transaction did not have is "Created". svn's client relies on
+	// this distinction and aborts with "path unexpectedly created" on a 201.
+	if isNew && !txnHasNode {
 		w.WriteHeader(http.StatusCreated)
 	} else {
 		w.WriteHeader(http.StatusNoContent)
@@ -1543,6 +1583,7 @@ func collectChanges(repo *fs.Repo, tx *txn) ([]fs.Change, error) {
 			Action:        action,
 			Kind:          ch.kind,
 			Data:          ch.data,
+			TextSet:       ch.textSet,
 			Props:         ch.props,
 			CopyFromPath:  ch.copyFromPath,
 			CopyFromRev:   ch.copyFromRev,

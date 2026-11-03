@@ -36,6 +36,7 @@ type persistedChange struct {
 	Action       string            `json:"action"`
 	Kind         string            `json:"kind,omitempty"`
 	DataRef      string            `json:"dataRef,omitempty"`
+	TextSet      bool              `json:"textSet,omitempty"`
 	Props        map[string]string `json:"props,omitempty"`
 	CopyFromPath string            `json:"copyFromPath,omitempty"`
 	CopyFromRev  uint64            `json:"copyFromRev,omitempty"`
@@ -182,7 +183,7 @@ func snapshotChange(path string, ch *txnChange) persistedChange {
 	pc := persistedChange{
 		Path: path, Action: actionName(ch.action), Kind: kindName(ch.kind),
 		Props: copyMap(ch.props), CopyFromPath: ch.copyFromPath,
-		CopyFromRev: ch.copyFromRev, BaseRev: ch.baseRev,
+		CopyFromRev: ch.copyFromRev, BaseRev: ch.baseRev, TextSet: ch.textSet,
 		Streamed: ch.streamed || ch.dataFile != "",
 		DataRef:  ch.dataRef, DataTextRef: ch.dataTextRef, DataTextSize: ch.dataTextSize,
 		DeltaRef: ch.deltaRef, DeltaTotal: ch.deltaTotal,
@@ -367,7 +368,7 @@ func txnChangeFromPersisted(pc persistedChange) *txnChange {
 	return &txnChange{
 		action: actionByName(pc.Action), kind: kindByName(pc.Kind),
 		props: copyMap(pc.Props), copyFromPath: pc.CopyFromPath,
-		copyFromRev: pc.CopyFromRev, baseRev: pc.BaseRev, dataRef: pc.DataRef,
+		copyFromRev: pc.CopyFromRev, baseRev: pc.BaseRev, textSet: pc.TextSet, dataRef: pc.DataRef,
 		data: pc.DataInline, delta: pc.DeltaInline,
 		streamed: pc.Streamed, dataTextRef: pc.DataTextRef, dataTextSize: pc.DataTextSize,
 		dataSHA1: decodeSHA1(pc.DataSHA1), hasSHA1: pc.DataSHA1 != "",

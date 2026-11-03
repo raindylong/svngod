@@ -236,6 +236,102 @@ func TestCommitMoveWithinTxn(t *testing.T) {
 	}
 }
 
+// TestCommitCopyFromRvrUTF8 covers a rename in a working copy: the client
+// sends COPY with a peg-revision source (!svn/rvr/<rev>/…) and a
+// percent-encoded UTF-8 destination path.
+func TestCommitCopyFromRvrUTF8(t *testing.T) {
+	ts, repo, base := testServer(t, "", "")
+	defer ts.Close()
+	before, _ := repo.Head() // rev 1
+
+	txnRoot := copyMoveSetup(t, base, "demo", "rvr-1")
+
+	dst := txnRoot + "/trunk/%E6%8B%B7%E8%B4%9D%20%E6%96%87%E4%BB%B6.txt" // "拷贝 文件.txt"
+	resp := doRequest(t, "COPY", base+"/svn/demo/!svn/rvr/1/trunk/README.txt", "", "", "", map[string]string{
+		"Destination": dst, "Overwrite": "F",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("COPY rvr=%d body=%s", resp.StatusCode, bodyOf(t, resp))
+	}
+	resp.Body.Close()
+
+	merge := `<?xml version="1.0"?><D:merge xmlns:D="DAV:"><D:source><D:href>` +
+		base + `/svn/demo/!svn/act/rvr-1/</D:href></D:source></D:merge>`
+	resp = doRequest(t, "MERGE", base+"/svn/demo/!svn/vcc/default", merge, "", "", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("MERGE=%d body=%s", resp.StatusCode, bodyOf(t, resp))
+	}
+	resp.Body.Close()
+
+	head, _ := repo.Head()
+	if head != before+1 {
+		t.Fatalf("head=%d want %d", head, before+1)
+	}
+	nr, err := repo.Resolve(head, "/trunk/拷贝 文件.txt")
+	if err != nil {
+		t.Fatalf("utf8 copy destination missing: %v", err)
+	}
+	if nr.CopyFrom == nil || nr.CopyFromPath != "/trunk/README.txt" || nr.CopyFrom.Rev != 1 {
+		t.Fatalf("copyfrom wrong: %+v path=%q", nr.CopyFrom, nr.CopyFromPath)
+	}
+	txt, _ := repo.GetText(nr.Node)
+	if string(txt) != "hello svn\n" {
+		t.Fatalf("copied content=%q", txt)
+	}
+}
+
+// TestCommitPutAfterCopyUsesCopySourceBase covers svn mv of a modified file:
+// the COPY puts the source text in the transaction, then PUT sends a delta
+// against that text without any X-SVN-Version-Name header. The server must
+// decode against the copy source and answer 204 (the working resource already
+// exists), not 201.
+func TestCommitPutAfterCopyUsesCopySourceBase(t *testing.T) {
+	ts, repo, base := testServer(t, "", "")
+	defer ts.Close()
+
+	txnRoot := copyMoveSetup(t, base, "demo", "cp-put-1")
+
+	resp := doRequest(t, "COPY", base+"/svn/demo/!svn/rvr/1/trunk/README.txt", "", "", "", map[string]string{
+		"Destination": txnRoot + "/trunk/copied.txt", "Overwrite": "F",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("COPY rvr=%d body=%s", resp.StatusCode, bodyOf(t, resp))
+	}
+	resp.Body.Close()
+
+	oldText := []byte("hello svn\n")
+	newText := []byte("hello svn\nedited line\n")
+	delta, err := svndiff.Encode(oldText, newText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = doRequest(t, "PUT", txnRoot+"/trunk/copied.txt", string(delta), "", "", map[string]string{
+		"Content-Type": "application/vnd.svn-svndiff",
+	})
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("PUT after COPY=%d body=%s (want 204)", resp.StatusCode, bodyOf(t, resp))
+	}
+	resp.Body.Close()
+
+	merge := `<?xml version="1.0"?><D:merge xmlns:D="DAV:"><D:source><D:href>` +
+		base + `/svn/demo/!svn/act/cp-put-1/</D:href></D:source></D:merge>`
+	resp = doRequest(t, "MERGE", base+"/svn/demo/!svn/vcc/default", merge, "", "", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("MERGE=%d body=%s", resp.StatusCode, bodyOf(t, resp))
+	}
+	resp.Body.Close()
+
+	head, _ := repo.Head()
+	nr, err := repo.Resolve(head, "/trunk/copied.txt")
+	if err != nil {
+		t.Fatalf("copied.txt missing: %v", err)
+	}
+	txt, _ := repo.GetText(nr.Node)
+	if string(txt) != string(newText) {
+		t.Fatalf("content=%q want %q", txt, newText)
+	}
+}
+
 // TestLargeBaseSmallDeltaIsStoredAsDelta covers the case that used to store a
 // full copy: a small svndiff against a base larger than the stream threshold
 // must be decoded window-by-window and kept as a delta, and a second edit must

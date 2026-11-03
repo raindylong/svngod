@@ -104,6 +104,63 @@ func postBundle(t *testing.T, ts *httptest.Server, body []byte) (int, map[string
 	return resp.StatusCode, out
 }
 
+func TestBundleEmptyDirAndStatKind(t *testing.T) {
+	ts, repo := newBundleTestServer(t)
+	defer ts.Close()
+
+	b := &testBundle{Token: strings.Repeat("c3", 16), Message: "empty dir"}
+	b.Changes = []testBundleChange{
+		{Path: "/trunk/README.txt", Action: "put", Kind: "file", TextLen: 1},
+		{Path: "/trunk/中文空目录", Action: "put", Kind: "dir"},
+	}
+	hdr, _ := json.Marshal(b)
+	var buf bytes.Buffer
+	buf.WriteString(bundleMagic)
+	var sz [8]byte
+	binary.BigEndian.PutUint64(sz[:], uint64(len(hdr)))
+	buf.Write(sz[:])
+	buf.Write(hdr)
+	buf.WriteString("x")
+
+	code, out := postBundle(t, ts, buf.Bytes())
+	if code != 200 || out["revision"].(float64) != 1 {
+		t.Fatalf("bundle status=%d out=%v", code, out)
+	}
+	head, _ := repo.Head()
+	nr, err := repo.Resolve(head, "/trunk/中文空目录")
+	if err != nil || nr.Kind != fs.KindDir {
+		t.Fatalf("empty dir missing: nr=%+v err=%v", nr, err)
+	}
+
+	req, _ := http.NewRequest("POST", ts.URL+"/svn/bun/!svngod/stat",
+		strings.NewReader(`{"files":["/trunk/中文空目录","/trunk/README.txt","/nope"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var st struct {
+		Files map[string]struct {
+			SHA1 string `json:"sha1"`
+			Size int64  `json:"size"`
+			Kind string `json:"kind"`
+		} `json:"files"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
+		t.Fatal(err)
+	}
+	if e, ok := st.Files["/trunk/中文空目录"]; !ok || e.Kind != "dir" {
+		t.Fatalf("dir stat=%+v ok=%v", e, ok)
+	}
+	if e, ok := st.Files["/trunk/README.txt"]; !ok || e.Size != 1 || e.SHA1 == "" {
+		t.Fatalf("file stat=%+v ok=%v", e, ok)
+	}
+	if _, ok := st.Files["/nope"]; ok {
+		t.Fatal("missing path returned a stat entry")
+	}
+}
+
 func TestBundleCommitAndReplay(t *testing.T) {
 	ts, repo := newBundleTestServer(t)
 	defer ts.Close()

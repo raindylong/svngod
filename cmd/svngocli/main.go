@@ -477,9 +477,13 @@ func cmdUpload(args []string) int {
 	// Scan the tree, hashing every file. The token is content derived, so
 	// re-running the same upload is a no-op instead of a second revision.
 	var files []uploadFile
+	var dirs []string
 	var total int64
 	digest := sha256.New()
 	fmt.Fprintf(digest, "%s\x00%s\x00%s\x00", repoRoot, targetPath, msg)
+	if targetPath != "" && targetPath != "/" {
+		dirs = append(dirs, targetPath)
+	}
 	err = filepath.WalkDir(localDir, func(p string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -487,6 +491,13 @@ func cmdUpload(args []string) int {
 		if d.IsDir() {
 			if d.Name() == ".svn" {
 				return filepath.SkipDir
+			}
+			if p != localDir {
+				rel, rerr := filepath.Rel(localDir, p)
+				if rerr != nil {
+					return rerr
+				}
+				dirs = append(dirs, joinRepoPath(targetPath, filepath.ToSlash(rel)))
 			}
 			return nil
 		}
@@ -626,6 +637,29 @@ func cmdUpload(args []string) int {
 	for _, p := range skippedPaths {
 		changes = append(changes, bundleChange{Path: p, Action: "check", Kind: "file", BaseRev: head})
 	}
+	// Empty directories are part of the tree, but only ones HEAD does not
+	// have are sent: re-sending an existing dir rewrites its node-rev and
+	// would turn an unchanged upload into a new revision. Texts for the file
+	// changes precede these, so the body order stays aligned.
+	var newDirs []string
+	if len(dirs) > 0 {
+		infos, serr := fetchStat(repoRoot, dirs, user, pass)
+		if serr != nil {
+			if !quiet {
+				fmt.Fprintf(os.Stderr, "svngocli: directory check failed: %v\n", serr)
+			}
+		} else {
+			for _, p := range dirs {
+				if _, ok := infos[p]; !ok {
+					newDirs = append(newDirs, p)
+				}
+			}
+		}
+	}
+	for _, p := range newDirs {
+		changes = append(changes, bundleChange{Path: p, Action: "put", Kind: "dir", BaseRev: head})
+		fmt.Fprintf(digest, "dir\x00%s\x00", p)
+	}
 	if delMiss {
 		gone, gerr := missingOnServer(targetURL, targetPath, files, user, pass)
 		if gerr != nil {
@@ -639,7 +673,7 @@ func cmdUpload(args []string) int {
 	}
 	token := hex.EncodeToString(digest.Sum(nil))
 
-	if len(files) == 0 && !delMiss {
+	if len(files) == 0 && len(newDirs) == 0 && !delMiss {
 		// Every file matched HEAD; sending only check changes would be an
 		// empty commit, so report success without a request. No data can be
 		// lost here because nothing is written.
@@ -708,6 +742,7 @@ func hashFileSums(p string) ([32]byte, [20]byte, error) {
 type statEntry struct {
 	SHA1 string `json:"sha1"`
 	Size int64  `json:"size"`
+	Kind string `json:"kind"` // "dir" for directories
 }
 
 // fetchStat asks the server for the HEAD sha1/size of the given repo paths.
