@@ -34,12 +34,13 @@ func TestHealthProbeMarksHungMirror(t *testing.T) {
 	bad.fail.Store(true)
 	fails := make([]int, 2)
 	m.probeOnce(fails)
+	m.probeOnce(fails)
 	if !m.isHealthy(1) {
-		t.Fatal("one failed probe took the mirror out of service")
+		t.Fatal("two failed probes took the mirror out of service")
 	}
 	m.probeOnce(fails)
 	if m.isHealthy(1) {
-		t.Fatal("two failed probes did not take the mirror out of service")
+		t.Fatal("three failed probes did not take the mirror out of service")
 	}
 	m.mu.Lock()
 	whole, over := m.wholeAtDown[1], m.pendingOverflow[1]

@@ -1383,10 +1383,12 @@ func (m *MirrorStore) anyDown() bool {
 // healthProbeInterval / healthProbeTimeout bound how long a hung but still
 // connected replica (a paused process, a black-holed network path) can keep
 // receiving "successful" buffered writes before it is taken out of service.
-// Two strikes keep a single slow response from evicting a healthy node.
+// Three strikes at 5s keep a busy-but-healthy node from being evicted: a 2s
+// list deadline flapped a standby under a 1M-object repair scan.
 const (
 	healthProbeInterval = 5 * time.Second
-	healthProbeTimeout  = 2 * time.Second
+	healthProbeTimeout  = 5 * time.Second
+	healthProbeStrikes  = 3
 )
 
 // healthLoop probes every healthy mirror with one cheap list request. A write
@@ -1414,14 +1416,15 @@ func (m *MirrorStore) probeOnce(fails []int) {
 	if prefix != "" {
 		prefix += "/"
 	}
+	control := m.controlKey
 	mirrors := append([]Store(nil), m.mirrors...)
 	healthy := append([]bool(nil), m.healthy...)
 	m.mu.Unlock()
 	// Never evict the elected primary on a probe: its liveness is exercised by
-	// every read and write with their own budgets, and a 2s list under heavy
-	// load once fenced a healthy primary, turning the cluster read-only. The
-	// probe exists for standbys, where a write can otherwise look successful
-	// while the process is paused.
+	// every read and write with their own budgets, and a short list deadline
+	// under heavy load once fenced a healthy primary, turning the cluster
+	// read-only. The probe exists for standbys, where a write can otherwise
+	// look successful while the process is paused.
 	_, prim := m.primary()
 	for i, s := range mirrors {
 		if i == prim || !healthy[i] {
@@ -1429,15 +1432,22 @@ func (m *MirrorStore) probeOnce(fails []int) {
 			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), healthProbeTimeout)
-		_, _, err := s.ListPrefix(ctx, prefix, "", 1)
+		var err error
+		if control != "" {
+			// A single HEAD on the tiny HEAD pointer is O(1); listing can page
+			// and took seconds under a concurrent 1M-object repair scan.
+			_, _, err = s.Head(ctx, control)
+		} else {
+			_, _, err = s.ListPrefix(ctx, prefix, "", 1)
+		}
 		cancel()
 		if err == nil {
 			fails[i] = 0
 			continue
 		}
 		fails[i]++
-		if fails[i] >= 2 {
-			log.Printf("mirror[%d] health probe failed twice: %v", i, err)
+		if fails[i] >= healthProbeStrikes {
+			log.Printf("mirror[%d] health probe failed %d times: %v", i, fails[i], err)
 			m.markDownHung(i)
 			fails[i] = 0
 		}
