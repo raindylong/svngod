@@ -76,6 +76,51 @@ func TestCopyKeyToUnknownWhenAllSourcesFail(t *testing.T) {
 	}
 }
 
+// idStore attaches a location identity to a MemoryStore for ordering tests.
+type idStore struct {
+	Store
+	id string
+}
+
+func (s *idStore) Identity() string { return s.id }
+
+// TestMirrorOrderCanonicalByIdentity: two processes that configure the same
+// replica set in opposite orders must still pick the same arbiter; otherwise
+// they create two leases and publish the same revision with different trees.
+func TestMirrorOrderCanonicalByIdentity(t *testing.T) {
+	ctx := context.Background()
+	a, b := NewMemoryStore(), NewMemoryStore()
+	ia, ib := &idStore{Store: a, id: "s3://a"}, &idStore{Store: b, id: "s3://b"}
+	m1 := NewMirror([]Store{ia, ib})
+	defer m1.Close()
+	m2 := NewMirror([]Store{ib, ia})
+	defer m2.Close()
+	firstID := func(m *MirrorStore) string {
+		return m.mirrors[0].(interface{ Identity() string }).Identity()
+	}
+	if firstID(m1) != "s3://a" || firstID(m2) != "s3://a" {
+		t.Fatalf("reversed configs chose different first mirrors: %q vs %q", firstID(m1), firstID(m2))
+	}
+	key := "repos/x/locks/commit"
+	if err := m1.CreateIfAbsentQuorum(ctx, key, []byte("owner1 1"), 1); err != nil {
+		t.Fatalf("first lease: %v", err)
+	}
+	if err := m2.CreateIfAbsentQuorum(ctx, key, []byte("owner2 2"), 1); !errors.Is(err, ErrPreconditionFailed) {
+		t.Fatalf("second lease with reversed config = %v, want ErrPreconditionFailed", err)
+	}
+}
+
+// TestMirrorOrderKeepsConfigWithoutIdentity: stores that cannot name
+// themselves keep the configured order (MemoryStore-based unit tests).
+func TestMirrorOrderKeepsConfigWithoutIdentity(t *testing.T) {
+	a, b := NewMemoryStore(), NewMemoryStore()
+	m := NewMirror([]Store{a, b})
+	defer m.Close()
+	if m.mirrors[0] != a || m.mirrors[1] != b {
+		t.Fatal("configured order changed for identity-less stores")
+	}
+}
+
 // TestMajorityQuorumIntersects: with three nodes a strict majority is enough,
 // so one node outage keeps commits possible, while two writers with different
 // health views still cannot both hold the lease.

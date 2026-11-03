@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -233,10 +234,38 @@ func (m *MirrorStore) LiveCount() int {
 
 // NewMirror builds a MirrorStore over the given backends, aligns them, and
 // starts the background repair loop.
+// canonicalMirrors orders replicas by their identity. Every process with the
+// same replica set therefore agrees on the arbiter/first writer even when its
+// config file lists the replicas in a different order. Mixed order used to
+// create two lease arbiters and publish the same revision with two different
+// trees (observed in the split-order experiment). Stores without an identity
+// keep the configured order (tests, custom backends).
+func canonicalMirrors(mirrors []Store) []Store {
+	type pair struct {
+		id string
+		s  Store
+	}
+	ps := make([]pair, len(mirrors))
+	for i, s := range mirrors {
+		id, ok := s.(interface{ Identity() string })
+		if !ok {
+			return mirrors
+		}
+		ps[i] = pair{id.Identity(), s}
+	}
+	sort.SliceStable(ps, func(i, j int) bool { return ps[i].id < ps[j].id })
+	out := make([]Store, len(ps))
+	for i, p := range ps {
+		out[i] = p.s
+	}
+	return out
+}
+
 func NewMirror(mirrors []Store, opts ...MirrorOption) *MirrorStore {
 	if len(mirrors) < 2 {
 		panic("MirrorStore requires at least 2 mirrors")
 	}
+	mirrors = canonicalMirrors(mirrors)
 	m := &MirrorStore{
 		mirrors:         mirrors,
 		healthy:         make([]bool, len(mirrors)),

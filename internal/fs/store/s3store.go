@@ -32,9 +32,17 @@ type S3Config struct {
 
 // S3Store implements Store on an S3-compatible object service.
 type S3Store struct {
-	client *minio.Client
-	bucket string
-	prefix string // repo prefix root
+	client   *minio.Client
+	endpoint string
+	bucket   string
+	prefix   string // repo prefix root
+}
+
+// Identity names this replica's location. MirrorStore canonicalises the
+// replica order by identity so every process with the same replica set picks
+// the same arbiter, regardless of the order in each config file.
+func (s *S3Store) Identity() string {
+	return "s3://" + strings.TrimSuffix(s.endpoint, "/") + "/" + s.bucket + "/" + s.prefix
 }
 
 // NewS3Store builds an S3Store.
@@ -104,7 +112,7 @@ func NewS3Store(cfg S3Config) (*S3Store, error) {
 			return nil, fmt.Errorf("store: create bucket %s: %w", cfg.Bucket, err)
 		}
 	}
-	return &S3Store{client: cl, bucket: cfg.Bucket, prefix: joinKey(cfg.RepoPrefix, cfg.BaseRepo)}, nil
+	return &S3Store{client: cl, endpoint: cfg.Endpoint, bucket: cfg.Bucket, prefix: joinKey(cfg.RepoPrefix, cfg.BaseRepo)}, nil
 }
 
 func joinKey(a, b string) string {

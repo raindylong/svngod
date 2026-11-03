@@ -37,6 +37,15 @@ func NewFileStore(base string) (*FileStore, error) {
 	return NewFileStoreWithSync(base, true)
 }
 
+// Identity names this replica's location for canonical mirror ordering.
+func (s *FileStore) Identity() string {
+	abs, err := filepath.Abs(s.base)
+	if err != nil {
+		abs = s.base
+	}
+	return "file://" + filepath.ToSlash(abs)
+}
+
 // NewFileStoreWithSync is NewFileStore with an explicit durability mode.
 // sync=false is for tests and disposable caches; acknowledged commits are not
 // guaranteed to survive a host crash without it.
