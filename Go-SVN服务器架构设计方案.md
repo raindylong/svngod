@@ -232,3 +232,27 @@
 - **代码层原子性已就位**：`CommitTxn` 入口已有 `r.mu` 串行锁 + 路径级乐观并发控制（目标路径在 baseRev..HEAD 被改即 E160024，且拒绝发生在写 block 之前）；block 按修订号寻址（`LooseRev(sh, N)`）不覆盖。单进程 + 串行锁下假 CAS 足够安全；真 CAS 是为多实例/多进程准备的加强。
 - **当前阻碍（环境层，非代码）**：RustFS（S3 网关）后台运行不稳定——压测后崩溃/不响应，导致 svn 客户端请求挂起（超时无响应）、纯 S3 后端与混合镜像（备 S3 读转备）都无法可靠运行。需先排查并稳定 RustFS（数据一致性、连接池、heal 后台任务），纯 S3 后端的原子性才能在稳定基线上做终验。
 
+
+### 中文目录与文件名全链路支持（2026-11-03，git 7e839d5）
+
+测试基线：chaos1m 仓库，4 个 svngod 进程（18600–18603）+ 主备 RustFS（19111/19112，主备模式、无仲裁），逐文件 MD5 对账、双副本 `svnadmin verify`、逐修订 revblock SHA 跨副本比较。覆盖 UTF-8 树：中文/繁體/日本語/한국어/emoji 目录，`# ? % &`、空格、全角括号、中文+ASCII 混合文件名，以及空目录。
+
+**发现并修复的 4 个协议缺陷**
+
+1. **COPY 源 `!svn/rvr/<rev>` 返回 400**（`internal/server/dav.go`）：`svn mv`/`svn cp` 的 COPY 源是 `!svn/rvr/<peg>`，解析为 `resRev`，但 `handleCopyMove` 只接受 `resBaseline/resBaselineColl/resTxn`，落入 default → 400。现将 `resRev`、`resVersion` 与 baseline 同视为版本化源。
+2. **复制后修改的文件 PUT 解码失败**（`internal/server/commit.go`）：`svn mv` 一个已修改文件时，COPY 把源文本放进事务，随后 PUT 的 svndiff 相对**复制源**、且不带 `X-SVN-Version-Name`；原实现按空 base 解码 → `source window out of bounds` → 400。现以事务内该路径的 copyFrom（或同事务复制的内存字节）作为 delta base，并对其校验 `X-SVN-Base-Fulltext-MD5`。
+3. **PUT 对已存在工作资源返回 201**：COPY 已在事务中创建节点，PUT 应返回 204；svn 客户端收到 201 会以 `Path ... unexpectedly created` 中止。现按“事务中是否已有该节点”区分 201/204。
+4. **复制节点提交时忽略 PUT 文本**（`internal/fs/repo.go`）：`ActionCopy` 只深拷贝源节点，修改后的内容被丢弃（重命名后提交的是旧内容）。新增 `TextSet` 标记，贯穿 `txnChange`、持久化 fragment、`fs.Change`；复制节点按 PUT 的 full text/delta/chunk/external ref 替换继承文本，并修正“显式空内容 PUT 被旧文本回填”的问题。
+5. **`svngocli upload` 丢失空目录**（`cmd/svngocli/main.go`、`internal/server/bundle.go`）：上传只采集文件。现遍历时采集目录，`!svngod/stat` 对目录返回 `kind=dir`，仅提交 HEAD 不存在的目录——空目录可创建，重复上传仍是 no-op（幂等）。
+
+**测试结果（全部通过）**
+
+- bundle 上传含 10 个中文/特殊字符文件 + 7 个目录（含 4 个空目录）→ r1752；两实例 `ls -R`、export、逐文件 MD5 一致；按段 percent-encode 的 `svn cat`（`# ? %`、空格、全角）全部正确。
+- 原生提交修改 + 新增 + `svn mv` 重命名 + `svn rm` → r1753；中文提交消息保留，另一实例 export 对账一致。
+- 原生 `svn mkdir --parents`（空目录）、`svn cp` 文件、`svn cp -r` 目录、`svn mv` 目录、二进制文件修改 → r1754；copyfrom 路径/修订正确，空目录可列出，13 个文件 MD5 全等。
+- 特殊字符文件修改提交 + 新增 `问号?文件.txt` → r1870/1871；export 对账 6/6 一致。
+- 4 实例并发中文混合测试两轮：每轮 4 个 WC、各 15 轮（新增/修改/重命名/删除/空目录），共 100+ 修订；四实例 HEAD 一致、四份 export 与四份 WC 完全一致；两副本 verify 通过，新增修订 revblock SHA 逐条相等；服务端无 400/500。
+- 故障读取：停备用 RustFS 后从主实例 export 成功；恢复备用并确认可服务后停主，从另一实例 export 成功。
+- 终点校验：r1922 双副本 `verify` 均报 no integrity issues；r1868..1922 共 55 个 revblock SHA 全部一致。
+
+**测试脚本修正**：`svn ls -R` 的期望集合需包含目录；`export` 返回值应比较 `returncode`；主节点故障测试必须先等备用 S3 真正应答（TCP+HTTP），仅等进程存在会与镜像健康探测产生竞态，误报 500。
