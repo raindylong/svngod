@@ -349,6 +349,26 @@ func (r *Repo) setHead(rev uint64) {
 	r.headMu.Unlock()
 }
 
+// readCurrentStrict reads the current pointer from the authoritative replica.
+// CommitTxn uses it instead of readCurrent: after a transient arbiter read
+// failure the lenient path may fall back to a stale standby, and choosing
+// head+1 from a stale value would write a revision block over an existing
+// revision on the arbiter (the following CAS would then fail, but the block
+// would already be damaged).
+func (r *Repo) readCurrentStrict() (*Current, string, error) {
+	ctx := context.Background()
+	key := r.keys.Current()
+	if ar, ok := r.store.(store.ArbiterReader); ok && ar.ArbiterRequired() {
+		b, err := ar.ArbiterGet(ctx, key)
+		if err != nil {
+			return nil, "", fmt.Errorf("fs: read authoritative head: %w", err)
+		}
+		cur, err := UnmarshalCurrent(b)
+		return cur, store.ContentETag(b), err
+	}
+	return r.readCurrent()
+}
+
 func (r *Repo) readCurrent() (*Current, string, error) {
 	ctx := context.Background()
 	key := r.keys.Current()
@@ -986,7 +1006,7 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 	if len(changes) == 0 {
 		return 0, errors.New("fs: empty commit")
 	}
-	cur, etag, err := r.readCurrent()
+	cur, etag, err := r.readCurrentStrict()
 	if err != nil {
 		return 0, err
 	}

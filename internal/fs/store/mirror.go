@@ -1691,11 +1691,12 @@ func (m *MirrorStore) anyDown() bool {
 // healthProbeInterval / healthProbeTimeout bound how long a hung but still
 // connected replica (a paused process, a black-holed network path) can keep
 // receiving "successful" buffered writes before it is taken out of service.
-// Three strikes at 5s keep a busy-but-healthy node from being evicted: a 2s
-// list deadline flapped a standby under a 1M-object repair scan.
+// Three strikes at 15s keep a busy-but-healthy node from being evicted: under
+// a multi-repository repair scan RustFS repeatedly needed more than 5s to
+// answer one list, which flapped a live standby every minute.
 const (
 	healthProbeInterval = 5 * time.Second
-	healthProbeTimeout  = 5 * time.Second
+	healthProbeTimeout  = 15 * time.Second
 	healthProbeStrikes  = 3
 )
 
@@ -1822,7 +1823,10 @@ func (m *MirrorStore) downReachable() bool {
 		return true
 	}
 	for _, i := range down {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		// A backend under a full repair scan can take several seconds to
+		// answer; a 2s budget kept a live standby unreachable, so recovery
+		// never started and the mirror stayed out of service for good.
+		ctx, cancel := context.WithTimeout(context.Background(), healthProbeTimeout)
 		_, _, err := m.mirrors[i].ListPrefix(ctx, prefix, "", 1)
 		cancel()
 		if err == nil {
