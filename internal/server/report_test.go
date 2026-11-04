@@ -602,3 +602,35 @@ func TestWritePropRemovals(t *testing.T) {
 		t.Fatalf("removed a still-present or revision property:\n%s", out)
 	}
 }
+
+// A checkout of a subdirectory inside a copied tree must use the copy
+// revision for inherited files; their own node revision predates the path.
+func TestCopyFloorForSubtreeCheckout(t *testing.T) {
+	ts, repo, _ := testServer(t, "", "")
+	defer ts.Close()
+	props := func(msg string) map[string]string {
+		return map[string]string{"svn:log": msg, "svn:author": "u", "svn:date": "2026-01-01T00:00:00Z"}
+	}
+	if _, err := repo.CommitTxn(1, []fs.Change{
+		{Path: "/trunk/dir/sub/f.txt", Action: fs.ActionAdd, Kind: fs.KindFile, Data: []byte("x")},
+	}, props("tree")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.CommitTxn(2, []fs.Change{{
+		Path: "/branches/br", Action: fs.ActionCopy, Kind: fs.KindDir,
+		CopyFromPath: "/trunk/dir", CopyFromRev: 2,
+	}}, props("copy")); err != nil {
+		t.Fatal(err)
+	}
+	floor := copyFloorFor(repo, 3, "/branches/br/sub")
+	if floor != 3 {
+		t.Fatalf("copy floor = %d, want the copy revision 3", floor)
+	}
+	nr, err := repo.Resolve(3, "/branches/br/sub/f.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pathCreatedRev(repo, nr) >= floor {
+		t.Fatalf("inherited file revision = %d, expected an older source revision", pathCreatedRev(repo, nr))
+	}
+}

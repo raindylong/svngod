@@ -211,7 +211,7 @@ func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name s
 		rp, _ := repo.GetRevProps(rev)
 		uuid, _ := repo.UUID()
 		b.WriteString("  <S:open-directory rev=\"" + strconv.FormatUint(anchorRev, 10) + "\">\n")
-		if err := s.updateWalkDir(&b, repo, base, rev, newPath, "open-directory", true, rp, uuid, walkWB, 0, limit, filesOnly, explicitDepth, 0, updateTarget, oldPath, sendAll); err != nil {
+		if err := s.updateWalkDir(&b, repo, base, rev, newPath, "open-directory", true, rp, uuid, walkWB, 0, limit, filesOnly, explicitDepth, copyFloorFor(repo, rev, newPath), updateTarget, oldPath, sendAll); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -233,7 +233,7 @@ func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name s
 	b.WriteString("  <S:target-revision rev=\"" + strconv.FormatUint(rev, 10) + "\"/>\n")
 	rp, _ := repo.GetRevProps(rev)
 	uuid, _ := repo.UUID()
-	if err := s.updateWalkDir(&b, repo, base, rev, rootPath, "open-directory", true, rp, uuid, wb, 0, limit, filesOnly, explicitDepth, 0, "", rootPath, sendAll); err != nil {
+	if err := s.updateWalkDir(&b, repo, base, rev, rootPath, "open-directory", true, rp, uuid, wb, 0, limit, filesOnly, explicitDepth, copyFloorFor(repo, rev, rootPath), "", rootPath, sendAll); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -399,6 +399,31 @@ func pathCreatedRev(repo *fs.Repo, nr *fs.NodeRev) uint64 {
 		return cr
 	}
 	return nr.Node.Rev
+}
+
+// copyFloorFor returns the newest revision at which an ancestor of p was
+// created by a copy. A checkout of a subdirectory inside a copied tree has no
+// copy metadata on the subdirectory itself, so the update report used each
+// inherited file's source revision for its checked-in URL. That revision does
+// not contain the branch path, and the client failed with E160013 while
+// checking out e.g. branches/br/sub. The floor makes the walker point at the
+// copy revision (or later), where the path exists.
+func copyFloorFor(repo *fs.Repo, rev uint64, p string) uint64 {
+	var floor uint64
+	cur := strings.TrimSuffix(p, "/")
+	for cur != "" && cur != "/" {
+		if nr, err := repo.Resolve(rev, cur); err == nil {
+			if cr, _, _, ok := copyOrigin(repo, nr); ok && cr > floor {
+				floor = cr
+			}
+		}
+		i := strings.LastIndexByte(cur, '/')
+		if i <= 0 {
+			break
+		}
+		cur = cur[:i]
+	}
+	return floor
 }
 
 // rvrHref builds a revision-resource URL for a path at its created revision.
