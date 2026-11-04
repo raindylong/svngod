@@ -151,6 +151,10 @@ func (r *Repo) reconcileJournal(force bool) {
 // complete, but whose HEAD CAS never happened (crash between WAL append and
 // publication). Entries that did not reach a quorum are ignored: they are the
 // remains of an aborted attempt.
+// journalReplayWindow bounds how many contiguous revision records one replay
+// pass may publish. It matches the largest commit batch.
+const journalReplayWindow = 256
+
 func (r *Repo) replayJournal() {
 	if !r.journal {
 		return
@@ -184,10 +188,12 @@ func (r *Repo) replayJournal() {
 	head := cur0.Head
 	// Only a contiguous run starting at head+1 can be published. Anything
 	// further ahead is a different writer's intent and must not be reordered.
-	// A missing or invalid record ends the search: probing the next seven
+	// A missing or invalid record ends the search: probing the next window of
 	// revision numbers on every HeadFresh cost one backend retry each while a
 	// replica was down (measured as ~10s per upload in availability mode).
-	for rev := head + 1; rev <= head+8; rev++ {
+	// The window covers one maximum-size commit batch so a crash after the
+	// batch's WAL append still rolls the whole batch forward.
+	for rev := head + 1; rev <= head+journalReplayWindow; rev++ {
 		key := r.keys.Journal(rev)
 		// Cheap presence probe first. A plain Get reads the primary and does
 		// not touch an out-of-service replica, so the common case (no pending

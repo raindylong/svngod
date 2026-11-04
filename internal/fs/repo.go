@@ -992,6 +992,9 @@ func (r *Repo) ensureNoPendingPublication(head uint64) error {
 func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]string) (uint64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if revProps == nil {
+		revProps = defaultRevProps()
+	}
 
 	// Serialise finalize across processes sharing the store: writing the
 	// revision block before the `current` CAS is only safe if no second
@@ -1108,252 +1111,19 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 	phase("ood")
 	N := cur.Head + 1
 	ctx := context.Background()
-
-	var root *tnode
 	hb, err := r.readBlock(cur.Head)
 	if err != nil {
 		return 0, err
 	}
-	root, err = r.loadNode(hb.Root)
+	root, err := r.loadNode(hb.Root)
 	if err != nil {
 		return 0, err
 	}
-	for i := range changes {
-		if err := r.applyChange(root, &changes[i]); err != nil {
-			return 0, err
-		}
-	}
-	root.dirty = true
-
-	// collect dirty nodes top-down
-	var dirty []*tnode
-	var walk func(t *tnode)
-	walk = func(t *tnode) {
-		if !t.dirty {
-			return
-		}
-		dirty = append(dirty, t)
-		for _, c := range t.children {
-			walk(c)
-		}
-	}
-	walk(root)
-	if len(dirty) == 0 {
-		return 0, errors.New("fs: empty commit")
-	}
-	for i, t := range dirty {
-		t.newID = uint64(i + 1)
+	rbBytes, rpBytes, err := r.buildRevisionLocked(ctx, root, cur.Head, N, uint64(cur.Created), changes, revProps)
+	if err != nil {
+		return 0, err
 	}
 
-	nodes := make([]*NodeRev, 0, len(dirty))
-	for _, t := range dirty {
-		nr := &NodeRev{Kind: t.kind, Node: NodeID{Rev: N, ID: t.newID}, Props: copyProps(t.props), Pred: t.id}
-		if t.copyFrom != nil {
-			cf := *t.copyFrom
-			nr.CopyFrom = &cf
-			nr.CopyFromPath = t.copyFromPath
-			nr.CopyFromRev = t.copyFromRev
-		}
-		if t.kind == KindFile {
-			if t.deltaRep {
-				if t.deltaBase.IsZero() {
-					return 0, errors.New("fs: delta change without a base")
-				}
-				bn, berr := r.GetNodeRev(t.deltaBase)
-				if berr != nil {
-					return 0, berr
-				}
-				nr.TextRep = TextRepDelta
-				nr.Text = append([]byte(nil), t.delta...)
-				base := t.deltaBase
-				nr.Base = &base
-				nr.DeltaDepth = bn.DeltaDepth + 1
-				nr.TotalSize = t.deltaTotal
-				if t.hasMD5 {
-					copy(nr.TextMD5[:], t.dataMD5[:])
-				}
-				if t.hasSHA1 {
-					nr.TextSHA1 = t.dataSHA1
-				}
-				nodes = append(nodes, nr)
-				continue
-			}
-			if len(t.chunkManifest) > 0 {
-				nr.TextRep = TextRepChunked
-				nr.Text = append([]byte(nil), t.chunkManifest...)
-				nr.TotalSize = t.chunkTotal
-				nr.TextSize = t.chunkTotal
-				if t.hasMD5 {
-					nr.TextMD5 = t.dataMD5
-				}
-				if t.hasSHA1 {
-					nr.TextSHA1 = t.dataSHA1
-				}
-				nodes = append(nodes, nr)
-				continue
-			}
-			if len(t.data) > cdc.Threshold {
-				manifest, total, cerr := r.storeChunkedReader(ctx, bytes.NewReader(t.data))
-				if cerr != nil {
-					return 0, cerr
-				}
-				nr.TextRep = TextRepChunked
-				nr.Text = manifest
-				nr.TotalSize = uint64(total)
-				nr.TextSize = uint64(total)
-				nr.TextMD5 = md5.Sum(t.data)
-				nr.TextSHA1 = sha1.Sum(t.data)
-				nodes = append(nodes, nr)
-				continue
-			}
-			if t.textRef != "" {
-				sum, herr := hex.DecodeString(t.textRef)
-				if herr != nil || len(sum) != 16 {
-					return 0, errors.New("fs: bad text ref")
-				}
-				if ok, eerr := r.store.Exists(ctx, r.keys.Text(t.textRef)); eerr != nil || !ok {
-					return 0, errors.New("fs: uploaded text object missing")
-				}
-				copy(nr.TextMD5[:], sum)
-				if t.hasSHA1 {
-					nr.TextSHA1 = t.dataSHA1
-				}
-				nr.TextRep = TextRepExternal
-				nr.TextRef = t.textRef
-				nr.TextSize = t.textSize
-				nr.TotalSize = t.textSize
-				nr.DeltaDepth = 0
-				nodes = append(nodes, nr)
-				continue
-			}
-			if t.dataFile != "" {
-				if st, serr := os.Stat(t.dataFile); serr == nil && st.Size() > cdc.Threshold {
-					f, oerr := os.Open(t.dataFile)
-					if oerr != nil {
-						return 0, oerr
-					}
-					var manifest []byte
-					var total int64
-					var cerr error
-					if t.hasMD5 && t.hasSHA1 {
-						// The upload already hashed the body while spooling.
-						manifest, total, cerr = r.storeChunkedReader(ctx, f)
-					} else {
-						h := md5.New()
-						hs := sha1.New()
-						manifest, total, cerr = r.storeChunkedReader(ctx, io.TeeReader(f, io.MultiWriter(h, hs)))
-						if cerr == nil {
-							copy(nr.TextMD5[:], h.Sum(nil))
-							copy(nr.TextSHA1[:], hs.Sum(nil))
-						}
-					}
-					f.Close()
-					if cerr != nil {
-						return 0, cerr
-					}
-					nr.TextRep = TextRepChunked
-					nr.Text = manifest
-					nr.TotalSize = uint64(total)
-					nr.TextSize = uint64(total)
-					if t.hasMD5 {
-						nr.TextMD5 = t.dataMD5
-					}
-					if t.hasSHA1 {
-						nr.TextSHA1 = t.dataSHA1
-					}
-					nodes = append(nodes, nr)
-					continue
-				}
-				var known *[16]byte
-				if t.hasMD5 {
-					known = &t.dataMD5
-				}
-				var knownSHA1 *[20]byte
-				if t.hasSHA1 {
-					knownSHA1 = &t.dataSHA1
-				}
-				sum, sha, size, ref, xerr := r.externalizeFile(ctx, t.dataFile, known, knownSHA1)
-				if xerr != nil {
-					return 0, xerr
-				}
-				copy(nr.TextMD5[:], sum[:])
-				nr.TextSHA1 = sha
-				nr.TextRep = TextRepExternal
-				nr.TextRef = ref
-				nr.TextSize = size
-				nr.TotalSize = size
-				nr.DeltaDepth = 0
-				nodes = append(nodes, nr)
-				continue
-			}
-			if err := r.ensureData(t); err != nil {
-				return 0, err
-			}
-			sum := md5.Sum(t.data)
-			copy(nr.TextMD5[:], sum[:])
-			if t.hasSHA1 {
-				nr.TextSHA1 = t.dataSHA1
-			} else if len(t.data) > 0 {
-				nr.TextSHA1 = sha1.Sum(t.data)
-			}
-			if t.id.IsZero() || t.deltaDepth+1 >= r.maxDelta {
-				nr.DeltaDepth = 0
-				if len(t.data) > externalTextThreshold {
-					ref := hex.EncodeToString(nr.TextMD5[:])
-					key := r.keys.Text(ref)
-					if ok, herr := r.store.Exists(ctx, key); herr != nil || !ok {
-						if perr := r.store.Put(ctx, key, t.data); perr != nil {
-							return 0, perr
-						}
-					}
-					nr.TextRep = TextRepExternal
-					nr.TextRef = ref
-					nr.TextSize = uint64(len(t.data))
-				} else {
-					nr.TextRep = TextRepFull
-					nr.Text = append([]byte(nil), t.data...)
-				}
-			} else {
-				delta, derr := svndiff.Encode(t.baseText, t.data)
-				if derr != nil {
-					return 0, derr
-				}
-				nr.TextRep = TextRepDelta
-				nr.Text = delta
-				base := t.id
-				nr.Base = &base
-				nr.DeltaDepth = t.deltaDepth + 1
-			}
-			nr.TotalSize = uint64(len(t.data))
-		} else {
-			if err := r.ensureDir(t); err != nil {
-				return 0, err
-			}
-			if r.dirBuckets && len(t.children) > dirBucketThreshold {
-				ref, size, werr := r.writeDirBuckets(ctx, t, N)
-				if werr != nil {
-					return 0, werr
-				}
-				nr.TextRep = TextRepExternal
-				nr.TextRef = ref
-				nr.TextSize = uint64(size)
-				nr.Children = nil
-			} else {
-				for name, c := range t.children {
-					cid := c.id
-					if c.dirty {
-						cid = NodeID{Rev: N, ID: c.newID}
-					}
-					nr.Children = append(nr.Children, Child{Name: name, ID: cid})
-				}
-			}
-		}
-		nodes = append(nodes, nr)
-	}
-
-	phase("build")
-	rootID := NodeID{Rev: N, ID: root.newID}
-	rb := NewRevBlock(N, cur.Head, rootID, nodes)
 
 	// The lease may have expired during a long finalize; stop before writing
 	// a revision block that another replica could already be publishing.
@@ -1361,13 +1131,6 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 		return 0, err
 	}
 	sh := r.shard(N)
-	rbBytes := rb.Marshal()
-	rp := NewRevProps()
-	rp.Props = revProps
-	if rp.Props == nil {
-		rp.Props = map[string]string{"svn:author": "svngod", "svn:date": time.Now().UTC().Format("2006-01-02T15:04:05.000000Z")}
-	}
-	rpBytes := rp.Marshal()
 	// The revision block and its properties are independent objects; writing
 	// them concurrently saves one ordered write round trip per mirror on the
 	// commit path (each Put itself targets the arbiter before the standby).
@@ -1401,7 +1164,7 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 		return 0, err
 	}
 	if err := r.writeCommitJournal(ctx, N, cur.Head, lease.token, nc.Created, rbBytes,
-		r.keys.LooseRev(sh, N), r.keys.LooseRevProps(sh, N), rp.Props); err != nil {
+		r.keys.LooseRev(sh, N), r.keys.LooseRevProps(sh, N), revProps); err != nil {
 		return 0, err
 	}
 	if err := lease.Verify(ctx, r.store); err != nil {

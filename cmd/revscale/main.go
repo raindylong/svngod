@@ -44,6 +44,7 @@ var (
 	bench     = flag.Bool("bench", false, "print every commit latency (benchmark mode)")
 	progress  = flag.Duration("progress", time.Second, "progress interval")
 	rawBench  = flag.Int("raw", 0, "measure raw 1KiB Put/Get round trips and exit")
+	batch     = flag.Int("batch", 1, "revisions per group commit (1 = one commit per revision)")
 )
 
 var authors = []string{"alice", "bob", "carol", "admin", "dave", "erin", "frank", "grace"}
@@ -141,44 +142,103 @@ func main() {
 
 	t0 := time.Now()
 	var wg sync.WaitGroup
-	for w := 0; w < *workers; w++ {
+	var taken int64
+	if *batch > 1 {
 		wg.Add(1)
-		go func(w int) {
+		go func() {
 			defer wg.Done()
-			rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(w)))
+			rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 			for {
 				select {
 				case <-stop:
 					return
 				default:
 				}
-				n := atomic.AddInt64(&done, 1)
-				if first+n > last {
+				remaining := *target - atomic.LoadInt64(&done)
+				if remaining <= 0 {
 					return
 				}
-				idx := first + n
-				ch := changeFor(idx, rng, *mixed)
-				props := map[string]string{
-					"svn:author": authors[idx%int64(len(authors))],
-					"svn:date":   time.Now().UTC().Format("2006-01-02T15:04:05.000000Z"),
+				cnt := *batch
+				if int64(cnt) > remaining {
+					cnt = int(remaining)
+				}
+				start := atomic.AddInt64(&taken, int64(cnt)) - int64(cnt)
+				if first+start+int64(cnt) > last {
+					return
+				}
+				reqs := make([]fs.BatchCommit, 0, cnt)
+				for j := 0; j < cnt; j++ {
+					idx := first + start + int64(j) + 1
+					reqs = append(reqs, fs.BatchCommit{
+						Changes: changeFor(idx, rng, *mixed),
+						RevProps: map[string]string{
+							"svn:author": authors[idx%int64(len(authors))],
+							"svn:date":   time.Now().UTC().Format("2006-01-02T15:04:05.000000Z"),
+						},
+					})
 				}
 				ct := time.Now()
-				_, cerr := r.CommitTxn(0, ch, props)
+				revs, errs, cerr := r.CommitBatch(reqs)
 				d := time.Since(ct)
+				okN := 0
+				for j := range reqs {
+					if cerr != nil || errs[j] != nil {
+						atomic.AddInt64(&errCount, 1)
+						if atomic.LoadInt64(&errCount) <= 5 {
+							e := cerr
+							if e == nil {
+								e = errs[j]
+							}
+							fmt.Printf("batch rev %d ERR %v\n", revs[j], e)
+						}
+						continue
+					}
+					okN++
+				}
 				atomic.AddInt64(&sumMs, d.Milliseconds())
-				if cerr != nil {
-					atomic.AddInt64(&errCount, 1)
-					fmt.Printf("rev %d ERR %v\n", idx, cerr)
-					if *bench {
+				atomic.AddInt64(&done, int64(okN))
+			}
+		}()
+	} else {
+		for w := 0; w < *workers; w++ {
+			wg.Add(1)
+			go func(w int) {
+				defer wg.Done()
+				rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(w)))
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					n := atomic.AddInt64(&done, 1)
+					if first+n > last {
 						return
 					}
-					continue
+					idx := first + n
+					ch := changeFor(idx, rng, *mixed)
+					props := map[string]string{
+						"svn:author": authors[idx%int64(len(authors))],
+						"svn:date":   time.Now().UTC().Format("2006-01-02T15:04:05.000000Z"),
+					}
+					ct := time.Now()
+					_, cerr := r.CommitTxn(0, ch, props)
+					d := time.Since(ct)
+					atomic.AddInt64(&sumMs, d.Milliseconds())
+					if cerr != nil {
+						atomic.AddInt64(&errCount, 1)
+						fmt.Printf("rev %d ERR %v\n", idx, cerr)
+						if *bench {
+							return
+						}
+						continue
+					}
+					if *bench {
+						fmt.Printf("%d %dms\n", idx, d.Milliseconds())
+					}
 				}
-				if *bench {
-					fmt.Printf("%d %dms\n", idx, d.Milliseconds())
-				}
-			}
-		}(w)
+			}(w)
+		}
 	}
 
 	tick := time.NewTicker(*progress)
