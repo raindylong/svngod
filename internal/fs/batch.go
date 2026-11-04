@@ -277,6 +277,9 @@ type batchPlan struct {
 
 // BatchCommit is one request inside CommitBatch.
 type BatchCommit struct {
+	// BaseRev is the transaction base revision for per-path out-of-date
+	// checks; 0 selects bulk semantics (add-existing / delete-missing only).
+	BaseRev  uint64
 	Changes  []Change
 	RevProps map[string]string
 }
@@ -334,22 +337,46 @@ func (r *Repo) lookupTree(root *tnode, path string) (*tnode, bool) {
 	return cur, true
 }
 
-// checkBulkChange applies the baseRev==0 conflict rules inside a batch: an add
-// of an existing path and a delete of a missing path are conflicts. Bulk
-// writers pass base 0, so there is no per-path base revision to compare.
-func (r *Repo) checkBulkChange(root *tnode, ch *Change) error {
-	if ch.Noop {
+// checkChangeInTree is the batch equivalent of CommitTxn's per-path
+// out-of-date loop: the node is looked up in the evolving tree (which already
+// contains the batch's earlier revisions) instead of the published HEAD.
+func (r *Repo) checkChangeInTree(root *tnode, ch *Change, baseRev uint64) error {
+	if ch.Noop || ch.Path == "/" || ch.Kind == KindDir {
 		return nil
 	}
-	switch ch.Action {
-	case ActionAdd:
-		if _, ok := r.lookupTree(root, ch.Path); ok {
+	base := ch.BaseRev
+	if base == 0 {
+		base = baseRev
+	}
+	t, ok := r.lookupTree(root, ch.Path)
+	if ok {
+		if base == 0 {
+			if ch.Action == ActionAdd {
+				return &OutOfDateError{Path: ch.Path}
+			}
+			return nil
+		}
+		if t.id.Rev > base {
 			return &OutOfDateError{Path: ch.Path}
 		}
-	case ActionDelete:
-		if _, ok := r.lookupTree(root, ch.Path); !ok {
-			return fmt.Errorf("fs: delete of nonexistent path %s", ch.Path)
+		if len(ch.Delta) > 0 {
+			bnr, err := r.Resolve(base, ch.Path)
+			if err != nil || t.id != bnr.Node {
+				return &OutOfDateError{Path: ch.Path}
+			}
+			if _, err := r.deltaBaseOf(bnr, ch.DeltaBase); err != nil {
+				return &OutOfDateError{Path: ch.Path}
+			}
 		}
+		return nil
+	}
+	if base > 0 {
+		if _, err := r.Resolve(base, ch.Path); err == nil {
+			return &OutOfDateError{Path: ch.Path}
+		}
+	}
+	if ch.Action == ActionDelete {
+		return fmt.Errorf("fs: delete of nonexistent path %s", ch.Path)
 	}
 	return nil
 }
@@ -422,7 +449,7 @@ func (r *Repo) CommitBatch(reqs []BatchCommit) ([]uint64, []error, error) {
 		}
 		bad := false
 		for _, ch := range req.Changes {
-			if cerr := r.checkBulkChange(root, &ch); cerr != nil {
+			if cerr := r.checkChangeInTree(root, &ch, req.BaseRev); cerr != nil {
 				errs[i] = cerr
 				bad = true
 				break

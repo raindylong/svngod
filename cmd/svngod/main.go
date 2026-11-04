@@ -58,6 +58,9 @@ type options struct {
 	prefix    string
 	useSSL    bool
 
+	commitBatch    int
+	commitWindowMs int
+
 	hooksDir       string
 	tlsCert        string
 	tlsKey         string
@@ -117,6 +120,8 @@ func main() {
 	fl := flag.NewFlagSet("svngod", flag.ExitOnError)
 	fl.StringVar(&o.addr, "addr", ":8080", "listen address")
 	fl.IntVar(&o.maxUploads, "max-uploads", 16, "maximum concurrent PUT/bundle uploads (0 = unlimited)")
+	fl.IntVar(&o.commitBatch, "commit-batch", 16, "group concurrently arriving commits into batches of this size (0/1 = off)")
+	fl.IntVar(&o.commitWindowMs, "commit-window-ms", 2, "milliseconds to wait for more commits once a batch starts")
 	fl.IntVar(&o.maxUserUploads, "max-user-uploads", 4, "maximum concurrent uploads per user (0 = unlimited)")
 	fl.BoolVar(&o.metrics, "metrics", true, "expose Prometheus metrics at /_metrics")
 	fl.StringVar(&o.basePath, "base-path", "/svn", "URL prefix for repositories")
@@ -144,13 +149,14 @@ func main() {
 	_ = fl.Parse(os.Args[1:])
 
 	if configPath != "" {
-		runMultiRepo(configPath)
+		runMultiRepo(configPath, o.commitBatch, o.commitWindowMs)
 		return
 	}
 
 	if o.repoRoot == "" {
 		log.Fatal("--repo-root required")
 	}
+	fs.ConfigureCommitBatch(o.commitBatch, o.commitWindowMs)
 	st, err := o.makeStore()
 	if err != nil {
 		log.Fatal(err)
@@ -219,11 +225,12 @@ func newHTTPServer(addr string, h http.Handler) *http.Server {
 
 // runMultiRepo starts a server configured from a JSON file with one or more
 // repositories, each with its own storage backend, authz file and auth chain.
-func runMultiRepo(configPath string) {
+func runMultiRepo(configPath string, commitBatch, commitWindowMs int) {
 	cfg, err := loadConfig(configPath)
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
+	fs.ConfigureCommitBatch(commitBatch, commitWindowMs)
 	repos, err := cfg.repoConfigs()
 	if err != nil {
 		log.Fatalf("build repos: %v", err)

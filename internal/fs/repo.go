@@ -61,6 +61,8 @@ type Repo struct {
 	// journal enables the commit WAL for mirror stores; writeQuorum > 1 makes
 	// the record (and the lease) quorum-replicated, else it is best-effort.
 	journal bool
+	// batch groups concurrent online commits (nil when disabled).
+	batch *commitBatcher
 	// journalMu serialises WAL replay and throttles it during reads.
 	journalMu sync.Mutex
 	journalAt time.Time
@@ -241,6 +243,12 @@ func OpenRepo(st store.Store, prefix string) (*Repo, error) {
 		chunkParams: cp, dirBuckets: f.DirBuckets, writeQuorum: writeQuorumOf(st),
 		journal: journalOf(st),
 		cache:   cache.New(1 << 16), nodeCache: make(map[cache.Key]*NodeRev),
+	}
+	if commitBatchEnabled() {
+		r.batch = newCommitBatcher(r)
+	}
+	if commitBatchEnabled() {
+		r.batch = newCommitBatcher(r)
 	}
 	// Replay the commit WAL before the mirror adopts a HEAD: a quorum-acked
 	// record whose CAS never ran is completed here.
@@ -988,8 +996,18 @@ func (r *Repo) ensureNoPendingPublication(head uint64) error {
 	return err
 }
 
-// CommitTxn applies the changes as a single new revision and returns its number.
+// CommitTxn applies the changes as a single new revision and returns its
+// number. With online batching enabled, concurrent callers share one lease
+// and one HEAD CAS (see CommitBatch); otherwise the commit runs directly.
 func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]string) (uint64, error) {
+	if r.batch != nil {
+		return r.batch.submit(baseRev, changes, revProps)
+	}
+	return r.commitTxn(baseRev, changes, revProps)
+}
+
+// commitTxn is the direct single-revision commit path.
+func (r *Repo) commitTxn(baseRev uint64, changes []Change, revProps map[string]string) (uint64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if revProps == nil {
