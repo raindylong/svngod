@@ -257,17 +257,28 @@ func TestLeaseVerifyRetriesTransientErrors(t *testing.T) {
 		t.Fatalf("Verify after transient read errors: %v", err)
 	}
 
+	// Verify is read-only, so a failing CAS cannot make it claim the lease is
+	// gone (the heartbeat owns renewal).
 	st.mu.Lock()
 	st.failCAS = 100
 	st.mu.Unlock()
+	if err := l.Verify(context.Background(), st); err != nil {
+		t.Fatalf("Verify must not depend on lease CAS: %v", err)
+	}
+
+	// Persistent read failures are reported as retryable, not as a lost lease.
+	st.mu.Lock()
+	st.failCAS = 0
+	st.failGet = 1000
+	st.mu.Unlock()
 	err = l.Verify(context.Background(), st)
 	if !errors.Is(err, ErrLeaseUnverified) {
-		t.Fatalf("Verify after persistent write errors = %v, want ErrLeaseUnverified", err)
+		t.Fatalf("Verify after persistent read errors = %v, want ErrLeaseUnverified", err)
 	}
 	if errors.Is(err, ErrLeaseLost) {
 		t.Fatal("a transient failure must not be reported as a lost lease")
 	}
 	st.mu.Lock()
-	st.failCAS = 0
+	st.failGet = 0
 	st.mu.Unlock()
 }

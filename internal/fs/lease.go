@@ -170,19 +170,24 @@ func (l *commitLease) renewOwn(ctx context.Context, st store.Store) error {
 	return err
 }
 
-// Verify fails once the lease was lost (expired, broken, or replaced).
+// Verify fails once the lease was lost (expired, broken, or replaced). It is
+// read-only: the heartbeat is the single renewer, so a commit check can never
+// race the heartbeat's CAS and turn a live lease into PreconditionFailed.
 func (l *commitLease) Verify(ctx context.Context, st store.Store) error {
 	if l.lost.Load() {
 		return ErrLeaseLost
 	}
 	var last error
 	for attempt := 0; attempt < leaseRetryAttempts; attempt++ {
-		err := l.renewOwn(ctx, st)
+		cur, err := l.readOwn(ctx, st)
 		if err == nil {
-			return nil
+			if strings.HasPrefix(string(cur), l.token+" ") {
+				return nil
+			}
+			return ErrLeaseLost
 		}
-		if errors.Is(err, ErrLeaseLost) {
-			return err
+		if errors.Is(err, store.ErrNotFound) {
+			return ErrLeaseLost
 		}
 		last = err
 		if ctx.Err() != nil {

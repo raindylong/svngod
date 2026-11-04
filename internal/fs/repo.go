@@ -34,6 +34,11 @@ var ErrRepoNotFound = errors.New("fs: repository not found")
 var ErrPathNotFound = errors.New("fs: path not found")
 var ErrOutOfDate = errors.New("fs: commit base revision is out of date")
 
+// debugCommit logs per-phase commit timings (SVNGOD_DEBUG_COMMIT=1) so a slow
+// backend can be attributed to lease, head read, tree build, object writes or
+// the final CAS without a profiler.
+var debugCommit = os.Getenv("SVNGOD_DEBUG_COMMIT") == "1"
+
 // OutOfDateError identifies the path whose working-copy revision predates a
 // concurrent change. It unwraps to ErrOutOfDate so callers can keep using
 // errors.Is.
@@ -992,16 +997,25 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 	// revision block before the `current` CAS is only safe if no second
 	// replica is doing the same for the same revision number.
 	ctxLease := context.Background()
+	t0 := time.Now()
 	lease, lerr := r.acquireCommitLease(ctxLease)
 	if lerr != nil {
 		return 0, lerr
 	}
 	defer lease.Release(r.store)
+	phase := func(name string) {
+		if debugCommit {
+			log.Printf("commit phase %-9s %s", name, time.Since(t0))
+			t0 = time.Now()
+		}
+	}
+	phase("lease")
 
 	// Another process may have published through a different mirror primary
 	// while this one was stale; adopt the quorum-acked WAL before choosing the
 	// next revision number.
 	r.reconcileJournal(true)
+	phase("reconcile")
 
 	if len(changes) == 0 {
 		return 0, errors.New("fs: empty commit")
@@ -1017,6 +1031,7 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 	if perr := r.ensureNoPendingPublication(cur.Head); perr != nil {
 		return 0, perr
 	}
+	phase("head")
 	// Optimistic concurrency control: the client commits against a base
 	// revision. If the repository head has moved past it (another writer won
 	// the race), refuse so a stale txn cannot clobber newer data (lost update).
@@ -1090,6 +1105,7 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 			}
 		}
 	}
+	phase("ood")
 	N := cur.Head + 1
 	ctx := context.Background()
 
@@ -1335,6 +1351,7 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 		nodes = append(nodes, nr)
 	}
 
+	phase("build")
 	rootID := NodeID{Rev: N, ID: root.newID}
 	rb := NewRevBlock(N, cur.Head, rootID, nodes)
 
@@ -1372,6 +1389,7 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 	if rpErr != nil {
 		return 0, rpErr
 	}
+	phase("writes")
 	nc := &Current{Head: N, Created: cur.Created}
 	if nc.Created == 0 {
 		nc.Created = time.Now().Unix()
@@ -1396,6 +1414,7 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 		}
 		log.Printf("commit: lease unverified after WAL (rev %d); journal record is ours, publishing", N)
 	}
+	phase("journal")
 	// Chaos hook (test-only): exit after the WAL append but before the HEAD CAS
 	// to exercise journal roll-forward on a live store.
 	if os.Getenv("SVNGOD_CHAOS_AFTER_WAL") == "1" {
@@ -1420,6 +1439,7 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 		// invalidate cached HEAD-dependent state
 		r.cache.Clear()
 	}
+	phase("cas")
 	// Auto-pack the just-completed shard: when N is the last revision of a
 	// shard, its predecessor shard is complete and gets packed. This keeps the
 	// repository at ~O(shards) loose objects instead of O(revisions) — required
