@@ -198,3 +198,76 @@ func TestLeaseVerifyDetectsReplacement(t *testing.T) {
 	}
 	l.Release(st)
 }
+
+// flakyLeaseStore injects a bounded number of transient Get/CAS failures.
+type flakyLeaseStore struct {
+	store.Store
+	mu      sync.Mutex
+	failGet int
+	failCAS int
+}
+
+func (f *flakyLeaseStore) Get(ctx context.Context, key string, rng *store.Range) ([]byte, error) {
+	f.mu.Lock()
+	n := f.failGet
+	if n > 0 {
+		f.failGet--
+	}
+	f.mu.Unlock()
+	if n > 0 {
+		return nil, errors.New("temporary read failure")
+	}
+	return f.Store.Get(ctx, key, rng)
+}
+
+func (f *flakyLeaseStore) CAS(ctx context.Context, key, expect string, data []byte) (string, error) {
+	f.mu.Lock()
+	n := f.failCAS
+	if n > 0 {
+		f.failCAS--
+	}
+	f.mu.Unlock()
+	if n > 0 {
+		return "", errors.New("temporary write failure")
+	}
+	return f.Store.CAS(ctx, key, expect, data)
+}
+
+func TestLeaseVerifyRetriesTransientErrors(t *testing.T) {
+	base := store.NewMemoryStore()
+	if _, err := CreateRepo(base, "flaky", 4096, 64); err != nil {
+		t.Fatal(err)
+	}
+	st := &flakyLeaseStore{Store: base}
+	r, err := OpenRepo(st, "flaky")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l, err := r.acquireCommitLease(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Release(st)
+
+	// A backend blink must not be mistaken for a lost lease.
+	st.mu.Lock()
+	st.failGet = leaseRetryAttempts - 1
+	st.mu.Unlock()
+	if err := l.Verify(context.Background(), st); err != nil {
+		t.Fatalf("Verify after transient read errors: %v", err)
+	}
+
+	st.mu.Lock()
+	st.failCAS = 100
+	st.mu.Unlock()
+	err = l.Verify(context.Background(), st)
+	if !errors.Is(err, ErrLeaseUnverified) {
+		t.Fatalf("Verify after persistent write errors = %v, want ErrLeaseUnverified", err)
+	}
+	if errors.Is(err, ErrLeaseLost) {
+		t.Fatal("a transient failure must not be reported as a lost lease")
+	}
+	st.mu.Lock()
+	st.failCAS = 0
+	st.mu.Unlock()
+}

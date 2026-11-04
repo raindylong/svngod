@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -24,6 +25,10 @@ import (
 var (
 	ErrCommitBusy = errors.New("fs: another commit is in progress")
 	ErrLeaseLost  = errors.New("fs: commit lease lost")
+	// ErrLeaseUnverified means the backend could not confirm the lease after
+	// retries. Unlike ErrLeaseLost the lease may still be ours, so a commit
+	// stops before publishing and the client is told to retry.
+	ErrLeaseUnverified = errors.New("fs: commit lease unverified")
 
 	// Nanoseconds, accessed atomically: tests retune the timings while a
 	// background heartbeat from another lease may still be reading them.
@@ -117,7 +122,10 @@ func (l *commitLease) readOwn(ctx context.Context, st store.Store) ([]byte, erro
 			return ar.ArbiterGet(ctx, l.key)
 		}
 		b, count, err := l.qr.QuorumGet(ctx, l.key)
-		if err != nil || count < l.effectiveQuorum() {
+		if err != nil {
+			return nil, err
+		}
+		if count < l.effectiveQuorum() {
 			return nil, ErrLeaseLost
 		}
 		return b, nil
@@ -125,19 +133,67 @@ func (l *commitLease) readOwn(ctx context.Context, st store.Store) ([]byte, erro
 	return st.Get(ctx, l.key, nil)
 }
 
+// A lease read or renewal can fail because the backend blinked, not because
+// the lease changed hands. Treating any error as "lost" turned one transient
+// S3/TCP failure into a 503 for a commit whose WAL record was already durable
+// (the revision then rolled forward anyway, so the client saw a failure for a
+// commit that succeeded). Retry a few times before concluding anything: only a
+// different owner or a deleted lease is authoritative.
+const (
+	leaseRetryAttempts = 3
+	leaseRetryDelay    = 100 * time.Millisecond
+)
+
+// renewOwn refreshes the lease. It returns ErrLeaseLost only when another
+// owner (or no owner) holds the object; backend errors are returned unchanged
+// so the caller can retry or report a transient failure.
+func (l *commitLease) renewOwn(ctx context.Context, st store.Store) error {
+	cur, err := l.readOwn(ctx, st)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return ErrLeaseLost
+		}
+		return err
+	}
+	if !strings.HasPrefix(string(cur), l.token+" ") {
+		return ErrLeaseLost
+	}
+	if l.useQuorum() {
+		err = l.qr.CASQuorum(ctx, l.key, store.ContentETag(cur), l.payload(), l.effectiveQuorum())
+	} else {
+		// CAS keeps the same owner while refreshing the timestamp.
+		_, err = st.CAS(ctx, l.key, store.ContentETag(cur), l.payload())
+	}
+	if errors.Is(err, store.ErrPreconditionFailed) || errors.Is(err, store.ErrNotFound) {
+		return ErrLeaseLost
+	}
+	return err
+}
+
 // Verify fails once the lease was lost (expired, broken, or replaced).
 func (l *commitLease) Verify(ctx context.Context, st store.Store) error {
 	if l.lost.Load() {
 		return ErrLeaseLost
 	}
-	cur, err := l.readOwn(ctx, st)
-	if err != nil {
-		return ErrLeaseLost
+	var last error
+	for attempt := 0; attempt < leaseRetryAttempts; attempt++ {
+		err := l.renewOwn(ctx, st)
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, ErrLeaseLost) {
+			return err
+		}
+		last = err
+		if ctx.Err() != nil {
+			break
+		}
+		select {
+		case <-time.After(leaseRetryDelay):
+		case <-ctx.Done():
+		}
 	}
-	if !strings.HasPrefix(string(cur), l.token+" ") {
-		return ErrLeaseLost
-	}
-	return nil
+	return fmt.Errorf("%w: %v", ErrLeaseUnverified, last)
 }
 
 func (l *commitLease) Release(st store.Store) {
@@ -163,23 +219,28 @@ func (l *commitLease) keepAlive(ctx context.Context, st store.Store) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			cur, err := l.readOwn(ctx, st)
-			if err != nil || !strings.HasPrefix(string(cur), l.token+" ") {
-				l.lost.Store(true)
-				return
-			}
-			if l.useQuorum() {
-				if err := l.qr.CASQuorum(ctx, l.key, store.ContentETag(cur), l.payload(), l.effectiveQuorum()); err != nil {
-					l.lost.Store(true)
+			// A heartbeat failure is not proof the lease moved: retry before
+			// declaring it lost. Marking lost on the first backend blip used to
+			// fail a live commit after its WAL record was durable.
+			var err error
+			for attempt := 0; attempt < leaseRetryAttempts; attempt++ {
+				err = l.renewOwn(ctx, st)
+				if err == nil || errors.Is(err, ErrLeaseLost) {
+					break
+				}
+				if ctx.Err() != nil {
 					return
 				}
+				time.Sleep(leaseRetryDelay)
+			}
+			if err == nil {
 				continue
 			}
-			// CAS keeps the same owner while refreshing the timestamp.
-			if _, err := st.CAS(ctx, l.key, store.ContentETag(cur), l.payload()); err != nil {
+			if errors.Is(err, ErrLeaseLost) {
 				l.lost.Store(true)
 				return
 			}
+			log.Printf("lease: heartbeat failed, will retry on next tick: %v", err)
 		}
 	}
 }

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -300,5 +302,120 @@ func TestTrimJournal(t *testing.T) {
 	recs, err = r.JournalTail(10)
 	if err != nil || len(recs) != 1 || recs[0].Rev != 3 {
 		t.Fatalf("journal after trim: %+v err=%v", recs, err)
+	}
+}
+
+// replayRaceStore publishes a pending WAL record through a peer repository
+// just before the writer's own HEAD CAS, reproducing the cross-process race
+// between journal replay and a live commit.
+type replayRaceStore struct {
+	store.Store
+	once       sync.Once
+	currentKey string
+	peer       *Repo
+}
+
+func (s *replayRaceStore) Journaling() bool { return true }
+
+func (s *replayRaceStore) CAS(ctx context.Context, key, expect string, data []byte) (string, error) {
+	if s.peer != nil && key == s.currentKey {
+		s.once.Do(func() { s.peer.reconcileJournal(true) })
+	}
+	return s.Store.CAS(ctx, key, expect, data)
+}
+
+func TestCommitSurvivesConcurrentJournalReplay(t *testing.T) {
+	base := store.NewMemoryStore()
+	ws := &replayRaceStore{Store: base}
+	if _, err := CreateRepo(ws, "race", 4096, 64); err != nil {
+		t.Fatal(err)
+	}
+	r, err := OpenRepo(ws, "race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerStore := &replayRaceStore{Store: base}
+	peer, err := OpenRepo(peerStore, "race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws.currentKey = r.keys.Current()
+	ws.peer = peer
+
+	// Replay publishes the record before our CAS; the commit must still report
+	// success (the revision is exactly the one this writer built).
+	rev, err := r.CommitTxn(0, []Change{{Path: "/a", Action: ActionAdd, Kind: KindFile, Data: []byte("1")}}, nil)
+	if err != nil {
+		t.Fatalf("commit lost the CAS race to replay: %v", err)
+	}
+	if rev != 1 {
+		t.Fatalf("rev=%d, want 1", rev)
+	}
+	if h, _ := r.HeadFresh(); h != 1 {
+		t.Fatalf("head=%d, want 1", h)
+	}
+	// The next commit must proceed normally.
+	if rev, err := r.CommitTxn(1, []Change{{Path: "/b", Action: ActionAdd, Kind: KindFile, Data: []byte("2")}}, nil); err != nil || rev != 2 {
+		t.Fatalf("second commit rev=%d err=%v", rev, err)
+	}
+}
+
+// leaseLossStore makes lease CASes fail once the WAL record is durable,
+// simulating a backend blink between the WAL append and the final lease check.
+type leaseLossStore struct {
+	store.Store
+	mu    sync.Mutex
+	armed bool
+}
+
+func (s *leaseLossStore) Journaling() bool { return true }
+
+func (s *leaseLossStore) Put(ctx context.Context, key string, data []byte) error {
+	if strings.Contains(key, "/journal/") {
+		s.mu.Lock()
+		s.armed = true
+		s.mu.Unlock()
+	}
+	return s.Store.Put(ctx, key, data)
+}
+
+func (s *leaseLossStore) PutFrom(ctx context.Context, key string, r io.Reader, n int64) error {
+	if strings.Contains(key, "/journal/") {
+		s.mu.Lock()
+		s.armed = true
+		s.mu.Unlock()
+	}
+	return s.Store.PutFrom(ctx, key, r, n)
+}
+
+func (s *leaseLossStore) CAS(ctx context.Context, key, expect string, data []byte) (string, error) {
+	s.mu.Lock()
+	fail := s.armed && strings.Contains(key, "/locks/")
+	s.mu.Unlock()
+	if fail {
+		return "", errors.New("temporary lease write failure")
+	}
+	return s.Store.CAS(ctx, key, expect, data)
+}
+
+func TestCommitPublishesWhenLeaseUnverifiedAfterWAL(t *testing.T) {
+	base := store.NewMemoryStore()
+	ws := &leaseLossStore{Store: base}
+	if _, err := CreateRepo(ws, "wallease", 4096, 64); err != nil {
+		t.Fatal(err)
+	}
+	r, err := OpenRepo(ws, "wallease")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rev, err := r.CommitTxn(0, []Change{{Path: "/a", Action: ActionAdd, Kind: KindFile, Data: []byte("1")}}, nil)
+	if err != nil {
+		t.Fatalf("commit with a lease blink after WAL: %v", err)
+	}
+	if rev != 1 {
+		t.Fatalf("rev=%d, want 1", rev)
+	}
+	if h, _ := r.HeadFresh(); h != 1 {
+		t.Fatalf("head=%d, want 1", h)
 	}
 }

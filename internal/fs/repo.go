@@ -1387,7 +1387,14 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 		return 0, err
 	}
 	if err := lease.Verify(ctx, r.store); err != nil {
-		return 0, err
+		// The WAL record is already durable and names this commit. If it is
+		// still ours, replay would publish it anyway, so verify the lease can
+		// no longer turn an already-reserved revision into a client-visible
+		// failure. If another writer replaced the record, stop instead.
+		if !r.journalOwns(ctx, N, lease.token, rbBytes) {
+			return 0, err
+		}
+		log.Printf("commit: lease unverified after WAL (rev %d); journal record is ours, publishing", N)
 	}
 	// Chaos hook (test-only): exit after the WAL append but before the HEAD CAS
 	// to exercise journal roll-forward on a live store.
@@ -1396,11 +1403,23 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 		os.Exit(9)
 	}
 	if _, err := r.store.CAS(ctx, r.keys.Current(), etag, nc.Marshal()); err != nil {
-		return 0, err
+		// Another process's WAL replay can publish the record we just wrote
+		// before our own CAS lands (replay does not take the commit lease).
+		// The revision then exists exactly as we built it, so report success
+		// instead of 409 for a commit that is already durable -- otherwise the
+		// client retries an already-applied change and every retry is rejected
+		// as out of date.
+		if errors.Is(err, store.ErrPreconditionFailed) && r.publishedByReplay(ctx, N, lease.token, rbBytes, cur.Head) {
+			r.setHead(N)
+			r.cache.Clear()
+		} else {
+			return 0, err
+		}
+	} else {
+		r.setHead(N)
+		// invalidate cached HEAD-dependent state
+		r.cache.Clear()
 	}
-	r.setHead(N)
-	// invalidate cached HEAD-dependent state
-	r.cache.Clear()
 	// Auto-pack the just-completed shard: when N is the last revision of a
 	// shard, its predecessor shard is complete and gets packed. This keeps the
 	// repository at ~O(shards) loose objects instead of O(revisions) — required
@@ -1411,6 +1430,49 @@ func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]s
 		}
 	}
 	return N, nil
+}
+
+// journalOwns reports whether the durable WAL record for rev still describes
+// this writer's revision block and carries its lease token.
+func (r *Repo) journalOwns(ctx context.Context, rev uint64, token string, rbBytes []byte) bool {
+	if !r.journal {
+		return false
+	}
+	b, err := r.store.Get(ctx, r.keys.Journal(rev), nil)
+	if err != nil {
+		return false
+	}
+	rec, derr := DecodeCommitRecord(b)
+	if derr != nil || rec.Rev != rev || rec.Lease != token {
+		return false
+	}
+	sum := sha256.Sum256(rbBytes)
+	return rec.RevBlockSHA == hex.EncodeToString(sum[:])
+}
+
+// publishedByReplay reports whether rev is already the published HEAD and the
+// journal record for it describes this commit: same parent, same lease token
+// and the same revision block. WAL replay publishes a record once it is
+// quorum-acked and complete, so a writer that lost the HEAD CAS to that replay
+// can safely treat its commit as successful.
+func (r *Repo) publishedByReplay(ctx context.Context, rev uint64, token string, rbBytes []byte, parent uint64) bool {
+	if !r.journal {
+		return false
+	}
+	cur, _, err := r.readCurrentStrict()
+	if err != nil || cur.Head != rev {
+		return false
+	}
+	b, err := r.store.Get(ctx, r.keys.Journal(rev), nil)
+	if err != nil {
+		return false
+	}
+	rec, derr := DecodeCommitRecord(b)
+	if derr != nil || rec.Rev != rev || rec.Parent != parent || rec.Lease != token {
+		return false
+	}
+	sum := sha256.Sum256(rbBytes)
+	return rec.RevBlockSHA == hex.EncodeToString(sum[:])
 }
 
 // VerifyIssue describes one integrity failure found by Verify.
