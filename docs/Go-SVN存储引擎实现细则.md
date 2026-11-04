@@ -293,6 +293,9 @@ func (r *Repo) CommitTxn(txid, newRevProps) (newRev, error):
 - **repair 作用域**：`WithRepoPrefix("<storage.prefix>/<name>")` 使 repair 只列举/复制本仓库对象；配置的前缀必须同时传给 `OpenRepo` 与 MirrorStore（`cmd/svngod`、`svnadmin --mirror-file` 已贯通），否则 repair 会扫错前缀并把副本误判为完整。
 - **revprop 更新**：镜像后端把 revprop 修改纳入提交租约（与提交串行），读取取多数派、写入广播到全部可达副本（`PutAll`），避免两个进程各自 CAS 不同主节点导致属性丢失或读到旧值。
 - **WAL 保留与崩溃注入**：`svnadmin gc` 保留最近 4096 条 journal 记录（更早的清理）；`SVNGOD_CHAOS_AFTER_WAL=1` 是测试专用钩子，在 WAL 落盘、`current` CAS 之前退出进程，用于实测回放前滚（生产不设置即无影响）。
+- **回放与在线提交的竞争**：WAL 回放不持有提交租约。另一个进程的回放可能在本进程 `current` CAS 之前就发布了同一条记录；此时本进程 CAS 得到 `PreconditionFailed`。只要 `current.Head == N`、记录中的 `lease` 等于本进程令牌、`parent` 与读取时一致、`revblock_sha256` 等于本进程写入的块，就把提交视为成功（修订已按本进程的字节发布），避免向客户端返回 409 让它在“已提交”的变更上重试并被判过期。
+- **租约抖动容错**：租约读取/续约遇到后端瞬时错误（连接重置、S3 5xx）不再立即判定“租约丢失”，而是重试 3 次（间隔 100ms）；只有读到他人的令牌或对象不存在才算丢失。持久失败返回 `ErrLeaseUnverified` → HTTP 503（可重试）。若失败发生在 WAL 已落盘之后，且 `journal/<N>` 仍是本进程的记录（令牌与 revblock SHA-256 都匹配），则继续推进 `HEAD`（回放本来也会发布它），不会把已预留的修订报成失败。
+- **锁状态只认仲裁者**：两节点主备下，`locks/commit`、`locks.json` 只在第一项（仲裁者）上创建/删除，备节点可能残留更新前的旧副本。修复遍历不得把“只存在于备节点”的锁状态回灌到仲裁者——实测这样会把一张已释放的租约复活，使正在提交的进程读到别人的令牌而报 `commit lease lost`。规则：仲裁者可达时，有则从仲裁者复制到备，无则删除备上的残留；仲裁者不可达时不动锁状态。
 
 ---
 
