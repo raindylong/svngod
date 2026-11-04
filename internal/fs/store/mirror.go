@@ -279,6 +279,21 @@ func canonicalMirrors(mirrors []Store) []Store {
 	return out
 }
 
+// probeReachable checks one cheap control object instead of listing the
+// repository prefix. With one journal record per revision a prefix listing can
+// take longer than the probe budget, falsely marking a live backend
+// unreachable and leaving the standby permanently out of service.
+func (m *MirrorStore) probeReachable(ctx context.Context, i int) error {
+	prefix := strings.Trim(m.repoPrefix, "/")
+	if prefix == "" {
+		// Test/custom stores have no repository namespace.
+		_, _, err := m.mirrors[i].ListPrefix(ctx, m.repoPrefix, "", 1)
+		return err
+	}
+	_, _, err := m.mirrors[i].Head(ctx, prefix+"/current")
+	return err
+}
+
 func NewMirror(mirrors []Store, opts ...MirrorOption) *MirrorStore {
 	if len(mirrors) < 2 {
 		panic("MirrorStore requires at least 2 mirrors")
@@ -336,8 +351,7 @@ func NewMirror(mirrors []Store, opts ...MirrorOption) *MirrorStore {
 				defer probeWG.Done()
 				ctx, cancel := context.WithTimeout(context.Background(), startupProbeTimeout)
 				defer cancel()
-				_, _, err := s.ListPrefix(ctx, m.repoPrefix, "", 1)
-				reachable[i] = err == nil
+				reachable[i] = m.probeReachable(ctx, i) == nil
 			}(i, s)
 		}
 		probeWG.Wait()
@@ -1894,7 +1908,7 @@ func (m *MirrorStore) downReachable() bool {
 		// answer; a 2s budget kept a live standby unreachable, so recovery
 		// never started and the mirror stayed out of service for good.
 		ctx, cancel := context.WithTimeout(context.Background(), healthProbeTimeout)
-		_, _, err := m.mirrors[i].ListPrefix(ctx, prefix, "", 1)
+		err := m.probeReachable(ctx, i)
 		cancel()
 		if err == nil {
 			return true
@@ -2150,7 +2164,7 @@ func (m *MirrorStore) repairInternal() {
 			timeout := repairListTimeout
 			if !m.isHealthy(i) {
 				pctx, pcancel := context.WithTimeout(context.Background(), 30*time.Second)
-				_, _, perr := m.mirrors[i].ListPrefix(pctx, m.repoPrefix, "", 1)
+				perr := m.probeReachable(pctx, i)
 				pcancel()
 				if perr != nil {
 					log.Printf("mirror[%d] still unreachable during repair: %v", i, perr)
@@ -2423,15 +2437,16 @@ const repairStreamThreshold = 4 << 20
 func (m *MirrorStore) copyRepairObject(ctx context.Context, key string, sets []map[string]int64,
 	reachable []bool, mu *sync.Mutex, missing []int, failed []bool) {
 	mu.Lock()
-	var dests []int
-	src, size := -1, int64(0)
+	var dests, sources []int
+	size := int64(0)
 	for i := range m.mirrors {
 		if !reachable[i] {
 			continue
 		}
 		if sz, has := sets[i][key]; has {
-			if src < 0 {
-				src, size = i, sz
+			sources = append(sources, i)
+			if len(sources) == 1 {
+				size = sz
 			}
 			continue
 		}
@@ -2440,18 +2455,36 @@ func (m *MirrorStore) copyRepairObject(ctx context.Context, key string, sets []m
 		}
 	}
 	mu.Unlock()
-	if src < 0 || len(dests) == 0 {
+	if len(sources) == 0 || len(dests) == 0 {
 		return
 	}
 	for _, dst := range dests {
 		var err error
-		if size > repairStreamThreshold {
-			err = m.copyRepairStream(ctx, src, dst, key, size)
-		} else {
-			var b []byte
-			if b, err = m.mirrors[src].Get(ctx, key, nil); err == nil {
-				err = m.mirrors[dst].Put(ctx, key, b)
+		for _, src := range sources {
+			if size > repairStreamThreshold {
+				err = m.copyRepairStream(ctx, src, dst, key, size)
+			} else {
+				var b []byte
+				if b, err = m.mirrors[src].Get(ctx, key, nil); err == nil {
+					err = m.mirrors[dst].Put(ctx, key, b)
+				}
 			}
+			if err == nil || !errors.Is(err, ErrNotFound) {
+				break
+			}
+		}
+		if errors.Is(err, ErrNotFound) {
+			// The object was deleted after the listing (a lease-breaker marker
+			// or an abandoned session). It exists nowhere, so no copy is
+			// needed and this must not take a live mirror out of service.
+			mu.Lock()
+			for _, d := range dests {
+				if missing[d] > 0 {
+					missing[d]--
+				}
+			}
+			mu.Unlock()
+			return
 		}
 		mu.Lock()
 		if err != nil {
@@ -2574,6 +2607,7 @@ func (m *MirrorStore) reconcileMutable(ctx context.Context, k string, sets []map
 	if best == nil {
 		return
 	}
+	dbgCur := os.Getenv("SVNGOD_DEBUG_REPAIR") == "1" && k == m.controlName()
 	if k == m.controlName() {
 		// Never adopt a HEAD from an uncertain view. The rules:
 		//  - if this process already acknowledged a HEAD, best must not be
@@ -2629,9 +2663,17 @@ func (m *MirrorStore) reconcileMutable(ctx context.Context, k string, sets []map
 		}
 		if _, has := sets[i][k]; has {
 			cur, err := m.mirrors[i].Get(ctx, k, nil)
+			if dbgCur {
+				log.Printf("reconcile current: mirror[%d] has=%v order(best,cur)=%d err=%v", i, true, m.order(k, best, cur), err)
+			}
 			if err == nil && m.order(k, best, cur) <= 0 {
 				continue // already the newest
 			}
+		} else if dbgCur {
+			log.Printf("reconcile current: mirror[%d] missing in listing", i)
+		}
+		if dbgCur {
+			log.Printf("reconcile current: writing mirror[%d] best=%q", i, string(best))
 		}
 		if err := m.mirrors[i].Put(ctx, k, best); err != nil {
 			log.Printf("mirror[%d] repair put %q: %v", i, k, err)
@@ -2675,9 +2717,16 @@ func isMutableKey(key string) bool {
 // excluded: it is recreated on demand, and listing it made a repository with
 // many uploads page through thousands of intent records — the scans that timed
 // out on RustFS and kept a live standby out of service.
+//
+// journal/ is excluded for the same reason: it holds one record per revision,
+// so a 40k-revision repository made every repair listing page through 40k
+// keys and time out, leaving the standby permanently out of service and tens
+// of thousands of revisions behind. A record only matters for the crash window
+// before HEAD is published; an acknowledged revision is already described by
+// its published HEAD and packs, and an unacknowledged one may be dropped.
 var repairPrefixes = []string{
 	"revs/", "revs-loose/", "revprops/", "revprops-loose/",
-	"texts/", "chunks/", "dirs/", "journal/", "locks/",
+	"texts/", "chunks/", "dirs/", "locks/",
 }
 
 // listRepairObjects lists the repository objects repair needs, without the
@@ -2689,14 +2738,35 @@ func listRepairObjects(ctx context.Context, s Store, repoPrefix string) (map[str
 		// listing they expect.
 		return listAll(ctx, s, "")
 	}
+	active, haveShard := activeShard(ctx, s, base)
 	out := make(map[string]int64)
 	for _, p := range repairPrefixes {
-		ks, err := listAll(ctx, s, base+"/"+strings.TrimSuffix(p, "/"))
+		prefix := base + "/" + p
+		// Keep the trailing slash: "revs/" must not also match "revs-loose/",
+		// which doubled the listing and made a 40k-revision repository time
+		// out during repair.
+		if haveShard && (p == "revs-loose/" || p == "revprops-loose/") {
+			// Only the active shard still needs loose objects; completed
+			// shards are served from their pack, and their loose copies may
+			// not have been collected yet (gc is asynchronous). Listing them
+			// was the remaining reason a large repository timed out.
+			prefix += padShard(active)
+		}
+		ks, err := listAll(ctx, s, prefix)
 		if err != nil {
 			return nil, err
 		}
 		for k, v := range ks {
 			out[k] = v
+		}
+	}
+	// The commit lease and its breaker marker are arbiter-only, one-shot
+	// objects. Listing them made repair try to copy a key that is deleted as
+	// soon as the lease is released, and the resulting NotFound marked a live
+	// standby out of service on every pass.
+	for k := range out {
+		if strings.HasSuffix(k, "/locks/commit") || strings.HasSuffix(k, "/locks/commit.break") {
+			delete(out, k)
 		}
 	}
 	for _, k := range []string{"format", "uuid", "current", "locks.json"} {
@@ -2713,9 +2783,38 @@ func listRepairObjects(ctx context.Context, s Store, repoPrefix string) (map[str
 		// (no standard revision/text tree). Fall back to the unscoped listing so
 		// those stores keep the old behaviour; real repositories always have at
 		// least the format/current markers.
-		return listAll(ctx, s, base)
+		return listAll(ctx, s, base+"/")
 	}
 	return out, nil
+}
+
+// activeShard reads the repository's format and HEAD to find the shard whose
+// loose revisions are still live. Returns ok=false for custom layouts.
+func activeShard(ctx context.Context, s Store, base string) (uint64, bool) {
+	fb, err := s.Get(ctx, base+"/format", nil)
+	if err != nil {
+		return 0, false
+	}
+	var shard uint64
+	for _, line := range strings.Split(string(fb), "\n") {
+		if strings.HasPrefix(line, "SHARD_SIZE=") {
+			shard, _ = strconv.ParseUint(strings.TrimPrefix(line, "SHARD_SIZE="), 10, 64)
+		}
+	}
+	cb, err := s.Get(ctx, base+"/current", nil)
+	if err != nil {
+		return 0, false
+	}
+	var head uint64
+	for _, line := range strings.Split(string(cb), "\n") {
+		if strings.HasPrefix(line, "HEAD=") {
+			head, _ = strconv.ParseUint(strings.TrimPrefix(line, "HEAD="), 10, 64)
+		}
+	}
+	if shard == 0 {
+		return 0, false
+	}
+	return head / shard, true
 }
 
 // listAll returns every object under prefix with its size. Repair needs the
@@ -2723,10 +2822,11 @@ func listRepairObjects(ctx context.Context, s Store, repoPrefix string) (map[str
 func listAll(ctx context.Context, s Store, prefix string) (map[string]int64, error) {
 	keys := make(map[string]int64)
 	next := ""
-	p := strings.Trim(prefix, "/")
-	if p != "" {
-		p += "/"
-	}
+	// Do not force a trailing slash: control keys (current/format/uuid) are
+	// exact objects, and appending "/" made them invisible to every repair
+	// pass, so a standby's HEAD was never reconciled. Directory prefixes carry
+	// their own trailing slash.
+	p := strings.TrimPrefix(prefix, "/")
 	for {
 		objs, n, err := s.ListPrefix(ctx, p, next, 1000)
 		if err != nil {

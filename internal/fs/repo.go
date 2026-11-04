@@ -14,7 +14,6 @@ import (
 	"log"
 	"os"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1795,6 +1794,14 @@ func (r *Repo) packShardLocked(shard uint64) error {
 	if err := r.store.Put(ctx, r.keys.PackedDone(shard), []byte("1")); err != nil {
 		return err
 	}
+	// Readers use the pack once .done exists; drop the loose copies in the
+	// background so the commit that completed the shard is not held up by
+	// thousands of deletes.
+	go func() {
+		if _, err := r.collectLooseShard(context.Background(), shard); err != nil {
+			log.Printf("pack: loose cleanup shard %d: %v", shard, err)
+		}
+	}()
 	r.invalidateRevPropsPack(shard)
 	r.cache.Clear()
 	return nil
@@ -1820,49 +1827,57 @@ func cachePut(c *cache.LRU, k cache.Key, b []byte) {
 }
 
 // CollectLoose deletes loose revision and revprops objects that belong to
-// shards already packed. PackShard leaves them behind (readers switched to the
-// pack via the .done marker), so storage grew without bound on long-running
-// repositories. Returns the number of objects removed.
+// shards already packed. PackShard leaves them behind (readers switch to the
+// pack via the .done marker), so storage and repair listings grew without
+// bound on long-running repositories. Shard numbers and revision ranges are
+// known from HEAD, so this deletes exact keys instead of listing a prefix that
+// may hold tens of thousands of objects.
 func (r *Repo) CollectLoose(ctx context.Context) (int, error) {
+	head, err := r.HeadFresh()
+	if err != nil {
+		return 0, err
+	}
 	deleted := 0
-	for _, sub := range []string{"revs-loose/", "revprops-loose/"} {
-		prefix := r.keys.Prefix + "/" + sub
-		next := ""
-		for {
-			objs, n, err := r.store.ListPrefix(ctx, prefix, next, 1000)
-			if err != nil {
-				return deleted, err
-			}
-			var victims []string
-			for _, o := range objs {
-				rel := strings.TrimPrefix(o.Key, prefix)
-				shardStr := rel
-				if i := strings.IndexByte(rel, '/'); i >= 0 {
-					shardStr = rel[:i]
-				}
-				shard, err := strconv.ParseUint(shardStr, 10, 64)
-				if err != nil {
-					continue
-				}
-				packed, err := r.isPacked(shard)
-				if err != nil || !packed {
-					continue
-				}
-				victims = append(victims, o.Key)
-			}
-			if len(victims) > 0 {
-				if err := r.store.Delete(ctx, victims); err != nil {
-					return deleted, err
-				}
-				deleted += len(victims)
-			}
-			if n == "" {
-				break
-			}
-			next = n
+	for shard := uint64(0); shard <= r.shard(head); shard++ {
+		packed, err := r.isPacked(shard)
+		if err != nil || !packed {
+			continue
+		}
+		n, err := r.collectLooseShard(ctx, shard)
+		deleted += n
+		if err != nil {
+			return deleted, err
 		}
 	}
 	return deleted, nil
+}
+
+// collectLooseShard removes the loose rev/revprops keys of one packed shard.
+func (r *Repo) collectLooseShard(ctx context.Context, shard uint64) (int, error) {
+	first := shard * r.shardSz
+	last := first + r.shardSz - 1
+	var batch []string
+	deleted := 0
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		if err := r.store.Delete(ctx, batch); err != nil {
+			return err
+		}
+		deleted += len(batch)
+		batch = batch[:0]
+		return nil
+	}
+	for rev := first; rev <= last; rev++ {
+		batch = append(batch, r.keys.LooseRev(shard, rev), r.keys.LooseRevProps(shard, rev))
+		if len(batch) >= 500 {
+			if err := flush(); err != nil {
+				return deleted, err
+			}
+		}
+	}
+	return deleted, flush()
 }
 
 // CollectTxnData deletes content-addressed commit-session bodies that no

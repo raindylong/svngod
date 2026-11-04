@@ -162,7 +162,10 @@ func (o *options) mirrorStore(name string) (store.Store, string, error) {
 		return nil, "", fmt.Errorf("--mirror-file requires at least 2 backends (got %d)", len(ms))
 	}
 	prefix := strings.Trim(repoPrefix, "/") + "/" + name
-	opts := []store.MirrorOption{store.WithMutableOrder(fs.CompareMutable), store.WithRepoPrefix(prefix)}
+	// Lazy alignment: admin commands (gc, repair, dump) must not block on a
+	// full repository listing at construction; doRepair asks for an explicit
+	// pass and the others only touch known keys.
+	opts := []store.MirrorOption{store.WithMutableOrder(fs.CompareMutable), store.WithRepoPrefix(prefix), store.WithLazyRepair()}
 	if quorum > 0 {
 		opts = append(opts, store.WithWriteQuorum(quorum))
 	}

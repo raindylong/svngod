@@ -437,6 +437,18 @@ func isPreconditionFailed(err error) bool {
 	return false
 }
 
+// listPrefixKey prefixes a listing without trimming the trailing slash.
+// Object keys are normalised (no trailing slash), but a listing of "revs/"
+// must not also match "revs-loose/": trimming the slash doubled repair
+// listings and made large repositories time out.
+func (s *S3Store) listPrefixKey(prefix string) string {
+	p := strings.TrimPrefix(prefix, "/")
+	if s.prefix == "" {
+		return p
+	}
+	return s.prefix + "/" + p
+}
+
 func (s *S3Store) ListPrefix(ctx context.Context, prefix, continuation string, max int) ([]ListedObj, string, error) {
 	var out []ListedObj
 	var next string
@@ -455,7 +467,7 @@ func (s *S3Store) listPrefixOnce(ctx context.Context, prefix, continuation strin
 	// Ask for one extra key so "is there another page?" is decidable; with
 	// MaxKeys=max the slice can never exceed max and `next` stayed empty,
 	// truncating every listing (mirror repair only saw the first page).
-	opts := minio.ListObjectsOptions{Prefix: s.key(prefix), Recursive: true, MaxKeys: max + 1}
+	opts := minio.ListObjectsOptions{Prefix: s.listPrefixKey(prefix), Recursive: true, MaxKeys: max + 1}
 	if continuation != "" {
 		// Callers pass keys relative to the store prefix (the same form
 		// ListedObj.Key uses). StartAfter is compared against the full object
