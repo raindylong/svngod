@@ -45,6 +45,7 @@ var (
 	progress  = flag.Duration("progress", time.Second, "progress interval")
 	rawBench  = flag.Int("raw", 0, "measure raw 1KiB Put/Get round trips and exit")
 	batch     = flag.Int("batch", 1, "revisions per group commit (1 = one commit per revision)")
+	idxBase   = flag.Int64("idxbase", 0, "path index base for batch mode (keeps paths unique across resumed runs)")
 )
 
 var authors = []string{"alice", "bob", "carol", "admin", "dave", "erin", "frank", "grace"}
@@ -168,7 +169,7 @@ func main() {
 				}
 				reqs := make([]fs.BatchCommit, 0, cnt)
 				for j := 0; j < cnt; j++ {
-					idx := first + start + int64(j) + 1
+					idx := *idxBase + start + int64(j)
 					reqs = append(reqs, fs.BatchCommit{
 						Changes: changeFor(idx, rng, *mixed),
 						RevProps: map[string]string{
