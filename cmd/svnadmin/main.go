@@ -241,6 +241,8 @@ func main() {
 		doJournal(&o, repoName)
 	case "info":
 		doInfo(&o, repoName)
+	case "repair":
+		doRepair(&o, repoName)
 	case "migrate":
 		doMigrate(&o, repoName)
 	case "gc":
@@ -259,6 +261,7 @@ usage:
   svnadmin dump   [--output FILE] [s3 flags] <repo>
   svnadmin load   [--input FILE] [s3 flags] <repo>
   svnadmin verify [s3 flags] <repo>   # integrity walk; prints corrupted nodes
+  svnadmin repair [--mirror-file FILE] <repo>  # synchronously reconcile mirrors
   svnadmin journal [-n N] [s3 flags | --mirror-file FILE] <repo>  # show WAL records
   svnadmin gc     [s3 flags] <repo>   # loose objects, txn bodies, unused texts
 
@@ -304,6 +307,31 @@ func chunkParamsFor(avg uint64) cdc.Params {
 }
 
 // doInfo prints the repository format and head without modifying anything.
+// doRepair runs one synchronous mirror reconciliation pass. A mirror that
+// missed writes while it was unreachable is normally healed by the server's
+// background repair; after a bulk load or a process crash that never got to
+// run it, this command copies the delta on demand.
+func doRepair(o *options, repoName string) {
+	st, prefix, err := o.repoStore(repoName)
+	if err != nil {
+		fatal(err)
+	}
+	r, err := fs.OpenRepo(st, prefix)
+	if err != nil {
+		fatal(err)
+	}
+	if rp, ok := st.(interface{ RepairNow() }); ok {
+		rp.RepairNow()
+	} else {
+		fmt.Println("store is not mirrored; nothing to repair")
+	}
+	head, err := r.HeadFresh()
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Printf("repaired %s head=%d\n", repoName, head)
+}
+
 func doInfo(o *options, repoName string) {
 	st, prefix, err := o.repoStore(repoName)
 	if err != nil {

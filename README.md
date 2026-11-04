@@ -54,6 +54,7 @@ quorum 模式示例（3 节点，任意 1 个节点故障仍可提交；2 个故
 ```
 
 `svnadmin journal -n 20 <repo>` 可查看最近的 WAL 记录（修订、父修订、法定人数、revblock 校验和）。
+`svnadmin repair --mirror-file FILE <repo>` 可在批量导入或进程被强杀后，同步扫描并补齐备副本缺失的对象。
 
 多实例只需复制同一份 JSON、修改 `addr`，所有实例共享 `storage`：
 
