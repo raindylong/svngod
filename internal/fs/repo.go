@@ -1794,14 +1794,12 @@ func (r *Repo) packShardLocked(shard uint64) error {
 	if err := r.store.Put(ctx, r.keys.PackedDone(shard), []byte("1")); err != nil {
 		return err
 	}
-	// Readers use the pack once .done exists; drop the loose copies in the
-	// background so the commit that completed the shard is not held up by
-	// thousands of deletes.
-	go func() {
-		if _, err := r.collectLooseShard(context.Background(), shard); err != nil {
-			log.Printf("pack: loose cleanup shard %d: %v", shard, err)
-		}
-	}()
+	// Loose copies are left for svnadmin gc. Deleting thousands of keys per
+	// shard through the mirror knocks a standby out of service when its
+	// batched DELETE exceeds the standby write budget, which makes HEAD stop
+	// replicating; repair listings are bounded to the active shard, so the
+	// garbage is harmless until the operator collects it.
+
 	r.invalidateRevPropsPack(shard)
 	r.cache.Clear()
 	return nil
