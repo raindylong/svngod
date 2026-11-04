@@ -2496,7 +2496,65 @@ func (m *MirrorStore) copyRepairStream(ctx context.Context, src, dst int, key st
 
 // reconcileMutable picks the newest value of a mutable key and writes it to
 // every reachable mirror that is missing it or holds an older one.
+// isLockStateKey reports whether key is lock/lease state, which a two-node
+// pair keeps authoritative on the arbiter only (lease CAS and delete stop
+// after the first copy).
+func isLockStateKey(key string) bool {
+	base := key[strings.LastIndex(key, "/")+1:]
+	return strings.Contains(key, "/locks/") || base == "locks.json"
+}
+
+// reconcileLockKey reconciles lock state in a two-node pair. The arbiter is
+// the only writer, so its copy wins; a copy found only on the standby is a
+// leftover from before a release/outage and must be deleted, never promoted.
+// Copying such a stale lease back to the arbiter made a live commit fail with
+// "commit lease lost" (observed while one process recovered the arbiter and
+// another was committing).
+func (m *MirrorStore) reconcileLockKey(ctx context.Context, k string, sets []map[string]int64, reachable []bool) {
+	if !reachable[0] {
+		// Without the arbiter there is no authoritative view of lock state;
+		// leave both copies alone until it answers again.
+		return
+	}
+	if _, has := sets[0][k]; !has {
+		for i := 1; i < len(m.mirrors); i++ {
+			if !reachable[i] {
+				continue
+			}
+			if _, has := sets[i][k]; !has {
+				continue
+			}
+			if err := m.mirrors[i].Delete(ctx, []string{k}); err != nil {
+				log.Printf("mirror[%d] repair drop stale lock %q: %v", i, k, err)
+				reachable[i] = false
+			}
+		}
+		return
+	}
+	b, err := m.mirrors[0].Get(ctx, k, nil)
+	if err != nil {
+		return
+	}
+	for i := 1; i < len(m.mirrors); i++ {
+		if !reachable[i] {
+			continue
+		}
+		cur, cerr := m.mirrors[i].Get(ctx, k, nil)
+		if cerr == nil && bytes.Equal(cur, b) {
+			continue
+		}
+		if err := m.mirrors[i].Put(ctx, k, b); err != nil {
+			log.Printf("mirror[%d] repair lock %q: %v", i, k, err)
+			reachable[i] = false
+		}
+	}
+}
+
 func (m *MirrorStore) reconcileMutable(ctx context.Context, k string, sets []map[string]int64, reachable []bool) {
+	if m.ArbiterRequired() && isLockStateKey(k) {
+		m.reconcileLockKey(ctx, k, sets, reachable)
+		return
+	}
 	var best []byte
 	for i := range m.mirrors {
 		if !reachable[i] {
