@@ -96,7 +96,7 @@ blockquote p{margin:0}
 <li><strong>HTTPv2 默认开启</strong>：与现代 svn 客户端自动协商，一次提交从“活动/检出的多轮往返”缩减为 create-txn + PUT + MERGE；<code>SVNGOD_HTTPV2=0</code> 可回退 v1。</li>
 <li><strong>WAL + 法定人数（2026-11）</strong>：每次提交先把带 CRC32C 的记录写到 <code>journal/&lt;N&gt;</code>，再推进 HEAD；崩溃后可判定“是否已发布”，并在启动/下次提交时把已达成法定人数的记录<strong>前滚</strong>。严格模式 <code>quorum: 2</code>（3 节点）下，写不够多数派就返回 503，绝不单副本确认。</li>
 <li><strong>崩溃原子性</strong>：跨进程提交租约 + WAL 对账，token 幂等重试；上传中杀掉服务进程或提交中杀掉客户端，都不会留下半个修订；陈旧节点恢复后不会复活旧 HEAD 或重复修订号。</li>
-<li><strong>多副本与主备镜像</strong>：本地盘或 S3 后端；默认主备可用性模式（单节点故障不停写），可选法定人数严格模式（RPO=0）；主备双写、故障切换与秒级自愈修复。</li>
+<li><strong>多副本与主备镜像</strong>：本地盘或 S3 后端；默认主备可用性模式（<strong>备节点故障不停写；主节点故障时提交 503、读继续</strong>），可选法定人数严格模式（RPO=0）；主备双写、故障切换与秒级自愈修复。</li>
 <li><strong>标准互操作</strong>：dump 为 SVN dump v2 格式，原生 <code>svnadmin load</code> 可直接加载并 verify；authz、hooks、TLS 与原生 svn 客户端全部沿用。</li>
 </ul>
 
@@ -127,6 +127,7 @@ blockquote p{margin:0}
 </tbody></table>
 <blockquote>
 <p>原生 Apache 的提交同样是逐文件 PUT；文件数上万时往返次数线性增长，现场常见 600 秒网关超时。svngod 的原生客户端路径 35 秒完成，bundle 路径把往返压到 1 次。</p>
+<p><strong>组提交（CommitBatch）</strong>：批量写入把同一租约周期的多个修订合并为一次对象写入与一次 HEAD CAS——单进程 K=64 约 <strong>33 次/秒</strong>，8 个仓库并发 <strong>45–49 次/秒</strong>；16 仓 × 625,000 修订的千万级长跑约 <strong>60 小时</strong>。在线 DAV 提交默认开启组提交（16 批 / 2ms 窗口），但原生客户端受 MKACTIVITY/PUT/MERGE 会话往返限制，8 并发约 4.5 次/秒。</p>
 </blockquote>
 
 </section>
@@ -241,11 +242,11 @@ blockquote p{margin:0}
 </tr>
 <tr>
 <td>2 节点主备，主节点宕机</td>
-<td>1s 切备提交成功</td>
+<td>3–5s 内提交返回 503（HEAD 不变）；读切备继续，主节点恢复后重试成功</td>
 </tr>
 <tr>
 <td>主节点在上传 100MiB 增量时被杀</td>
-<td>6s 切备成功，整文件 sha256 一致</td>
+<td>上传被丢弃，不产生半个修订；恢复后重试成功（3 节点下可切备继续，sha256 一致）</td>
 </tr>
 <tr>
 <td>两个存储节点同时宕机</td>
@@ -257,7 +258,7 @@ blockquote p{margin:0}
 </tr>
 </tbody></table>
 <blockquote>
-<p>默认主备模式保可用性：任一节点故障仍可提交；最后一次提交可能只在一份副本（客户端会收到失败并可重试）。RPO=0 用 3 节点 + <code>quorum:2</code>。</p>
+<p>两节点主备：备节点故障时提交继续（写入只落主节点，恢复后自动补齐）；主节点（列表第一项）故障时提交返回 503、HEAD 不变，读仍可继续。要“主节点故障仍可提交”，用 3 节点 + <code>quorum:2</code>（RPO=0，容忍 1 节点故障）。</p>
 </blockquote>
 
 </section>

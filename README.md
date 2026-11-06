@@ -36,7 +36,7 @@ svngod --config svngod.json
 
 两种镜像策略：
 
-- **主备可用性模式（默认，不配 `quorum`）**：提交在选举出的主节点确认，WAL 仍写入并在启动/提交前对账；任一节点故障都继续可提交，节点恢复后自动补齐。代价是主节点在“最后一条提交镜像到备节点之前”崩溃时，该条提交可能只存在于主节点（RPO>0，客户端会收到失败并可重试）。
+- **主备可用性模式（默认，不配 `quorum`）**：两节点时**第一项是提交仲裁者**。它在线时提交正常（WAL 在启动/提交前对账），备节点故障不影响提交，恢复后自动补齐；**第一项故障时提交返回 503、HEAD 不变，读仍可从备节点继续**。需要“主节点故障仍可提交”，用 3 节点 `quorum:2`。备节点长期离线期间只有一份数据；恢复后用 `svnadmin repair` 补齐。
 - **法定人数严格模式（`quorum: N`）**：提交记录必须写到 N 份副本才确认（RPO=0）。3 节点配 `quorum: 2` 可容忍 1 节点故障；2 节点配 `quorum: 2` 没有容错，任一节点故障即返回 503。
 
 quorum 模式示例（3 节点，任意 1 个节点故障仍可提交；2 个故障则拒绝提交）：
@@ -54,7 +54,10 @@ quorum 模式示例（3 节点，任意 1 个节点故障仍可提交；2 个故
 ```
 
 `svnadmin journal -n 20 <repo>` 可查看最近的 WAL 记录（修订、父修订、法定人数、revblock 校验和）。
-`svnadmin repair --mirror-file FILE <repo>` 可在批量导入或进程被强杀后，同步扫描并补齐备副本缺失的对象。
+`svnadmin repair --mirror-file FILE <repo>` 可在批量导入、进程被强杀或备节点恢复后，同步扫描并补齐备副本缺失的对象。
+`svnadmin gc [--keep-journal N] <repo>` 回收已被分片包取代的 loose 对象、孤儿 txn/文本，并裁剪 WAL。
+
+在线提交默认开启组提交（`-commit-batch 16 -commit-window-ms 2`）：并发到达的提交共享一次租约与一次 HEAD CAS；`0` 关闭。
 
 多实例只需复制同一份 JSON、修改 `addr`，所有实例共享 `storage`：
 
@@ -140,6 +143,20 @@ for i in 1 2 3; do
 done
 wait
 ```
+
+## 规模压测
+
+`cmd/revscale` 走与 DAV MERGE 相同的 `CommitTxn`（fs 层直写），路径按十进制分片，供千万级修订压测：
+
+```bash
+go build -o revscale ./cmd/revscale
+revscale -store mirror -endpoints 10.0.0.11:9000,10.0.0.12:9000 \
+  -ak K -sk S -repo scale00 -batch 64 -idxbase 1000000 -target 625000
+```
+
+- `-batch K`：组提交批大小（一次租约、一次 HEAD CAS）；`-idxbase`：路径索引基址，续跑/多进程时必须取不重叠的 100 万区间。
+- 实测（主备 RustFS，LAN）：单进程 K=64 约 **33 次/秒**，8 个仓库并发 **45–49 次/秒**；1000 万修订约需 **60 小时**。
+- 16 仓 × 625,000 修订的千万级长跑使用 8 个 worker；每约 6 小时对两个副本做一次全量校验。
 
 ## 工程结构
 
