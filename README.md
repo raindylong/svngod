@@ -16,9 +16,9 @@
 ## 快速开始
 
 ```bash
-go build -o svngod ./cmd/svngod
-go build -o svnadmin ./cmd/svnadmin
-go build -o svngocli ./cmd/svngocli   # 客户端（需要本机 svn 命令）
+CGO_ENABLED=0 go build -o svngod ./cmd/svngod
+CGO_ENABLED=0 go build -o svnadmin ./cmd/svnadmin
+CGO_ENABLED=0 go build -o svngocli ./cmd/svngocli   # 客户端（需要本机 svn 命令）
 
 # 本地单库（flag 模式）
 svnadmin create /srv/svn/demo
@@ -31,6 +31,8 @@ svn co http://127.0.0.1:8080/svn/demo
 # 多库 / 多后端 / 主备镜像（JSON 配置）
 svngod --config svngod.json
 ```
+
+所有构建统一使用 `CGO_ENABLED=0`：纯 Go、静态链接，不依赖目标机器的 libc（容器/精简镜像可直接运行）。
 
 配置示例见 [`docs/配置与多实例部署.md`](docs/配置与多实例部署.md)（多库、多实例、本地+S3、主备/3 节点法定人数、LB、TLS/LDAP），以及 `docs/Go-SVN服务器架构设计方案.md` §9.4/§9.5。
 
@@ -149,7 +151,7 @@ wait
 `cmd/revscale` 走与 DAV MERGE 相同的 `CommitTxn`（fs 层直写），路径按十进制分片，供千万级修订压测：
 
 ```bash
-go build -o revscale ./cmd/revscale
+CGO_ENABLED=0 go build -o revscale ./cmd/revscale
 revscale -store mirror -endpoints 10.0.0.11:9000,10.0.0.12:9000 \
   -ak K -sk S -repo scale00 -batch 64 -idxbase 1000000 -target 625000
 ```

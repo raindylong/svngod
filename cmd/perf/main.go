@@ -2,7 +2,7 @@
 // sequential revisions (one file modified per revision) and reports per-revision
 // latency trends, shard packing, and final correctness. Run:
 //
-//	go run ./cmd/perf [revisions]
+//	CGO_ENABLED=0 go run ./cmd/perf [revisions]
 package main
 
 import (
