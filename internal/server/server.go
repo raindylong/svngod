@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -67,36 +68,110 @@ type RepoConfig struct {
 	Authenticate *auth.Chain
 	Authorize    *authz.Config
 	OpenRepo     RepoOpener
+	// Close releases the store built for this entry (stops mirror repair
+	// loops). Set by the caller that owns the storage.
+	Close func()
 }
 
-func (c *Config) repoCfg(name string) *RepoConfig {
-	for i := range c.Repos {
-		if c.Repos[i].Name == name {
-			return c.Repos[i]
+// repoSet is an immutable snapshot of the per-repository overrides. Reload
+// swaps the pointer; requests keep the snapshot they started with.
+type repoSet struct {
+	list   []*RepoConfig
+	byName map[string]*RepoConfig
+}
+
+func makeRepoSet(list []*RepoConfig) (*repoSet, error) {
+	set := &repoSet{list: list, byName: make(map[string]*RepoConfig, len(list))}
+	for _, rc := range list {
+		if rc.Name == "" {
+			return nil, errors.New("server: repository with empty name")
 		}
+		if _, dup := set.byName[rc.Name]; dup {
+			return nil, fmt.Errorf("server: duplicate repository %q", rc.Name)
+		}
+		set.byName[rc.Name] = rc
 	}
-	return nil
+	return set, nil
 }
 
-func (c *Config) authFor(name string) *auth.Chain {
-	if rc := c.repoCfg(name); rc != nil && rc.Authenticate != nil {
+func (s *Server) repoCfg(name string) *RepoConfig {
+	set := s.repos.Load()
+	if set == nil {
+		return nil
+	}
+	return set.byName[name]
+}
+
+func (s *Server) authFor(name string) *auth.Chain {
+	if rc := s.repoCfg(name); rc != nil && rc.Authenticate != nil {
 		return rc.Authenticate
 	}
-	return c.Authenticate
+	return s.cfg.Authenticate
 }
 
-func (c *Config) authzFor(name string) *authz.Config {
-	if rc := c.repoCfg(name); rc != nil && rc.Authorize != nil {
+func (s *Server) authzFor(name string) *authz.Config {
+	if rc := s.repoCfg(name); rc != nil && rc.Authorize != nil {
 		return rc.Authorize
 	}
-	return c.Authorize
+	return s.cfg.Authorize
 }
 
-func (c *Config) openerFor(name string) RepoOpener {
-	if rc := c.repoCfg(name); rc != nil && rc.OpenRepo != nil {
+func (s *Server) openerFor(name string) RepoOpener {
+	if rc := s.repoCfg(name); rc != nil && rc.OpenRepo != nil {
 		return rc.OpenRepo
 	}
-	return c.OpenRepo
+	return s.cfg.OpenRepo
+}
+
+// RepoNames returns the repositories currently configured (for the admin API).
+func (s *Server) RepoNames() []string {
+	set := s.repos.Load()
+	if set == nil {
+		return nil
+	}
+	out := make([]string, 0, len(set.list))
+	for _, rc := range set.list {
+		out = append(out, rc.Name)
+	}
+	return out
+}
+
+// SetRepos atomically installs a new repository set. Entries named in
+// invalidate (added, changed or removed) are dropped from the per-repo cache;
+// their open Repo instances are returned so the caller can close them after
+// in-flight requests finish.
+func (s *Server) SetRepos(list []*RepoConfig, invalidate map[string]bool) ([]*fs.Repo, error) {
+	set, err := makeRepoSet(list)
+	if err != nil {
+		return nil, err
+	}
+	var retired []*fs.Repo
+	s.repoMapMu.Lock()
+	s.repos.Store(set)
+	inSet := set.byName
+	for name := range invalidate {
+		if prev := s.repoCache[name]; prev != nil {
+			delete(s.repoCache, name)
+			retired = append(retired, prev)
+		}
+	}
+	for name, prev := range s.repoCache {
+		if _, ok := inSet[name]; !ok {
+			delete(s.repoCache, name)
+			retired = append(retired, prev)
+		}
+	}
+	// Locks/activities of removed repositories are no longer reachable.
+	for name := range invalidate {
+		if _, ok := inSet[name]; !ok {
+			s.mu.Lock()
+			s.locksLoaded[name] = false
+			s.stateLoaded[name] = false
+			s.mu.Unlock()
+		}
+	}
+	s.repoMapMu.Unlock()
+	return retired, nil
 }
 
 // Server is the WebDAV/DeltaV HTTP handler for svngod.
@@ -112,7 +187,8 @@ type Server struct {
 	lockOpsMu   sync.Mutex            // serialises refresh/mutate of the lock table
 	stateLoaded map[string]bool       // repositories whose persisted activities were restored
 	repoMapMu   sync.Mutex
-	repoCache   map[string]*fs.Repo // per-name repo singletons (shared r.mu)
+	repos       atomic.Pointer[repoSet] // current per-repo overrides (hot-swappable)
+	repoCache   map[string]*fs.Repo     // per-name repo singletons (shared r.mu)
 	uploads     chan struct{}       // nil when uploads are unlimited
 	upMu        sync.Mutex
 	userUploads map[string]int
@@ -135,6 +211,9 @@ func New(cfg Config) *Server {
 	}
 	if cfg.MaxConcurrentUploads > 0 {
 		s.uploads = make(chan struct{}, cfg.MaxConcurrentUploads)
+	}
+	if set, err := makeRepoSet(cfg.Repos); err == nil {
+		s.repos.Store(set)
 	}
 	return s
 }
@@ -293,7 +372,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 
 	// Authorize: for methods that mutate, require write to the resource path.
 	if !s.authorized(ident.Username, res, r.Method) {
-		if ident.Username == "" && s.cfg.authFor(res.repo) != nil {
+		if ident.Username == "" && s.authFor(res.repo) != nil {
 			// Anonymous was denied: challenge for credentials so the SVN
 			// client retries with Basic auth, instead of a 403 it cannot
 			// recover from. ($anonymous-allowed reads never reach here.)
@@ -347,7 +426,7 @@ var writeMethods = map[string]bool{
 // authorized applies the authz file (if configured) to the request, honoring
 // a per-repository override.
 func (s *Server) authorized(user string, res resource, method string) bool {
-	az := s.cfg.authzFor(res.repo)
+	az := s.authzFor(res.repo)
 	if az == nil {
 		return true
 	}
@@ -362,7 +441,7 @@ func (s *Server) authorized(user string, res resource, method string) bool {
 		// path when the transaction is committed (handleMerge), so users whose
 		// write grant is on a subtree (e.g. /trunk) can commit without
 		// write on "/".
-		return user != "" || s.cfg.authFor(res.repo) == nil
+		return user != "" || s.authFor(res.repo) == nil
 	case MethodCopy:
 		// Copying needs read access to the source; the destination is
 		// checked at commit time. Requiring write on the source made
@@ -372,12 +451,12 @@ func (s *Server) authorized(user string, res resource, method string) bool {
 		// PROPPATCH on the transaction root carries revision properties
 		// (svn:log etc.), not a node change; node props are still checked.
 		if res.typ == resTxn && (res.path == "" || res.path == "/") {
-			return user != "" || s.cfg.authFor(res.repo) == nil
+			return user != "" || s.authFor(res.repo) == nil
 		}
 	case http.MethodDelete:
 		// Aborting an activity / transaction is cleanup, not a path change.
 		if res.typ == resActivity || res.typ == resTxn {
-			return user != "" || s.cfg.authFor(res.repo) == nil
+			return user != "" || s.authFor(res.repo) == nil
 		}
 	}
 	write := writeMethods[method]
@@ -387,7 +466,7 @@ func (s *Server) authorized(user string, res resource, method string) bool {
 // authenticate parses Basic credentials and runs the auth chain selected for
 // the target repository (per-repo override or global).
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request, repo string) (auth.Identity, bool) {
-	chain := s.cfg.authFor(repo)
+	chain := s.authFor(repo)
 	if chain == nil {
 		return auth.Identity{Username: ""}, true // no auth configured: anonymous
 	}
@@ -424,9 +503,11 @@ func (s *Server) unauthorized(w http.ResponseWriter) bool {
 // --- helpers ---
 
 func (s *Server) repo(w http.ResponseWriter, res resource) (*fs.Repo, bool) {
-	opener := s.cfg.openerFor(res.repo)
+	opener := s.openerFor(res.repo)
 	if opener == nil {
-		http.Error(w, "no repositories configured", http.StatusInternalServerError)
+		// No global opener and no per-repo entry: the name is not configured
+		// (a repository removed by the admin API must look like 404, not 500).
+		http.NotFound(w, nil)
 		return nil, false
 	}
 	// Reuse a per-repo singleton so concurrent requests share the Repo's

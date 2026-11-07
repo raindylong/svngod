@@ -244,7 +244,7 @@ func (s *Server) openRepoOnly(w http.ResponseWriter, name string) (*fs.Repo, boo
 	if r != nil {
 		return r, true
 	}
-	opener := s.cfg.openerFor(name)
+	opener := s.openerFor(name)
 	if opener == nil {
 		http.Error(w, "no repositories configured", http.StatusInternalServerError)
 		return nil, false
@@ -487,11 +487,11 @@ func (s *Server) handleRevPropPatch(w http.ResponseWriter, r *http.Request, res 
 		return
 	}
 	user := IdentityFrom(r.Context()).Username
-	if s.cfg.authFor(res.repo) != nil && user == "" {
+	if s.authFor(res.repo) != nil && user == "" {
 		s.unauthorized(w)
 		return
 	}
-	if az := s.cfg.authzFor(res.repo); az != nil && !az.Authorize(user, res.repo, "/", true) {
+	if az := s.authzFor(res.repo); az != nil && !az.Authorize(user, res.repo, "/", true) {
 		http.Error(w, "Access forbidden", http.StatusForbidden)
 		return
 	}
@@ -1460,7 +1460,7 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 	// their own resource, but a transaction can contain paths it never named
 	// (server-side copies, MOVE destinations). Re-check every changed path,
 	// plus read access to copy sources, exactly where mod_dav_svn does.
-	if az := s.cfg.authzFor(res.repo); az != nil {
+	if az := s.authzFor(res.repo); az != nil {
 		user := IdentityFrom(r.Context()).Username
 		for _, ch := range changes {
 			if !az.Authorize(user, res.repo, ch.Path, true) {

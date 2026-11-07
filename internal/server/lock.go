@@ -55,7 +55,7 @@ func (s *Server) handleLock(w http.ResponseWriter, r *http.Request, res resource
 	// Locking requires an authenticated principal when the repo has auth
 	// configured; otherwise the lockowner would be meaningless and anonymous
 	// callers could lock any path.
-	if s.cfg.authFor(res.repo) != nil && IdentityFrom(r.Context()).Username == "" {
+	if s.authFor(res.repo) != nil && IdentityFrom(r.Context()).Username == "" {
 		s.unauthorized(w)
 		return
 	}
@@ -112,7 +112,7 @@ func (s *Server) handleLock(w http.ResponseWriter, r *http.Request, res resource
 }
 
 func (s *Server) handleUnlock(w http.ResponseWriter, r *http.Request, res resource, repo *fs.Repo) {
-	if s.cfg.authFor(res.repo) != nil && IdentityFrom(r.Context()).Username == "" {
+	if s.authFor(res.repo) != nil && IdentityFrom(r.Context()).Username == "" {
 		s.unauthorized(w)
 		return
 	}

@@ -26,11 +26,14 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
+	"svngod/internal/admin"
 	"svngod/internal/auth"
 	"svngod/internal/authz"
+	"svngod/internal/config"
 	"svngod/internal/fs"
 	"svngod/internal/fs/store"
 	"svngod/internal/server"
@@ -60,6 +63,10 @@ type options struct {
 
 	commitBatch    int
 	commitWindowMs int
+
+	adminAddr      string
+	adminToken     string
+	adminAllowCIDR string
 
 	hooksDir       string
 	tlsCert        string
@@ -122,6 +129,9 @@ func main() {
 	fl.IntVar(&o.maxUploads, "max-uploads", 16, "maximum concurrent PUT/bundle uploads (0 = unlimited)")
 	fl.IntVar(&o.commitBatch, "commit-batch", 16, "group concurrently arriving commits into batches of this size (0/1 = off)")
 	fl.IntVar(&o.commitWindowMs, "commit-window-ms", 2, "milliseconds to wait for more commits once a batch starts")
+	fl.StringVar(&o.adminAddr, "admin-addr", "", "management API listen address (empty = disabled; requires --config and a token)")
+	fl.StringVar(&o.adminToken, "admin-token", "", "management API bearer token (prefer SVNGOD_ADMIN_TOKEN)")
+	fl.StringVar(&o.adminAllowCIDR, "admin-allow-cidr", "", "comma-separated CIDRs allowed to call the management API (default loopback)")
 	fl.IntVar(&o.maxUserUploads, "max-user-uploads", 4, "maximum concurrent uploads per user (0 = unlimited)")
 	fl.BoolVar(&o.metrics, "metrics", true, "expose Prometheus metrics at /_metrics")
 	fl.StringVar(&o.basePath, "base-path", "/svn", "URL prefix for repositories")
@@ -149,12 +159,15 @@ func main() {
 	_ = fl.Parse(os.Args[1:])
 
 	if configPath != "" {
-		runMultiRepo(configPath, o.commitBatch, o.commitWindowMs)
+		runMultiRepo(configPath, o.commitBatch, o.commitWindowMs, o.adminAddr, o.adminToken, o.adminAllowCIDR)
 		return
 	}
 
 	if o.repoRoot == "" {
 		log.Fatal("--repo-root required")
+	}
+	if o.adminAddr != "" {
+		log.Printf("admin API disabled: it requires --config (mutations must persist to a JSON file)")
 	}
 	fs.ConfigureCommitBatch(o.commitBatch, o.commitWindowMs)
 	st, err := o.makeStore()
@@ -225,13 +238,13 @@ func newHTTPServer(addr string, h http.Handler) *http.Server {
 
 // runMultiRepo starts a server configured from a JSON file with one or more
 // repositories, each with its own storage backend, authz file and auth chain.
-func runMultiRepo(configPath string, commitBatch, commitWindowMs int) {
-	cfg, err := loadConfig(configPath)
+func runMultiRepo(configPath string, commitBatch, commitWindowMs int, adminAddr, adminToken, adminAllowCIDR string) {
+	cfg, err := config.Load(configPath)
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
 	fs.ConfigureCommitBatch(commitBatch, commitWindowMs)
-	repos, err := cfg.repoConfigs()
+	repos, cfgs, err := cfg.BuildRepos(nil, nil)
 	if err != nil {
 		log.Fatalf("build repos: %v", err)
 	}
@@ -247,6 +260,7 @@ func runMultiRepo(configPath string, commitBatch, commitWindowMs int) {
 	if maxUserUploads == 0 {
 		maxUserUploads = 4
 	}
+	logger := log.New(os.Stderr, "svngod ", log.LstdFlags)
 	srv := server.New(server.Config{
 		BasePath:             cfg.BasePath,
 		Repos:                repos,
@@ -254,8 +268,9 @@ func runMultiRepo(configPath string, commitBatch, commitWindowMs int) {
 		MaxConcurrentUploads: maxUploads,
 		MaxUserUploads:       maxUserUploads,
 		DisableMetrics:       cfg.DisableMetrics,
-		Logger:               log.New(os.Stderr, "svngod ", log.LstdFlags),
+		Logger:               logger,
 	})
+	startAdmin(configPath, cfg, cfgs, srv, adminAddr, adminToken, adminAllowCIDR, logger)
 	log.Printf("svngod listening on %s (base %s, %d repos)", addr, cfg.BasePath, len(repos))
 	hs := newHTTPServer(addr, srv.Handler())
 	if cfg.TLSCert != "" && cfg.TLSKey != "" {
@@ -268,6 +283,63 @@ func runMultiRepo(configPath string, commitBatch, commitWindowMs int) {
 	if err := hs.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// startAdmin runs the management API on its own listener. It is disabled
+// unless an address is configured; running it without a token is refused.
+func startAdmin(configPath string, cfg *config.Config, cfgs map[string]*server.RepoConfig,
+	srv *server.Server, addr, token, allowCIDR string, logger *log.Logger) {
+	if addr == "" {
+		addr = cfg.AdminAddr
+	}
+	if addr == "" {
+		return
+	}
+	if token == "" {
+		token = os.Getenv("SVNGOD_ADMIN_TOKEN")
+	}
+	if token == "" {
+		token = cfg.AdminToken
+	}
+	if token == "" && cfg.AdminTokenFile != "" {
+		if b, err := os.ReadFile(cfg.AdminTokenFile); err == nil {
+			token = strings.TrimSpace(string(b))
+		} else {
+			log.Fatalf("admin token file: %v", err)
+		}
+	}
+	if token == "" {
+		log.Fatal("admin API requires a token: set -admin-token, SVNGOD_ADMIN_TOKEN, or admin-token-file")
+	}
+	if allowCIDR == "" {
+		allowCIDR = cfg.AdminAllowCIDR
+	}
+	if allowCIDR == "" {
+		allowCIDR = "127.0.0.1/32,::1/128"
+	}
+	allow, err := admin.ParseCIDRs(allowCIDR)
+	if err != nil {
+		log.Fatalf("admin allow list: %v", err)
+	}
+	svc := admin.New(configPath, cfg, cfgs, srv, token, allow, logger)
+	hs := newHTTPServer(addr, svc.Handler())
+	go func() {
+		logger.Printf("admin API listening on %s (allow %s)", addr, allowCIDR)
+		if err := hs.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Printf("admin API stopped: %v", err)
+		}
+	}()
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	go func() {
+		for range hup {
+			if _, err := svc.ReloadNow(); err != nil {
+				logger.Printf("SIGHUP reload failed: %v", err)
+			} else {
+				logger.Printf("SIGHUP reload ok")
+			}
+		}
+	}()
 }
 
 // staleTempRe matches temp files created by server/mirror transfers, which

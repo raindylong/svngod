@@ -1384,7 +1384,7 @@ func (s *Server) reportList(w http.ResponseWriter, r *http.Request, repo *fs.Rep
 	// namespace and makes clients reject the report).
 	b.WriteString(`<S:list-report xmlns:S="svn:" xmlns:D="` + NS_DAV + `">` + "\n")
 
-	az := s.cfg.authzFor(repoName)
+	az := s.authzFor(repoName)
 	user := IdentityFrom(r.Context()).Username
 	allowed := func(p string) bool {
 		return az == nil || az.Authorize(user, repoName, p, false)

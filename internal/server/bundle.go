@@ -138,7 +138,7 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user := ident.Username
-	if user == "" && s.cfg.authFor(name) != nil {
+	if user == "" && s.authFor(name) != nil {
 		s.unauthorized(w)
 		return
 	}
@@ -267,7 +267,7 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 		base = head
 	}
 
-	az := s.cfg.authzFor(name)
+	az := s.authzFor(name)
 	changes := make([]fs.Change, 0, len(hdr.Changes))
 	var tempFiles []string
 	defer func() {
@@ -510,7 +510,7 @@ func (s *Server) handleBundleStat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user := ident.Username
-	if user == "" && s.cfg.authFor(name) != nil {
+	if user == "" && s.authFor(name) != nil {
 		s.unauthorized(w)
 		return
 	}
@@ -533,7 +533,7 @@ func (s *Server) handleBundleStat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	az := s.cfg.authzFor(name)
+	az := s.authzFor(name)
 	out := make(map[string]bundleStatEntry, len(req.Files))
 	for _, p := range req.Files {
 		path, perr := cleanBundlePath(p)

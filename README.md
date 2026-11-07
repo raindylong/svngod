@@ -160,6 +160,31 @@ revscale -store mirror -endpoints 10.0.0.11:9000,10.0.0.12:9000 \
 - 实测（主备 RustFS，LAN）：单进程 K=64 约 **33 次/秒**，8 个仓库并发 **45–49 次/秒**；1000 万修订约需 **60 小时**。
 - 16 仓 × 625,000 修订的千万级长跑使用 8 个 worker；每约 6 小时对两个副本做一次全量校验。
 
+## 管理 API（热加载）
+
+管理员可以在独立端口上增删改仓库配置并热加载，无需重启（需要 `--config` 文件模式）：
+
+```bash
+svngod --config svngod.json \
+  -admin-addr 127.0.0.1:18080 -admin-token-file /etc/svngod/admin.token
+
+# 新增仓库并自动建库
+curl -X POST "http://127.0.0.1:18080/_api/v1/repos?create=1" \
+  -H "Authorization: Bearer $SVNGOD_ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"assets","storage":{"type":"file","root":"/srv/svn"},
+       "auth":[{"type":"local","passwd":"/etc/svngod/passwd"}]}'
+
+# 重新读取配置文件（也可 kill -HUP）
+curl -X POST http://127.0.0.1:18080/_api/v1/reload \
+  -H "Authorization: Bearer $SVNGOD_ADMIN_TOKEN"
+```
+
+- 端口默认关闭；启用必须有 token，默认只允许回环来源；配置响应中的密钥会脱敏。
+- 只热加载 `repos`（存储/authz/认证链）；`addr`、TLS、上传上限等进程参数仍要重启。
+- 变更原子写回 JSON（临时文件 + rename，保留 `.bak`），失败整体回滚；删除仓库不删数据。
+
+完整接口、dry-run、替换/删除与失败语义见 [`docs/管理API与热加载.md`](docs/管理API与热加载.md)。
+
 ## 工程结构
 
 ```

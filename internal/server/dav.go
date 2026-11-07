@@ -624,7 +624,7 @@ func (s *Server) propChildren(b *strings.Builder, repo *fs.Repo, base, name stri
 		// svn_fspath__skip_ancestor assertion.
 		cpath := strings.TrimRight(path, "/") + "/" + c.Name
 		// Never disclose inaccessible subtrees in a directory listing.
-		if az := s.cfg.authzFor(name); az != nil && !az.Authorize(user, name, cpath, false) {
+		if az := s.authzFor(name); az != nil && !az.Authorize(user, name, cpath, false) {
 			continue
 		}
 		// ListDir already returned each child's NodeRev fields; pass the
