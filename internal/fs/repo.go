@@ -1851,31 +1851,49 @@ func (r *Repo) CollectLoose(ctx context.Context) (int, error) {
 }
 
 // collectLooseShard removes the loose rev/revprops keys of one packed shard.
+// Deletes are independent and run concurrently: RustFS needs seconds for a
+// 1000-key batch, and a serial pass over 625k revisions would take hours.
 func (r *Repo) collectLooseShard(ctx context.Context, shard uint64) (int, error) {
 	first := shard * r.shardSz
 	last := first + r.shardSz - 1
+	var batches [][]string
 	var batch []string
-	deleted := 0
-	flush := func() error {
-		if len(batch) == 0 {
-			return nil
-		}
-		if err := r.store.Delete(ctx, batch); err != nil {
-			return err
-		}
-		deleted += len(batch)
-		batch = batch[:0]
-		return nil
-	}
 	for rev := first; rev <= last; rev++ {
 		batch = append(batch, r.keys.LooseRev(shard, rev), r.keys.LooseRevProps(shard, rev))
-		if len(batch) >= 500 {
-			if err := flush(); err != nil {
-				return deleted, err
-			}
+		if len(batch) >= 1000 {
+			batches = append(batches, batch)
+			batch = nil
 		}
 	}
-	return deleted, flush()
+	if len(batch) > 0 {
+		batches = append(batches, batch)
+	}
+	sem := make(chan struct{}, 8)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	deleted := 0
+	var firstErr error
+	for _, b := range batches {
+		wg.Add(1)
+		go func(b []string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if err := r.store.Delete(ctx, b); err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+				return
+			}
+			mu.Lock()
+			deleted += len(b)
+			mu.Unlock()
+		}(b)
+	}
+	wg.Wait()
+	return deleted, firstErr
 }
 
 // CollectTxnData deletes content-addressed commit-session bodies that no
