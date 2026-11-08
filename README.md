@@ -8,9 +8,10 @@
 - **认证**：OpenLDAP（search+bind / direct-bind 两种模式）+ 本地密码表（`{SHA}` / `{CRYPT}` SHA-512crypt），按序首成功；真实 OpenLDAP 集成验证。Apache `AuthLDAPURL` 迁移见 [`docs/配置与多实例部署.md`](docs/配置与多实例部署.md) §7.1。
 - **授权**：SVN authz 文件（组传递闭包、`~` 否定、max-of-matches），每库独立 authz。
 - **存储**：svndiff v0 编解码、FSFS 式分片（SHARD_SIZE 默认 4096）、自动打包、LRU 缓存；后端 `file`（本地）/ `s3`（RustFS/MinIO/AWS/OSS/COS）/ `mirror`（主备镜像）。
-- **规模**：单仓 1000 万修订级（分片+自动打包，loose 对象数 O(shards)）；实测 10 万修订 avg 0.44ms/rev 稳定不退化。
+- **规模**：千万级修订实测通过——16 仓 × 625,000 = **10,000,000** 修订，组提交 K=64、8 worker，73.3 小时完成（平均 37.9 次/秒），16/16 仓全量 verify 通过；分片+自动打包使 loose 对象数保持 O(shards)。
 - **多租户**：`--config` 单进程多库，每库独立存储/认证/授权；`mirror` 提供主备 S3 负载均衡 + 故障降级 + 恢复自动补齐。
 - **多实例**：无状态 svngod 实例可共享同一存储，LB 轮询即可；跨进程提交租约 + WAL 保证唯一修订号，节点不足法定人数返回 503。完整 JSON 见 [`docs/配置与多实例部署.md`](docs/配置与多实例部署.md)。
+- **管理 API（热加载）**：独立端口 + Bearer Token，可增删改仓库配置、自动建库、dry-run，`reload`/`SIGHUP` 原子生效；进程级参数仍需重启。见 [`docs/管理API与热加载.md`](docs/管理API与热加载.md)。
 - **WAL + 写法定人数（etcd 思路）**：mirror 配置 `"quorum": 2` 后，提交先把带 CRC32C 的提交记录（WAL）写到法定人数副本，再推进 HEAD；启动/提交前回放 WAL，把“已达成法定人数但 HEAD 未推进”的提交前滚。提交租约也改为法定人数互斥，避免两个 svngod 进程各自选举不同 mirror 主节点时同时提交同一修订号。严格模式下节点不足法定人数时提交返回 503，不确认任何数据。
 
 ## 快速开始
@@ -213,7 +214,7 @@ cmd/
 - 真实 OpenLDAP（direct-bind + search+bind）认证 + authz 授权。
 - 多库独立 authz / 独立认证（本地表 + LDAP 混合）E2E。
 - 主备 S3 镜像：双写 / 读负载均衡 / 故障降级 / 恢复自动补齐 E2E。
-- 1000 万修订级压测（自动分片打包）。
+- **1000 万修订压测（2026-11）**：16 仓 × 625,000 = **10,000,000** 修订，73.3 小时（平均 37.9 次/秒）；16/16 仓 `verify --all-revs` 通过。后半程备 S3 故障，为单副本交付。详见 [`docs/千万级压测报告.md`](docs/千万级压测报告.md)。
 
 ## 其他模型优化建议落地清单
 
