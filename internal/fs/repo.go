@@ -82,6 +82,11 @@ type Repo struct {
 	// segRepairAt rate-limits read-triggered index rebuilds per shard.
 	segRepairMu sync.Mutex
 	segRepairAt map[uint64]time.Time
+	// segOverrides caches which revisions have a mutable revprop override
+	// (segment repositories). Bounded by shards touched, same TTL as revprops.
+	segOverrideMu sync.Mutex
+	segOverrides  map[uint64]map[uint64]bool
+	segOverrideAt map[uint64]time.Time
 	// writeQuorum is the number of replicas a commit record must reach before
 	// publication (0/1 = single-node semantics, no WAL).
 	writeQuorum int
@@ -2343,6 +2348,12 @@ func (r *Repo) invalidateRevPropsPack(sh uint64) {
 func (r *Repo) loadRevProps(rev uint64) (*RevProps, error) {
 	ctx := context.Background()
 	if r.segments && rev >= r.segmentFrom {
+		if rp, ok, oerr := r.segRevProps(rev, false); oerr != nil {
+			return nil, oerr
+		} else if ok {
+			r.cacheRevProps(rev, rp)
+			return rp, nil
+		}
 		_, props, err := r.segmentEntry(rev, false)
 		if err != nil {
 			return nil, err
@@ -2390,6 +2401,11 @@ func (r *Repo) loadRevProps(rev uint64) (*RevProps, error) {
 func (r *Repo) loadRevPropsFresh(rev uint64) (*RevProps, error) {
 	ctx := context.Background()
 	if r.segments && rev >= r.segmentFrom {
+		if rp, ok, oerr := r.segRevProps(rev, true); oerr != nil {
+			return nil, oerr
+		} else if ok {
+			return rp, nil
+		}
 		_, props, err := r.segmentEntry(rev, true)
 		if err != nil {
 			return nil, err

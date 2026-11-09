@@ -3,6 +3,7 @@ package fs
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"svngod/internal/cdc"
@@ -137,5 +138,40 @@ func TestRebuildRejectsOverlap(t *testing.T) {
 	}
 	if _, err := r.rebuildSegmentIndex(context.Background(), 0, 16); err == nil {
 		t.Fatal("rebuild accepted overlapping segment ranges")
+	}
+}
+
+// TestRepairRefusesShortIndex deletes a segment object and expects the rebuild
+// to refuse writing a shorter index: the loss must stay visible.
+func TestRepairRefusesShortIndex(t *testing.T) {
+	st := store.NewMemoryStore()
+	r, err := CreateRepoSegments(st, "repos/short", 8, 64, cdc.DefaultParams(), false, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitBatches(t, r, 2, 4) // revs 1..8: shard 0 = 1..7, shard 1 = 8
+	refs, err := r.loadSegmentIndex(0)
+	if err != nil || len(refs) == 0 {
+		t.Fatalf("index=%+v err=%v", refs, err)
+	}
+	if err := st.Delete(context.Background(), []string{r.segmentKeyFor(refs[0].First, refs[0].Count)}); err != nil {
+		t.Fatal(err)
+	}
+	r2, err := OpenRepo(st, "repos/short")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r2.RepairSegmentIndexes(context.Background()); err == nil {
+		t.Fatal("repair accepted an index that does not cover HEAD")
+	} else if !strings.Contains(err.Error(), "cover") {
+		t.Fatalf("error does not explain the gap: %v", err)
+	}
+	// The original index is preserved (it names the missing object).
+	got, err := r2.loadSegmentIndex(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(refs) || got[0] != refs[0] {
+		t.Fatalf("index was narrowed to %+v", got)
 	}
 }

@@ -159,6 +159,13 @@ func (r *Repo) repairSegmentIndex(ctx context.Context, sh uint64) ([]segmentRef,
 		// Leave no index behind rather than an empty one.
 		return nil, nil
 	}
+	// Refuse to narrow the index: if a segment object is missing, the rebuilt
+	// list stops short of HEAD and writing it would hide the loss behind
+	// "revision not in index". The previous index is left in place so the error
+	// names the revision that cannot be read.
+	if !segmentIndexCovers(refs, r.segmentStart(sh), r.shardLast(sh, head)) {
+		return nil, fmt.Errorf("shard %d: segment objects do not cover up to HEAD (%d)", sh, head)
+	}
 	_, etag, existed, err := r.loadSegmentIndexETag(ctx, sh)
 	if err != nil {
 		return nil, err
@@ -203,13 +210,38 @@ func (r *Repo) RepairSegmentIndexes(ctx context.Context) (int, error) {
 		before, _ := r.loadSegmentIndex(sh)
 		refs, rerr := r.repairSegmentIndex(ctx, sh)
 		if rerr != nil {
-			return repaired, fmt.Errorf("shard %d: %w", sh, rerr)
+			return repaired, rerr
 		}
 		if !sameSegmentRefs(before, refs) {
 			repaired++
 		}
 	}
 	return repaired, nil
+}
+
+// shardLast is the last revision a shard must cover, bounded by HEAD.
+func (r *Repo) shardLast(sh, head uint64) uint64 {
+	last := (sh+1)*r.shardSz - 1
+	if last > head {
+		last = head
+	}
+	return last
+}
+
+// segmentIndexCovers reports whether refs continue the shard from start through
+// last without gaps or overlaps.
+func segmentIndexCovers(refs []segmentRef, start, last uint64) bool {
+	if last < start {
+		return true
+	}
+	next := start
+	for _, ref := range refs {
+		if ref.First != next {
+			return false
+		}
+		next = ref.First + ref.Count
+	}
+	return next > last
 }
 
 func sameSegmentRefs(a, b []segmentRef) bool {

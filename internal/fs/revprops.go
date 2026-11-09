@@ -20,6 +20,12 @@ func (r *Repo) UpdateRevProps(rev uint64, set map[string]string, remove []string
 	if rev > head {
 		return errors.New("fs: revision does not exist")
 	}
+	// Segment repositories keep the committed properties inside immutable
+	// segments; an edit is stored as an override object instead of rewriting
+	// the segment (which many other revisions share).
+	if r.segments && rev >= r.segmentFrom {
+		return r.updateSegRevProps(rev, set, remove)
+	}
 	ctx := context.Background()
 	sh := r.shard(rev)
 	packed, err := r.isPacked(sh)

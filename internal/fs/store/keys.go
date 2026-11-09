@@ -53,6 +53,20 @@ func (k *Keys) SegmentDir(shard uint64) string {
 	return k.p("segs", padShard(shard)) + "/"
 }
 
+// SegRevPropsOverride holds mutable revision properties for a revision whose
+// committed copy lives inside an immutable segment. Written only after a
+// revprop edit; absent for every other revision.
+func (k *Keys) SegRevPropsOverride(shard, rev uint64) string {
+	return k.p("seg-revprops", padShard(shard), padRev(rev))
+}
+
+// SegRevPropsIndex lists the revisions of one shard that have an override, so
+// the read path needs no extra GET for the (overwhelmingly common) revisions
+// whose properties only exist in the segment.
+func (k *Keys) SegRevPropsIndex(shard uint64) string {
+	return k.p("seg-revprops", padShard(shard)+".idx")
+}
+
 // SegmentIndex names the per-shard segment index (format v2).
 func (k *Keys) SegmentIndex(shard uint64) string {
 	return k.p("segs", padShard(shard)+".idx")
