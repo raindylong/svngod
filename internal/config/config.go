@@ -64,6 +64,10 @@ type Repo struct {
 	Storage Store  `json:"storage"`
 	Authz   string `json:"authz"`
 	Auth    []Auth `json:"auth"`
+	// Segments switches a repository created with ?create=1 to the batched
+	// segment format (v2). It has no effect on an existing repository.
+	Segments      bool   `json:"segments,omitempty"`
+	SegmentTarget uint64 `json:"segment-target,omitempty"`
 }
 
 // Store describes a storage backend (or a mirror of backends).
@@ -379,6 +383,10 @@ func (r *Repo) Provision() error {
 	if _, err := fs.OpenRepo(st, prefix); err == nil {
 		return ErrRepoExists
 	} else if !errors.Is(err, fs.ErrRepoNotFound) {
+		return err
+	}
+	if r.Segments {
+		_, err = fs.CreateRepoSegments(st, prefix, 4096, 8192, cdc.DefaultParams(), false, r.SegmentTarget)
 		return err
 	}
 	_, err = fs.CreateRepoFull(st, prefix, 4096, 8192, cdc.DefaultParams(), false)

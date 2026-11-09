@@ -83,6 +83,30 @@ func TestAdminAuthRequired(t *testing.T) {
 	}
 }
 
+func TestAdminCreateRepoSegments(t *testing.T) {
+	svc, _, dir := testService(t)
+	h := svc.Handler()
+	passwd := filepath.Join(dir, "passwd")
+	body := repoBody("segadm", dir, passwd)
+	body["segments"] = true
+	body["segment-target"] = 64
+	rec, out := call(t, h, http.MethodPost, "/_api/v1/repos?create=1", "tok", body)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%v", rec.Code, out)
+	}
+	rc := svc.cfgs["segadm"]
+	if rc == nil {
+		t.Fatal("descriptor missing")
+	}
+	rp, err := rc.OpenRepo("segadm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rp.SegmentsEnabled() || rp.SegmentTarget() != 64 {
+		t.Fatalf("segments=%v target=%d", rp.SegmentsEnabled(), rp.SegmentTarget())
+	}
+}
+
 func TestAdminCreateRepoAndPersist(t *testing.T) {
 	svc, srv, dir := testService(t)
 	h := svc.Handler()

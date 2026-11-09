@@ -113,15 +113,93 @@ func (r *Repo) publishSegmentPlans(ctx context.Context, lease *commitLease, cur 
 	r.setHead(last)
 	r.cache.Clear()
 
-	// Compact a shard once its last revision is published.
+	// Compact a shard once its last revision is published. The merge runs in
+	// the background: it is O(shard size), and the commit that closed the shard
+	// must not wait for it (a client timeout would cancel it midway).
 	for _, g := range groups {
 		if (g.first+g.count)%r.shardSz == 0 {
-			if cerr := r.compactSegmentShard(ctx, g.shard); cerr != nil {
-				log.Printf("segment: compact shard %d: %v", g.shard, cerr)
-			}
+			r.enqueueCompaction(g.shard)
 		}
 	}
 	return revs, errs, nil
+}
+
+// initCompaction prepares the background compactor for segment repositories.
+// The worker starts on the first enqueue so v1 repositories spawn no goroutine.
+func (r *Repo) initCompaction() {
+	if r.segments && r.compactQ == nil {
+		r.compactQ = make(chan uint64, 256)
+	}
+}
+
+// enqueueCompaction schedules a completed shard. A full queue drops the shard
+// (compaction is an optimisation, never required for correctness) and the next
+// GC pass or the next shard completion retries it.
+func (r *Repo) enqueueCompaction(sh uint64) {
+	if r.compactQ == nil {
+		return
+	}
+	r.compactOnce.Do(func() { go r.compactLoop() })
+	select {
+	case r.compactQ <- sh:
+	default:
+		log.Printf("segment: compaction queue full, shard %d postponed", sh)
+	}
+}
+
+func (r *Repo) compactLoop() {
+	for sh := range r.compactQ {
+		r.runCompaction(sh)
+	}
+}
+
+// runCompaction merges one shard, retrying while another process holds the
+// commit lease.
+func (r *Repo) runCompaction(sh uint64) {
+	backoff := time.Second
+	for attempt := 0; attempt < 6; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		err := r.compactCompletedShard(ctx, sh)
+		cancel()
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, ErrCommitBusy) {
+			log.Printf("segment: compact shard %d: %v", sh, err)
+			return
+		}
+		time.Sleep(backoff)
+		backoff *= 2
+	}
+	log.Printf("segment: compact shard %d: commit lease busy, postponed", sh)
+}
+
+// compactCompletedShard merges a shard only after HEAD has passed its end and
+// only under the commit lease: the lease serialises the index read-modify-write
+// with concurrent commits, so a merge can never drop a newly published batch
+// (the old code merged inline for the same reason).
+func (r *Repo) compactCompletedShard(ctx context.Context, sh uint64) error {
+	cur, _, err := r.readCurrentStrict()
+	if err != nil {
+		return err
+	}
+	// A shard spans revisions sh*shardSz .. (sh+1)*shardSz-1, so it is complete
+	// once HEAD reached its last revision.
+	forShard := (sh+1)*r.shardSz - 1
+	if cur.Head < forShard {
+		return nil
+	}
+	lease, err := r.acquireCommitLease(ctx)
+	if err != nil {
+		return err
+	}
+	defer lease.Release(r.store)
+	if cur, _, cerr := r.readCurrentStrict(); cerr != nil || cur.Head < forShard {
+		return cerr
+	}
+	r.journalMu.Lock()
+	defer r.journalMu.Unlock()
+	return r.compactSegmentShard(ctx, sh)
 }
 
 // appendSegmentRef inserts a ref keeping the index ordered and deduplicated.
@@ -148,16 +226,16 @@ func (r *Repo) writeSegmentJournal(ctx context.Context, first, count, parent uin
 		return nil
 	}
 	rec := &CommitRecord{
-		Version:     2,
-		Rev:         first,
-		Parent:      parent,
-		Lease:       lease,
-		Created:     created,
-		SegmentKey:  key,
-		SegmentSHA:  sha,
-		First:       first,
-		Count:       count,
-		Quorum:      r.writeQuorum,
+		Version:    2,
+		Rev:        first,
+		Parent:     parent,
+		Lease:      lease,
+		Created:    created,
+		SegmentKey: key,
+		SegmentSHA: sha,
+		First:      first,
+		Count:      count,
+		Quorum:     r.writeQuorum,
 	}
 	if err := r.store.Put(ctx, r.keys.Journal(first), EncodeCommitRecord(rec)); err != nil {
 		return fmt.Errorf("journal: %w", err)

@@ -59,6 +59,12 @@ type Repo struct {
 	segments      bool
 	segmentFrom   uint64
 	segmentTarget uint64
+	// compactQ carries completed shard numbers to the background compactor.
+	// Merging a full shard costs O(shard size); doing it inline made the commit
+	// that closed the shard wait for the merge, and a client that timed out
+	// cancelled the merge halfway through.
+	compactQ    chan uint64
+	compactOnce sync.Once
 	// writeQuorum is the number of replicas a commit record must reach before
 	// publication (0/1 = single-node semantics, no WAL).
 	writeQuorum int
@@ -219,12 +225,15 @@ func createRepo(st store.Store, prefix string, shardSize, maxDelta uint64, chunk
 		return nil, err
 	}
 	wireMirrorControl(st, keys)
-	return &Repo{
+	r := &Repo{
 		store: st, keys: keys, shardSz: shardSize, maxDelta: maxDelta,
 		chunkParams: chunks, dirBuckets: dirBuckets, writeQuorum: writeQuorumOf(st),
-		journal: journalOf(st),
-		cache:   cache.New(1 << 16), nodeCache: make(map[cache.Key]*NodeRev),
-	}, nil
+		journal:  journalOf(st),
+		segments: format.Segments, segmentFrom: format.SegmentFrom, segmentTarget: format.SegmentTarget,
+		cache: cache.New(1 << 16), nodeCache: make(map[cache.Key]*NodeRev),
+	}
+	r.initCompaction()
+	return r, nil
 }
 
 // ReplicaStatus reports mirror health when the repository is backed by a
@@ -238,6 +247,12 @@ func (r *Repo) ReplicaStatus() []store.ReplicaStatus {
 
 // DirBucketsEnabled reports whether large directories are stored as buckets.
 func (r *Repo) DirBucketsEnabled() bool { return r.dirBuckets }
+
+// SegmentsEnabled reports whether commits are stored in batched segments.
+func (r *Repo) SegmentsEnabled() bool { return r.segments }
+
+// SegmentTarget returns the compaction target (revisions per merged segment).
+func (r *Repo) SegmentTarget() uint64 { return r.segmentTarget }
 
 // ChunkParams returns the repository's content-defined chunking profile.
 func (r *Repo) ChunkParams() cdc.Params { return r.chunkParams }
@@ -271,6 +286,7 @@ func OpenRepo(st store.Store, prefix string) (*Repo, error) {
 	if r.segmentTarget == 0 {
 		r.segmentTarget = r.shardSz
 	}
+	r.initCompaction()
 	if commitBatchEnabled() {
 		r.batch = newCommitBatcher(r)
 	}
@@ -309,7 +325,6 @@ func (r *Repo) Keys() *store.Keys { return r.keys }
 
 // Store exposes the underlying store (for GC / admin).
 func (r *Repo) Store() store.Store { return r.store }
-
 
 // UUID returns the repository's immutable uuid string.
 func (r *Repo) UUID() (string, error) {
@@ -1186,7 +1201,6 @@ func (r *Repo) commitTxn(baseRev uint64, changes []Change, revProps map[string]s
 	if err != nil {
 		return 0, err
 	}
-
 
 	// The lease may have expired during a long finalize; stop before writing
 	// a revision block that another replica could already be publishing.

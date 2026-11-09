@@ -64,6 +64,7 @@ curl -X POST "http://127.0.0.1:18080/_api/v1/repos?create=1" \
 ```
 
 - `create=1`：仓库不存在时按默认参数建库（分片 4096、最大 delta 链 64），已存在返回 409。
+- `create=1` 时可附加 `"segments": true`、`"segment-target": 4096`，新库使用 v2 段提交格式（每 4096 修订合并为一段，S3 上对象数从 40 万级降到千级）；对已存在的库无影响。
 - 不传 `create`：只加配置，仓库必须已存在，否则 422。
 - `dry_run=1`：只做校验，不建库、不落盘、不切换；返回 `{"dry_run":true,"valid":true}`。
 

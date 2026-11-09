@@ -3,7 +3,9 @@ package fs
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	"svngod/internal/cdc"
 	"svngod/internal/fs/store"
@@ -94,9 +96,18 @@ func TestSegmentCompaction(t *testing.T) {
 	if err != nil || errs[0] != nil {
 		t.Fatalf("rev4=%v errs=%v err=%v", rev4, errs, err)
 	}
-	refs, err := r.loadSegmentIndex(0)
-	if err != nil {
-		t.Fatal(err)
+	// Compaction runs in the background now; wait for the index to collapse.
+	var refs []segmentRef
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		refs, err = r.loadSegmentIndex(0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(refs) == 1 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if len(refs) != 1 || refs[0].First != 1 || refs[0].Count != 7 {
 		t.Fatalf("compaction refs=%+v", refs)
@@ -138,5 +149,80 @@ func TestSegmentReplayRollsForward(t *testing.T) {
 	}
 	if _, err := r2.readBlock(3); err != nil {
 		t.Fatalf("read replayed rev: %v", err)
+	}
+}
+
+// TestSegmentCompactionUnderLoad commits from several goroutines while the
+// background compactor merges completed shards. Every revision must stay
+// readable and every committed path must resolve afterwards: compaction takes
+// the same lease as commits, so it can never drop a batch from the shard index.
+func TestSegmentCompactionUnderLoad(t *testing.T) {
+	st := store.NewMemoryStore()
+	r := openSegRepo(t, st, "segload", 16, 16)
+	var wg sync.WaitGroup
+	errCh := make(chan error, 1)
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 25; i++ {
+				paths := []string{
+					fmt.Sprintf("/g%d-%d-a", g, i),
+					fmt.Sprintf("/g%d-%d-b", g, i),
+				}
+				_, errs, err := r.CommitBatch(batchAdds(paths...))
+				if err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					return
+				}
+				for _, e := range errs {
+					if e != nil {
+						select {
+						case errCh <- e:
+						default:
+						}
+						return
+					}
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	default:
+	}
+	head, err := r.HeadFresh()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head != 200 {
+		t.Fatalf("head=%d, want 200", head)
+	}
+	for rev := uint64(1); rev <= head; rev++ {
+		if _, err := r.readBlock(rev); err != nil {
+			t.Fatalf("read rev %d: %v", rev, err)
+		}
+		if _, err := r.loadRevProps(rev); err != nil {
+			t.Fatalf("props rev %d: %v", rev, err)
+		}
+	}
+	for g := 0; g < 4; g++ {
+		for i := 0; i < 25; i++ {
+			for _, suf := range []string{"a", "b"} {
+				p := fmt.Sprintf("/g%d-%d-%s", g, i, suf)
+				if _, err := r.Resolve(head, p); err != nil {
+					t.Fatalf("resolve %s at head: %v", p, err)
+				}
+			}
+		}
+	}
+	issues, err := r.VerifyRange(1, head, false)
+	if err != nil || len(issues) != 0 {
+		t.Fatalf("verify issues=%v err=%v", issues, err)
 	}
 }
