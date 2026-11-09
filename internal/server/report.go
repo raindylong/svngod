@@ -953,6 +953,7 @@ func (s *Server) reportLog(w http.ResponseWriter, repo *fs.Repo, reportPath stri
 	b.WriteString(`<S:log-report xmlns:S="svn:" xmlns:D="` + NS_DAV + `">` + "\n")
 	ascending := start < end
 	count := uint64(0)
+	var emitErr error
 	emit := func(rv uint64) bool {
 		if limit > 0 && count >= limit {
 			return false
@@ -985,7 +986,11 @@ func (s *Server) reportLog(w http.ResponseWriter, repo *fs.Repo, reportPath stri
 		count++
 		rp, err := repo.GetRevProps(rv)
 		if err != nil {
-			return true
+			// Never drop a revision from the log silently: the client would
+			// read a shorter history and believe the revision does not exist.
+			// The body is still buffered, so report the failure instead.
+			emitErr = fmt.Errorf("revision %d properties unreadable: %w", rv, err)
+			return false
 		}
 		b.WriteString("  <S:log-item>\n")
 		if discoverChanged {
@@ -1036,6 +1041,10 @@ func (s *Server) reportLog(w http.ResponseWriter, repo *fs.Repo, reportPath stri
 				break
 			}
 		}
+	}
+	if emitErr != nil {
+		http.Error(w, emitErr.Error(), http.StatusInternalServerError)
+		return
 	}
 	b.WriteString("</S:log-report>\n")
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")

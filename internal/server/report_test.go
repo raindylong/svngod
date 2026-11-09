@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/hex"
@@ -632,5 +633,35 @@ func TestCopyFloorForSubtreeCheckout(t *testing.T) {
 	}
 	if pathCreatedRev(repo, nr) >= floor {
 		t.Fatalf("inherited file revision = %d, expected an older source revision", pathCreatedRev(repo, nr))
+	}
+}
+
+// TestReportLogSurfacesMissingRevProps makes sure a revision whose properties
+// cannot be read fails the report instead of being silently omitted: a shorter
+// log would make the revision look nonexistent.
+func TestReportLogSurfacesMissingRevProps(t *testing.T) {
+	ts, repo, base := testServer(t, "", "")
+	defer ts.Close()
+	ctx := context.Background()
+	keys := []string{
+		repo.Keys().LooseRevProps(0, 1),
+		repo.Keys().PackedRevProps(0),
+	}
+	if err := repo.Store().Delete(ctx, keys); err != nil {
+		t.Fatal(err)
+	}
+	body := `<?xml version="1.0" encoding="utf-8"?>` +
+		`<S:log-report xmlns:S="http://subversion.tigris.org/xmlns/dav/">` +
+		`<S:start-revision>1</S:start-revision>` +
+		`<S:end-revision>1</S:end-revision>` +
+		`<S:path>/</S:path>` +
+		`<S:revprop name="svn:log"/>` +
+		`</S:log-report>`
+	resp := doRequest(t, "REPORT", base+"/svn/demo/!svn/me", body, "", "", nil)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want 500; body=%s", resp.StatusCode, bodyOf(t, resp))
+	}
+	if out := bodyOf(t, resp); !strings.Contains(out, "properties unreadable") {
+		t.Fatalf("error does not name the revision: %s", out)
 	}
 }

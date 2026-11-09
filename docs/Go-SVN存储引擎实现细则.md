@@ -313,7 +313,7 @@ func (r *Repo) CommitTxn(txid, newRevProps) (newRev, error):
 - 每批一条 `journal/<first>` WAL（v2），回放按批前滚；
 - `format` 增加 `SEGMENTS` / `SEGMENT_FROM` / `SEGMENT_TARGET`，v1 仓库不受影响。
 
-设计、提交协议、崩溃窗口、compaction 与迁移步骤见 [`存储引擎Segment格式设计.md`](存储引擎Segment格式设计.md)。已落地：格式字段、键布局、编解码与索引；提交路径（批段+批 WAL+索引+汇总 CAS）、读路径（含 fresh 重试/SHA 校验；v2 段按修订 Range 读，顺序访问自动升级整段读，verify 强制全量校验）、分片完成时的在线 compaction（后台 worker 异步执行，与提交共用租约）、v2 journal 裁剪；`svnadmin create --segments` 或管理 API `POST /_api/v1/repos?create=1` 带 `"segments": true` 可建 v2 仓库。原生 svn 端到端（提交/并发批段/检出/log/cat/verify/dump-load/重启）已验证。`svnadmin repair --rebuild-index` 可从 segment 对象重建分片索引（读路径在索引缺条目时也会限频自愈）；`svnadmin migrate --segments on [--purge]` 可把 v1 仓库按分片迁移到 v2（HEAD 变动即中止，全部成功后才切格式）；20k 修订实测迁移 4.45s，v2 写入 2.0s/332 文件，对比 v1 26s/7,254 文件。
+设计、提交协议、崩溃窗口、compaction 与迁移步骤见 [`存储引擎Segment格式设计.md`](存储引擎Segment格式设计.md)。已落地：格式字段、键布局、编解码与索引；提交路径（批段+批 WAL+索引+汇总 CAS）、读路径（含 fresh 重试/SHA 校验；v2 段按修订 Range 读，顺序访问自动升级整段读，verify 强制全量校验）、分片完成时的在线 compaction（后台 worker 异步执行，与提交共用租约）、v2 journal 裁剪；`svnadmin create --segments` 或管理 API `POST /_api/v1/repos?create=1` 带 `"segments": true` 可建 v2 仓库。原生 svn 端到端（提交/并发批段/检出/log/cat/verify/dump-load/重启）已验证。失败语义：读不到的修订属性会让 `svn log` 整体返回 500 并点名修订号，绝不静默跳过——静默跳过会让客户端把“读不到”误当成“不存在”。`svnadmin repair --rebuild-index` 可从 segment 对象重建分片索引（读路径在索引缺条目时也会限频自愈）；`svnadmin migrate --segments on [--purge]` 可把 v1 仓库按分片迁移到 v2（HEAD 变动即中止，全部成功后才切格式）；20k 修订实测迁移 4.45s，v2 写入 2.0s/332 文件，对比 v1 26s/7,254 文件。
 
 ## 6. 读路径实现
 
