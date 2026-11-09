@@ -55,6 +55,9 @@ type options struct {
 	gcGrace         int
 	chunkAvg        uint64
 	dirBuckets      bool
+	segments      bool
+	segmentTarget uint64
+
 	deleteWorkers   int
 	deleteDryRun    bool
 	deleteForce     bool
@@ -205,6 +208,10 @@ func main() {
 		fs.StringVar(&o.migrateDirs, "dir-buckets", "", "on|off: page large directories (leave empty to keep)")
 		fs.Uint64Var(&o.migrateChunkAvg, "chunk-avg", 0, "new target average chunk size in bytes (0 keeps)")
 	}
+	if cmd == "create" {
+		fs.BoolVar(&o.segments, "segments", false, "store revisions in batched segment objects (format v2)")
+		fs.Uint64Var(&o.segmentTarget, "segment-target", 0, "compaction target revisions per segment (0 = shard size)")
+	}
 	if cmd == "delete-repo" {
 		fs.IntVar(&o.deleteWorkers, "workers", 16, "concurrent delete batches")
 		fs.BoolVar(&o.deleteDryRun, "dry-run", false, "count objects without deleting")
@@ -282,7 +289,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `svnadmin - svngod repository administration
 
 usage:
-  svnadmin create [s3 flags | --mirror-file FILE] <repo>
+  svnadmin create [--segments] [s3 flags | --mirror-file FILE] <repo>
   svnadmin dump   [--output FILE] [s3 flags] <repo>
   svnadmin load   [--input FILE] [s3 flags] <repo>
   svnadmin verify [s3 flags] <repo>   # integrity walk; prints corrupted nodes
@@ -300,7 +307,12 @@ func doCreate(o *options, repoName string, shardSize, maxDelta uint64) {
 	if err != nil {
 		fatal(err)
 	}
-	repo, err := fs.CreateRepoFull(st, prefix, shardSize, maxDelta, chunkParamsFor(o.chunkAvg), o.dirBuckets)
+	var repo *fs.Repo
+	if o.segments {
+		repo, err = fs.CreateRepoSegments(st, prefix, shardSize, maxDelta, chunkParamsFor(o.chunkAvg), o.dirBuckets, o.segmentTarget)
+	} else {
+		repo, err = fs.CreateRepoFull(st, prefix, shardSize, maxDelta, chunkParamsFor(o.chunkAvg), o.dirBuckets)
+	}
 	if err != nil {
 		fatal(err)
 	}

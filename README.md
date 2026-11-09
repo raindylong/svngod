@@ -22,7 +22,8 @@ CGO_ENABLED=0 go build -o svnadmin ./cmd/svnadmin
 CGO_ENABLED=0 go build -o svngocli ./cmd/svngocli   # 客户端（需要本机 svn 命令）
 
 # 本地单库（flag 模式）
-svnadmin create /srv/svn/demo
+svnadmin create /srv/svn/demo                 # 每修订一个对象（v1）
+svnadmin create --segments /srv/svn/demo2     # 批段存储（v2，可选）
 svngod --addr 127.0.0.1:8080 --base-path /svn --repo-root /srv/svn \
   --passwd /etc/svngod/passwd --authz /etc/svngod/authz &
 

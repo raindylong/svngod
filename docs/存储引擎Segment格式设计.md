@@ -124,10 +124,12 @@ u32 CRC32C(以上全部)
 ## 9. 落地顺序
 
 1. **已完成**：format 字段、键布局（`segs/...`）、segment 编解码、分片索引编解码/查找（含 CRC/损坏/越界单测）。
-2. 提交路径：`CommitBatch`/`CommitTxn` v2 分支、批 WAL、索引更新、CAS 与回放。
-3. 读路径：`readBlock`/`loadRevProps`/fresh 变体接入 segment（含缓存与 fresh 重试）。
-4. 在线 compaction 与旧 segment 延迟删除；GC/trim 适配。
-5. `svnadmin create --segments`、`migrate --segments`、文档与基准。
+2. **已完成**：提交路径 v2（`CommitBatch` 分支、按分片拆段、批 WAL、索引更新、汇总 CAS、CAS 竞争的逐段认领）；`CommitTxn` 在 v2 下走批量入口。
+3. **已完成**：读路径（`readBlock`/`loadRevProps`/fresh、索引缓存未命中 fresh 重试、segment SHA 校验）。
+4. **已完成**：分片完成时在线 compaction（新键含 count、旧段 60 秒后删除）；v2 的 journal 裁剪按索引精确键删除；`CollectLoose` 在 v2 下跳过（无 loose）。
+5. **部分完成**：`svnadmin create --segments [--segment-target N]` 已可用；`migrate --segments`（v1→v2 增量迁移）待实现；基准待补。
+
+端到端验证（2026-11-09）：v2 仓库用原生 svn 完成 12 次提交 + 4 并发 ×3 提交（产生 count=3/4 的批段），`svn log/cat/co`、`verify --all-revs`、`dump/load` round-trip、重启后读取全部通过；磁盘上仅 rev 0 为 loose，其余在 `segs/`。
 
 ## 10. 风险与取舍
 

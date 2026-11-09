@@ -39,8 +39,13 @@ var journalCRC = crc32.MakeTable(crc32.Castagnoli)
 
 // CommitRecord describes one revision publication.
 type CommitRecord struct {
-	Version     int    `json:"v"`
-	Rev         uint64 `json:"rev"`
+	Version int    `json:"v"`
+	Rev     uint64 `json:"rev"`
+	// Version 2 (segment format) describes a whole batch:
+	First      uint64 `json:"first,omitempty"`
+	Count      uint64 `json:"count,omitempty"`
+	SegmentKey string `json:"segment_key,omitempty"`
+	SegmentSHA string `json:"segment_sha256,omitempty"`
 	Parent      uint64 `json:"parent"`
 	Lease       string `json:"lease,omitempty"`
 	Created     int64  `json:"created"`
@@ -84,7 +89,7 @@ func DecodeCommitRecord(b []byte) (*CommitRecord, error) {
 	if err := json.Unmarshal(body, &rec); err != nil {
 		return nil, fmt.Errorf("journal: decode: %w", err)
 	}
-	if rec.Version != journalVersion {
+	if rec.Version != 1 && rec.Version != 2 {
 		return nil, fmt.Errorf("journal: unsupported version %d", rec.Version)
 	}
 	return &rec, nil
@@ -192,7 +197,7 @@ func (r *Repo) replayJournal() {
 	// replica was down (measured as ~10s per upload in availability mode).
 	// The window covers one maximum-size commit batch so a crash after the
 	// batch's WAL append still rolls the whole batch forward.
-	for rev := head + 1; rev <= head+journalReplayWindow; rev++ {
+	for rev := head + 1; rev <= head+journalReplayWindow; {
 		key := r.keys.Journal(rev)
 		// Cheap presence probe first. A plain Get reads the primary and does
 		// not touch an out-of-service replica, so the common case (no pending
@@ -205,7 +210,49 @@ func (r *Repo) replayJournal() {
 			break
 		}
 		rec, derr := DecodeCommitRecord(b)
-		if derr != nil || rec.Rev != rev || rec.Parent != head {
+		if derr != nil || rec.Parent != head {
+			break
+		}
+		if rec.Version == 2 {
+			if rec.First != rev || rec.Count == 0 {
+				break
+			}
+			seg, _, serr := read(rec.SegmentKey)
+			if serr != nil {
+				break
+			}
+			sum := sha256.Sum256(seg)
+			if hex.EncodeToString(sum[:]) != rec.SegmentSHA {
+				break
+			}
+			refs, ierr := r.loadSegmentIndex(r.shard(rec.First))
+			if ierr != nil {
+				break
+			}
+			if !segmentIndexHas(refs, rec) {
+				refs = appendSegmentRef(refs, segmentRef{First: rec.First, Count: rec.Count,
+					Key: rec.SegmentKey, SHA256: rec.SegmentSHA})
+				if perr := r.store.Put(ctx, r.keys.SegmentIndex(r.shard(rec.First)), encodeSegmentIndex(refs)); perr != nil {
+					break
+				}
+			}
+			cur, etag, cerr := r.readCurrent()
+			if cerr != nil || cur.Head != head {
+				return
+			}
+			last := rec.First + rec.Count - 1
+			nc := &Current{Head: last, Created: rec.Created}
+			if _, cerr := r.store.CAS(ctx, r.keys.Current(), etag, nc.Marshal()); cerr != nil {
+				return
+			}
+			r.setHead(last)
+			r.cache.Clear()
+			log.Printf("journal: rolled forward revisions %d..%d (segment, head was %d)", rec.First, last, head)
+			head = last
+			rev = head + 1
+			continue
+		}
+		if rec.Version != 1 || rec.Rev != rev {
 			break
 		}
 		rb, rbCount, rerr := read(rec.RevBlockKey)
@@ -228,7 +275,18 @@ func (r *Repo) replayJournal() {
 		r.cache.Clear()
 		log.Printf("journal: rolled forward revision %d (quorum-acked, head was %d)", rev, head)
 		head = rev
+		rev = head + 1
 	}
+}
+
+// segmentIndexHas reports whether the index already contains this exact batch.
+func segmentIndexHas(refs []segmentRef, rec *CommitRecord) bool {
+	for _, ref := range refs {
+		if ref.First == rec.First && ref.Count == rec.Count && ref.Key == rec.SegmentKey && ref.SHA256 == rec.SegmentSHA {
+			return true
+		}
+	}
+	return false
 }
 
 // JournalTail returns the last n journal records that can be decoded, newest
@@ -283,6 +341,34 @@ func (r *Repo) TrimJournal(keep uint64) (int, error) {
 		return 0, nil
 	}
 	cutoff := head - keep
+	if r.segments {
+		// One WAL record per batch: delete the records of segments that ended
+		// at or below the cutoff, by exact key (no prefix listing).
+		deleted := 0
+		for sh := uint64(0); sh <= r.shard(head); sh++ {
+			refs, ierr := r.loadSegmentIndex(sh)
+			if ierr != nil {
+				return deleted, ierr
+			}
+			var keys []string
+			for _, ref := range refs {
+				if ref.First+ref.Count-1 <= cutoff {
+					keys = append(keys, r.keys.Journal(ref.First))
+				}
+			}
+			for start := 0; start < len(keys); start += 1000 {
+				end := start + 1000
+				if end > len(keys) {
+					end = len(keys)
+				}
+				if derr := r.deleteLoose(context.Background(), keys[start:end]); derr != nil {
+					return deleted, derr
+				}
+				deleted += end - start
+			}
+		}
+		return deleted, nil
+	}
 	ctx := context.Background()
 	// Delete by exact key range instead of listing the journal prefix: one
 	// record per revision means a 625k-revision repository needs 625 list

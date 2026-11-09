@@ -480,6 +480,9 @@ func (r *Repo) CommitBatch(reqs []BatchCommit) ([]uint64, []error, error) {
 	if len(plans) == 0 {
 		return revs, errs, nil
 	}
+	if r.segments {
+		return r.publishSegmentPlans(ctx, lease, cur, etag, plans, created, revs, errs)
+	}
 
 	// Data objects first: both mirrors receive every revision block and
 	// property set concurrently. The batch is not visible until the CAS below.

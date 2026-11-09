@@ -54,6 +54,11 @@ type Repo struct {
 	maxDelta    uint64
 	chunkParams cdc.Params
 	dirBuckets  bool
+	// segments stores revisions >= segmentFrom in batched segment objects
+	// (format v2); 0/false keeps the per-revision loose/pack layout.
+	segments      bool
+	segmentFrom   uint64
+	segmentTarget uint64
 	// writeQuorum is the number of replicas a commit record must reach before
 	// publication (0/1 = single-node semantics, no WAL).
 	writeQuorum int
@@ -157,6 +162,17 @@ func CreateRepoParams(st store.Store, prefix string, shardSize, maxDelta uint64,
 
 // CreateRepoFull also selects whether large directories are paged.
 func CreateRepoFull(st store.Store, prefix string, shardSize, maxDelta uint64, chunks cdc.Params, dirBuckets bool) (*Repo, error) {
+	return createRepo(st, prefix, shardSize, maxDelta, chunks, dirBuckets, false, 0)
+}
+
+// CreateRepoSegments creates a format-v2 repository whose commits are stored in
+// batched segment objects. target bounds the compaction target (revisions per
+// segment; 0 = shard size).
+func CreateRepoSegments(st store.Store, prefix string, shardSize, maxDelta uint64, chunks cdc.Params, dirBuckets bool, target uint64) (*Repo, error) {
+	return createRepo(st, prefix, shardSize, maxDelta, chunks, dirBuckets, true, target)
+}
+
+func createRepo(st store.Store, prefix string, shardSize, maxDelta uint64, chunks cdc.Params, dirBuckets, segments bool, target uint64) (*Repo, error) {
 	chunks = chunks.Normalize()
 	if shardSize == 0 {
 		shardSize = 4096
@@ -170,6 +186,14 @@ func CreateRepoFull(st store.Store, prefix string, shardSize, maxDelta uint64, c
 		Version: 1, ShardSize: shardSize, MaxDeltaChain: maxDelta,
 		ChunkMin: uint64(chunks.Min), ChunkMax: uint64(chunks.Max), ChunkMask: chunks.Mask,
 		DirBuckets: dirBuckets,
+	}
+	if segments {
+		if target == 0 || target > shardSize {
+			target = shardSize
+		}
+		format.Segments = true
+		format.SegmentFrom = 1 // revision 0 stays loose
+		format.SegmentTarget = target
 	}
 	if err := st.Put(ctx, keys.Format(), format.Marshal()); err != nil {
 		return nil, err
@@ -240,11 +264,12 @@ func OpenRepo(st store.Store, prefix string) (*Repo, error) {
 	r := &Repo{
 		store: st, keys: keys, shardSz: f.ShardSize, maxDelta: f.MaxDeltaChain,
 		chunkParams: cp, dirBuckets: f.DirBuckets, writeQuorum: writeQuorumOf(st),
+		segments: f.Segments, segmentFrom: f.SegmentFrom, segmentTarget: f.SegmentTarget,
 		journal: journalOf(st),
 		cache:   cache.New(1 << 16), nodeCache: make(map[cache.Key]*NodeRev),
 	}
-	if commitBatchEnabled() {
-		r.batch = newCommitBatcher(r)
+	if r.segmentTarget == 0 {
+		r.segmentTarget = r.shardSz
 	}
 	if commitBatchEnabled() {
 		r.batch = newCommitBatcher(r)
@@ -473,6 +498,19 @@ func (r *Repo) readBlock(rev uint64) (*RevBlock, error) {
 		return rb, err
 	}
 	ctx := context.Background()
+	if r.segments && rev >= r.segmentFrom {
+		data, _, err := r.segmentEntry(rev, false)
+		if err != nil {
+			return nil, err
+		}
+		rb, err := UnmarshalRevBlock(data)
+		if err != nil {
+			return nil, err
+		}
+		cachePut(r.cache, k, data)
+		r.storeBlock(rev, rb, len(data))
+		return rb, nil
+	}
 	sh := r.shard(rev)
 	var data []byte
 	var err error
@@ -1002,6 +1040,13 @@ func (r *Repo) ensureNoPendingPublication(head uint64) error {
 func (r *Repo) CommitTxn(baseRev uint64, changes []Change, revProps map[string]string) (uint64, error) {
 	if r.batch != nil {
 		return r.batch.submit(baseRev, changes, revProps)
+	}
+	if r.segments {
+		revs, errs, err := r.CommitBatch([]BatchCommit{{BaseRev: baseRev, Changes: changes, RevProps: revProps}})
+		if err != nil {
+			return 0, err
+		}
+		return revs[0], errs[0]
 	}
 	return r.commitTxn(baseRev, changes, revProps)
 }
@@ -1837,6 +1882,11 @@ func cachePut(c *cache.LRU, k cache.Key, b []byte) {
 // known from HEAD, so this deletes exact keys instead of listing a prefix that
 // may hold tens of thousands of objects.
 func (r *Repo) CollectLoose(ctx context.Context) (int, error) {
+	if r.segments {
+		// Segment repositories have no per-revision loose objects (revision 0
+		// stays loose but is tiny); compaction reclaims old segments instead.
+		return 0, nil
+	}
 	head, err := r.HeadFresh()
 	if err != nil {
 		return 0, err
@@ -2189,6 +2239,17 @@ func (r *Repo) invalidateRevPropsPack(sh uint64) {
 
 func (r *Repo) loadRevProps(rev uint64) (*RevProps, error) {
 	ctx := context.Background()
+	if r.segments && rev >= r.segmentFrom {
+		_, props, err := r.segmentEntry(rev, false)
+		if err != nil {
+			return nil, err
+		}
+		rp, err := UnmarshalRevProps(props)
+		if err == nil {
+			r.cacheRevProps(rev, rp)
+		}
+		return rp, err
+	}
 	sh := r.shard(rev)
 	packed, err := r.isPacked(sh)
 	if err != nil {
@@ -2225,6 +2286,13 @@ func (r *Repo) loadRevProps(rev uint64) (*RevProps, error) {
 // loose entries and cached packs (another replica may have rewritten either).
 func (r *Repo) loadRevPropsFresh(rev uint64) (*RevProps, error) {
 	ctx := context.Background()
+	if r.segments && rev >= r.segmentFrom {
+		_, props, err := r.segmentEntry(rev, true)
+		if err != nil {
+			return nil, err
+		}
+		return UnmarshalRevProps(props)
+	}
 	sh := r.shard(rev)
 	packed, err := r.isPacked(sh)
 	if err != nil {

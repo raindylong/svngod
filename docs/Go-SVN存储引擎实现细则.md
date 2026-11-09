@@ -313,7 +313,7 @@ func (r *Repo) CommitTxn(txid, newRevProps) (newRev, error):
 - 每批一条 `journal/<first>` WAL（v2），回放按批前滚；
 - `format` 增加 `SEGMENTS` / `SEGMENT_FROM` / `SEGMENT_TARGET`，v1 仓库不受影响。
 
-设计、提交协议、崩溃窗口、compaction 与迁移步骤见 [`存储引擎Segment格式设计.md`](存储引擎Segment格式设计.md)。当前已落地格式字段、键布局、segment 编解码与索引（含单测）；提交/读取/compaction 接线与迁移工具按文档阶段推进。
+设计、提交协议、崩溃窗口、compaction 与迁移步骤见 [`存储引擎Segment格式设计.md`](存储引擎Segment格式设计.md)。已落地：格式字段、键布局、编解码与索引；提交路径（批段+批 WAL+索引+汇总 CAS）、读路径（含 fresh 重试/SHA 校验）、分片完成时的在线 compaction、v2 journal 裁剪；`svnadmin create --segments` 可建 v2 仓库。原生 svn 端到端（提交/并发批段/检出/log/cat/verify/dump-load/重启）已验证。增量迁移 `migrate --segments` 与基准待补。
 
 ## 6. 读路径实现
 
