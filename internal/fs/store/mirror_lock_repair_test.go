@@ -77,3 +77,27 @@ func TestRepairLeavesLockStateAloneWithoutArbiter(t *testing.T) {
 		t.Fatal("lock state changed while the arbiter was unreachable")
 	}
 }
+// TestDeletePrimaryOnlyTouchesArbiter: loose-object cleanup must not mirror
+// its deletes; a standby's leftover copies are harmless, while mirrored
+// thousand-key deletes used to take a live standby out of service.
+func TestDeletePrimaryOnlyTouchesArbiter(t *testing.T) {
+	ctx := context.Background()
+	a, b := NewMemoryStore(), NewMemoryStore()
+	key := "repos/x/revs-loose/0000000000/000000000001"
+	for _, s := range []Store{a, b} {
+		if err := s.Put(ctx, key, []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := NewMirror([]Store{a, b}, WithRepoPrefix("repos/x"))
+	defer m.Close()
+	if err := m.DeletePrimary(ctx, []string{key}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := a.Head(ctx, key); ok {
+		t.Fatal("arbiter copy not deleted")
+	}
+	if _, ok, _ := b.Head(ctx, key); !ok {
+		t.Fatal("standby copy was deleted (delete mirrored)")
+	}
+}

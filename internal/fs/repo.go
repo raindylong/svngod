@@ -1794,11 +1794,16 @@ func (r *Repo) packShardLocked(shard uint64) error {
 	if err := r.store.Put(ctx, r.keys.PackedDone(shard), []byte("1")); err != nil {
 		return err
 	}
-	// Loose copies are left for svnadmin gc. Deleting thousands of keys per
-	// shard through the mirror knocks a standby out of service when its
-	// batched DELETE exceeds the standby write budget, which makes HEAD stop
-	// replicating; repair listings are bounded to the active shard, so the
-	// garbage is harmless until the operator collects it.
+	// Reclaim the packed shard's loose copies in the background. Deletes go to
+	// the arbiter only (DeletePrimary): mirroring thousands of keys knocked a
+	// standby out of service when a 1000-key DELETE exceeded its budget, and a
+	// standby's leftover loose copies are harmless (repair lists only the
+	// active shard).
+	go func() {
+		if _, err := r.collectLooseShard(context.Background(), shard); err != nil {
+			log.Printf("pack: loose cleanup shard %d: %v", shard, err)
+		}
+	}()
 
 	r.invalidateRevPropsPack(shard)
 	r.cache.Clear()
@@ -1853,6 +1858,16 @@ func (r *Repo) CollectLoose(ctx context.Context) (int, error) {
 // collectLooseShard removes the loose rev/revprops keys of one packed shard.
 // Deletes are independent and run concurrently: RustFS needs seconds for a
 // 1000-key batch, and a serial pass over 625k revisions would take hours.
+// deleteLoose uses the primary-only path when the store is a mirror.
+func (r *Repo) deleteLoose(ctx context.Context, keys []string) error {
+	if pd, ok := r.store.(interface {
+		DeletePrimary(context.Context, []string) error
+	}); ok {
+		return pd.DeletePrimary(ctx, keys)
+	}
+	return r.store.Delete(ctx, keys)
+}
+
 func (r *Repo) collectLooseShard(ctx context.Context, shard uint64) (int, error) {
 	first := shard * r.shardSz
 	last := first + r.shardSz - 1
@@ -1879,7 +1894,7 @@ func (r *Repo) collectLooseShard(ctx context.Context, shard uint64) (int, error)
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			if err := r.store.Delete(ctx, b); err != nil {
+			if err := r.deleteLoose(ctx, b); err != nil {
 				mu.Lock()
 				if firstErr == nil {
 					firstErr = err

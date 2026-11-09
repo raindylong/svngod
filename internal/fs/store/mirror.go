@@ -1187,6 +1187,19 @@ func (m *MirrorStore) Delete(ctx context.Context, keys []string) error {
 	return nil
 }
 
+// DeletePrimary removes keys from the arbiter only. Bulk cleanup of loose
+// objects uses it: a packed shard's loose copies on a standby are harmless
+// (repair ignores them), while mirroring thousands of deletes knocked a live
+// standby out of service when a 1000-key DELETE exceeded the standby budget.
+func (m *MirrorStore) DeletePrimary(ctx context.Context, keys []string) error {
+	p, pi := m.primary()
+	if err := p.Delete(ctx, keys); err != nil {
+		m.markDown(pi)
+		return err
+	}
+	return nil
+}
+
 // DeletePrefix drops a whole prefix on the primary and on healthy standbys.
 func (m *MirrorStore) DeletePrefix(ctx context.Context, prefix string) error {
 	p, pi := m.primary()
