@@ -11,8 +11,7 @@ import (
 	"hash/crc32"
 	"log"
 	"sort"
-	"strconv"
-	"strings"
+	"sync"
 	"time"
 
 	"svngod/internal/fs/store"
@@ -285,33 +284,48 @@ func (r *Repo) TrimJournal(keep uint64) (int, error) {
 	}
 	cutoff := head - keep
 	ctx := context.Background()
-	prefix := r.keys.JournalPrefix()
-	next := ""
-	var victims []string
-	for {
-		objs, n, lerr := r.store.ListPrefix(ctx, prefix, next, 1000)
-		if lerr != nil {
-			return 0, lerr
+	// Delete by exact key range instead of listing the journal prefix: one
+	// record per revision means a 625k-revision repository needs 625 list
+	// pages, and RustFS needs seconds per page (repair/GC stalled for hours
+	// on it). Deletes run concurrently for the same reason.
+	sem := make(chan struct{}, 8)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	deleted := 0
+	var firstErr error
+	var batch []string
+	flush := func(b []string) {
+		if len(b) == 0 {
+			return
 		}
-		for _, o := range objs {
-			revStr := o.Key[strings.LastIndex(o.Key, "/")+1:]
-			rev, perr := strconv.ParseUint(revStr, 10, 64)
-			if perr == nil && rev <= cutoff {
-				victims = append(victims, o.Key)
+		wg.Add(1)
+		go func(b []string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if err := r.store.Delete(ctx, b); err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+				return
 			}
+			mu.Lock()
+			deleted += len(b)
+			mu.Unlock()
+		}(b)
+	}
+	for rev := uint64(1); rev <= cutoff; rev++ {
+		batch = append(batch, r.keys.Journal(rev))
+		if len(batch) >= 1000 {
+			flush(batch)
+			batch = nil
 		}
-		if n == "" || n == next {
-			break
-		}
-		next = n
 	}
-	if len(victims) == 0 {
-		return 0, nil
-	}
-	if err := r.store.Delete(ctx, victims); err != nil {
-		return 0, err
-	}
-	return len(victims), nil
+	flush(batch)
+	wg.Wait()
+	return deleted, firstErr
 }
 
 // JournalRecord returns one decoded record, or nil when absent.
