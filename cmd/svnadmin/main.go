@@ -39,32 +39,34 @@ const (
 )
 
 type options struct {
-	endpoint        string
-	accessKey       string
-	secretKey       string
-	bucket          string
-	prefix          string
-	useSSL          bool
-	mirrorFile      string
-	allRevs         bool
-	texts           bool
-	fromRev         uint64
-	toRev           uint64
-	journalLimit    int
-	keepJournal     uint64
-	gcGrace         int
-	chunkAvg        uint64
-	dirBuckets      bool
+	endpoint      string
+	accessKey     string
+	secretKey     string
+	bucket        string
+	prefix        string
+	useSSL        bool
+	mirrorFile    string
+	allRevs       bool
+	texts         bool
+	fromRev       uint64
+	toRev         uint64
+	journalLimit  int
+	keepJournal   uint64
+	gcGrace       int
+	gcTexts       bool
+	gcCompact     bool
+	chunkAvg      uint64
+	dirBuckets    bool
 	segments      bool
 	segmentTarget uint64
 
-	deleteWorkers   int
-	deleteDryRun    bool
-	deleteForce     bool
-	deleteNoSweep   bool
-	deleteHead      uint64
-	deleteBatch     int
-	deleteControl   bool
+	deleteWorkers int
+	deleteDryRun  bool
+	deleteForce   bool
+	deleteNoSweep bool
+	deleteHead    uint64
+	deleteBatch   int
+	deleteControl bool
 
 	migrateSegments string
 	migratePurge    bool
@@ -237,6 +239,8 @@ func main() {
 	if cmd == "gc" {
 		fs.Uint64Var(&o.keepJournal, "keep-journal", 4096, "number of recent WAL records to keep")
 		fs.IntVar(&o.gcGrace, "gc-grace", 3600, "seconds an unreferenced text/chunk must be old before collection (0 disables)")
+		fs.BoolVar(&o.gcTexts, "texts", false, "scan every revision to collect unreferenced texts (slow: O(all revisions))")
+		fs.BoolVar(&o.gcCompact, "compact", true, "merge segment shards whose index has more than one entry")
 	}
 	shardSize := uint64(defaultShardSize)
 	maxDelta := uint64(defaultMaxDelta)
@@ -300,7 +304,7 @@ usage:
   svnadmin repair [--mirror-file FILE] <repo>  # synchronously reconcile mirrors
   svnadmin delete-repo -force [s3 flags | --mirror-file FILE] <repo>  # delete every object of a repository
   svnadmin journal [-n N] [s3 flags | --mirror-file FILE] <repo>  # show WAL records
-  svnadmin gc     [s3 flags] <repo>   # loose objects, txn bodies, unused texts
+  svnadmin gc [-texts] [s3 flags] <repo>  # loose objects, txn bodies, segment compaction (-texts: unreferenced texts, slow)
 
 s3 flags: --endpoint H:PORT --access-key K --secret-key S --bucket B [--prefix P] [--ssl]
 `)
@@ -656,16 +660,36 @@ func doGC(o *options, repoName string) {
 	if err != nil {
 		fatal(err)
 	}
-	tx, err := repo.CollectTextsGrace(context.Background(), time.Duration(o.gcGrace)*time.Second)
-	if err != nil {
-		fatal(err)
+	// Collecting unreferenced texts walks every revision, which costs minutes
+	// per 100k revisions on object storage. It is a leak-reclamation pass, never
+	// needed for correctness, so routine GC skips it and ops opt in with -texts.
+	tx := 0
+	if o.gcTexts {
+		tx, err = repo.CollectTextsGrace(context.Background(), time.Duration(o.gcGrace)*time.Second)
+		if err != nil {
+			fatal(err)
+		}
 	}
 	jn, err := repo.TrimJournal(o.keepJournal)
 	if err != nil {
 		fatal(err)
 	}
-	fmt.Printf("gc: removed %d loose objects, %d orphaned txn bodies and %d unreferenced texts from %q (journal: %d trimmed)\n",
+	merged := 0
+	if o.gcCompact {
+		merged, err = repo.CompactSegments(context.Background())
+		if err != nil {
+			fatal(err)
+		}
+	}
+	orphans, err := repo.CollectOrphanSegments(context.Background(), time.Duration(o.gcGrace)*time.Second)
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Printf("gc: removed %d loose objects, %d orphaned txn bodies and %d unreferenced texts from %q (journal: %d records dropped)\n",
 		n, tn, tx, repoName, jn)
+	if merged > 0 || orphans > 0 {
+		fmt.Printf("gc: merged %d segment shards, removed %d orphaned segments\n", merged, orphans)
+	}
 }
 
 func doJournal(o *options, repoName string) {

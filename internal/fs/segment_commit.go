@@ -353,6 +353,7 @@ func (r *Repo) compactSegmentShard(ctx context.Context, sh uint64) error {
 		return err
 	}
 	var first, last uint64
+	var total uint64
 	for i, ref := range refs {
 		if i == 0 {
 			first = ref.First
@@ -360,6 +361,13 @@ func (r *Repo) compactSegmentShard(ctx context.Context, sh uint64) error {
 		if end := ref.First + ref.Count - 1; end > last {
 			last = end
 		}
+		total += ref.Count
+	}
+	// A contiguous index is the invariant every commit maintains. Refusing a
+	// gapped one protects against merging holes into a segment that no reader
+	// could decode; the hole itself must be repaired from the WAL instead.
+	if last-first+1 != total {
+		return fmt.Errorf("segment: shard %d index has a gap (%d entries, span %d-%d)", sh, total, first, last)
 	}
 	merged := &segmentData{First: first, Count: last - first + 1, Parent: first - 1}
 	for _, ref := range refs {
