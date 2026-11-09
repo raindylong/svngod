@@ -24,6 +24,7 @@ CGO_ENABLED=0 go build -o svngocli ./cmd/svngocli   # 客户端（需要本机 s
 # 本地单库（flag 模式）
 svnadmin create /srv/svn/demo                 # 每修订一个对象（v1）
 svnadmin create --segments /srv/svn/demo2     # 批段存储（v2，可选）
+svnadmin migrate --segments on --purge /srv/svn/demo  # 现有 v1 仓库迁移到 v2
 svngod --addr 127.0.0.1:8080 --base-path /svn --repo-root /srv/svn \
   --passwd /etc/svngod/passwd --authz /etc/svngod/authz &
 

@@ -127,9 +127,22 @@ u32 CRC32C(以上全部)
 2. **已完成**：提交路径 v2（`CommitBatch` 分支、按分片拆段、批 WAL、索引更新、汇总 CAS、CAS 竞争的逐段认领）；`CommitTxn` 在 v2 下走批量入口。
 3. **已完成**：读路径（`readBlock`/`loadRevProps`/fresh、索引缓存未命中 fresh 重试、segment SHA 校验）。
 4. **已完成**：分片完成时在线 compaction（新键含 count、旧段 60 秒后删除）；v2 的 journal 裁剪按索引精确键删除；`CollectLoose` 在 v2 下跳过（无 loose）。
-5. **部分完成**：`svnadmin create --segments [--segment-target N]` 已可用；`migrate --segments`（v1→v2 增量迁移）待实现；基准待补。
+5. **已完成**：`svnadmin create --segments [--segment-target N]`；`svnadmin migrate --segments on [--purge] <repo>` 离线/增量迁移（按分片写段、HEAD 变动即中止、全部成功后才切格式、可选 purge 旧对象）；基准见 §11。
 
 端到端验证（2026-11-09）：v2 仓库用原生 svn 完成 12 次提交 + 4 并发 ×3 提交（产生 count=3/4 的批段），`svn log/cat/co`、`verify --all-revs`、`dump/load` round-trip、重启后读取全部通过；磁盘上仅 rev 0 为 loose，其余在 `segs/`。
+
+## 11. 实测（2026-11-09，本地 file 后端，20,000 修订，K=64）
+
+| 指标 | v1（每修订对象） | v2（segment） |
+|---|---|---|
+| 写入 20k 修订 | 26.0s（768/s） | **2.0s（9,796/s）** |
+| 仓库文件数 | 7,254 | **332** |
+| 迁移 v1→v2（含 purge） | — | 4.45s，迁移后 14 个文件 |
+| 迁移后继续提交 | — | 1,000 修订 0.1s（8,320/s） |
+| 全量 verify | — | 20k/21k 修订 `no integrity issues` |
+
+- 迁移过程中发现并修复：`segmentEntry` 返回段内子切片会让每个缓存的 revblock 持有整个多 MB 段，20k 修订的 `verify` 因此 OOM；现返回拷贝。
+- 读取路径对段内修订取的是拷贝，缓存按 block/segment 分别计量。
 
 ## 10. 风险与取舍
 

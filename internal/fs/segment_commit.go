@@ -212,7 +212,12 @@ func (r *Repo) segmentEntry(rev uint64, fresh bool) ([]byte, []byte, error) {
 	if i >= uint64(len(seg.Blocks)) {
 		return nil, nil, fmt.Errorf("fs: revision %d outside segment %s", rev, ref.Key)
 	}
-	return seg.Blocks[i], seg.Props[i], nil
+	// Copy: a subslice keeps the whole (possibly multi-megabyte) segment
+	// backing array alive, and the block cache would then hold one segment per
+	// cached revision (verify of a 20k-revision repository OOMs).
+	block := append([]byte(nil), seg.Blocks[i]...)
+	props := append([]byte(nil), seg.Props[i]...)
+	return block, props, nil
 }
 
 func (r *Repo) segmentIndex(sh uint64, fresh bool) ([]segmentRef, error) {

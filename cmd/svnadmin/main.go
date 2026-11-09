@@ -66,6 +66,8 @@ type options struct {
 	deleteBatch     int
 	deleteControl   bool
 
+	migrateSegments string
+	migratePurge    bool
 	migrateDirs     string
 	migrateChunkAvg uint64
 }
@@ -205,6 +207,8 @@ func main() {
 	fs.StringVar(&o.mirrorFile, "mirror-file", "", "JSON array of backends to create a mirror store (local-primary + S3-standby etc.)")
 	var output, input string
 	if cmd == "migrate" {
+		fs.StringVar(&o.migrateSegments, "segments", "", "on: rewrite revisions into segment objects (format v2)")
+		fs.BoolVar(&o.migratePurge, "purge", false, "with --segments on: delete superseded v1 objects after switching")
 		fs.StringVar(&o.migrateDirs, "dir-buckets", "", "on|off: page large directories (leave empty to keep)")
 		fs.Uint64Var(&o.migrateChunkAvg, "chunk-avg", 0, "new target average chunk size in bytes (0 keeps)")
 	}
@@ -566,7 +570,39 @@ func doInfo(o *options, repoName string) {
 
 // doMigrate changes opt-in format switches. Every replica must be restarted
 // afterwards: servers cache the format when they open a repository.
+// doMigrateToSegments rewrites every revision into segment objects and then
+// switches the repository format. Run it with writers stopped: HEAD moving
+// during the pass aborts the migration (the repository stays v1).
+func doMigrateToSegments(o *options, repoName string) {
+	st, prefix, err := o.repoStore(repoName)
+	if err != nil {
+		fatal(err)
+	}
+	repo, err := fs.OpenRepo(st, prefix)
+	if err != nil {
+		fatal(err)
+	}
+	n, err := repo.MigrateToSegments(context.Background(), o.migratePurge)
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Printf("migrated %q to segment format: %d revisions%s\n", repoName, n,
+		map[bool]string{true: " (v1 objects purged)", false: ""}[o.migratePurge])
+	fmt.Println("restart running servers and replicas to pick up the new format")
+}
+
 func doMigrate(o *options, repoName string) {
+	if o.migrateSegments != "" {
+		switch strings.ToLower(o.migrateSegments) {
+		case "on", "true", "1":
+			doMigrateToSegments(o, repoName)
+		case "off", "false", "0":
+			fatal(fmt.Errorf("segment format cannot be reverted online; migrate to a v1 repository with dump/load"))
+		default:
+			fatal(fmt.Errorf("invalid --segments %q (use on)", o.migrateSegments))
+		}
+		return
+	}
 	if o.migrateDirs == "" && o.migrateChunkAvg == 0 {
 		fatal(fmt.Errorf("nothing to change: use --dir-buckets on|off and/or --chunk-avg N"))
 	}
