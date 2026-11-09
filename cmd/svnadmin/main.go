@@ -52,6 +52,7 @@ type options struct {
 	toRev         uint64
 	journalLimit  int
 	verifyWorkers int
+	rebuildIndex  bool
 	keepJournal   uint64
 	gcGrace       int
 	gcTexts       bool
@@ -208,6 +209,7 @@ func main() {
 	fs.StringVar(&o.prefix, "prefix", "", "S3 repo prefix")
 	fs.BoolVar(&o.useSSL, "ssl", false, "use https for S3")
 	fs.StringVar(&o.mirrorFile, "mirror-file", "", "JSON array of backends to create a mirror store (local-primary + S3-standby etc.)")
+	fs.BoolVar(&o.rebuildIndex, "rebuild-index", false, "repair: rebuild segment shard indexes from segment objects")
 	var output, input string
 	if cmd == "migrate" {
 		fs.StringVar(&o.migrateSegments, "segments", "", "on: rewrite revisions into segment objects (format v2)")
@@ -303,7 +305,7 @@ usage:
   svnadmin dump   [--output FILE] [s3 flags] <repo>
   svnadmin load   [--input FILE] [s3 flags] <repo>
   svnadmin verify [--all-revs [--workers N] [--texts]] [s3 flags] <repo>  # integrity walk
-  svnadmin repair [--mirror-file FILE] <repo>  # synchronously reconcile mirrors
+  svnadmin repair [--mirror-file FILE] [--rebuild-index] <repo>  # reconcile mirrors / rebuild segment indexes
   svnadmin delete-repo -force [s3 flags | --mirror-file FILE] <repo>  # delete every object of a repository
   svnadmin journal [-n N] [s3 flags | --mirror-file FILE] <repo>  # show WAL records
   svnadmin gc [-texts] [s3 flags] <repo>  # loose objects, txn bodies, segment compaction (-texts: unreferenced texts, slow)
@@ -368,9 +370,16 @@ func doRepair(o *options, repoName string) {
 	if err != nil {
 		fatal(err)
 	}
+	if o.rebuildIndex {
+		n, rerr := r.RepairSegmentIndexes(context.Background())
+		if rerr != nil {
+			fatal(rerr)
+		}
+		fmt.Printf("repair: rebuilt %d segment shard index(es) from segment objects\n", n)
+	}
 	if rp, ok := st.(interface{ RepairNow() }); ok {
 		rp.RepairNow()
-	} else {
+	} else if !o.rebuildIndex {
 		fmt.Println("store is not mirrored; nothing to repair")
 	}
 	head, err := r.HeadFresh()

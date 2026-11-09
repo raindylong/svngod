@@ -79,6 +79,9 @@ type Repo struct {
 	seqMu   sync.Mutex
 	seqKey  string
 	seqNext uint64
+	// segRepairAt rate-limits read-triggered index rebuilds per shard.
+	segRepairMu sync.Mutex
+	segRepairAt map[uint64]time.Time
 	// writeQuorum is the number of replicas a commit record must reach before
 	// publication (0/1 = single-node semantics, no WAL).
 	writeQuorum int

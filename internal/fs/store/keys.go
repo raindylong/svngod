@@ -48,6 +48,11 @@ func (k *Keys) Segment(shard, first, count uint64) string {
 	return k.p("segs", padShard(shard), fmt.Sprintf("%012d-%012d.seg", first, count))
 }
 
+// SegmentDir is the listing prefix of one shard's segment objects.
+func (k *Keys) SegmentDir(shard uint64) string {
+	return k.p("segs", padShard(shard)) + "/"
+}
+
 // SegmentIndex names the per-shard segment index (format v2).
 func (k *Keys) SegmentIndex(shard uint64) string {
 	return k.p("segs", padShard(shard)+".idx")

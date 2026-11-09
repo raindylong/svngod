@@ -293,6 +293,17 @@ func (r *Repo) segmentEntry(rev uint64, fresh bool) ([]byte, []byte, error) {
 			return nil, nil, err
 		}
 		if ref, ok = findSegment(refs, rev); !ok {
+			// The revision is below HEAD but missing from the index: the index
+			// (mutable) lost an entry while the segment objects (immutable,
+			// written first) are intact. Rebuild that shard once and retry.
+			if head, herr := r.HeadFresh(); herr == nil && rev >= r.segmentFrom && rev <= head {
+				r.repairSegmentIndexOnce(sh)
+				if refs, err = r.segmentIndex(sh, true); err == nil {
+					ref, ok = findSegment(refs, rev)
+				}
+			}
+		}
+		if !ok {
 			return nil, nil, fmt.Errorf("fs: revision %d not in shard %d segment index", rev, sh)
 		}
 	}
@@ -359,7 +370,7 @@ func segmentEntryAt(seg *segmentData, rev uint64, ref *segmentRef) ([]byte, []by
 }
 
 func (r *Repo) segmentIndex(sh uint64, fresh bool) ([]segmentRef, error) {
-	key := cache.Key(fmt.Sprintf("segi/%d", sh))
+	key := cache.Key(segmentIndexCacheKey(sh))
 	if !fresh {
 		if b, ok := r.cache.Get(key); ok {
 			return decodeSegmentIndex(b)
@@ -454,7 +465,7 @@ func (r *Repo) compactSegmentShard(ctx context.Context, sh uint64) error {
 	if err := r.store.Put(ctx, r.keys.SegmentIndex(sh), encodeSegmentIndex([]segmentRef{ref})); err != nil {
 		return err
 	}
-	cachePut(r.cache, cache.Key(fmt.Sprintf("segi/%d", sh)), encodeSegmentIndex([]segmentRef{ref}))
+	cachePut(r.cache, cache.Key(segmentIndexCacheKey(sh)), encodeSegmentIndex([]segmentRef{ref}))
 	old := make([]string, 0, len(refs))
 	for _, ref := range refs {
 		old = append(old, r.segmentKeyFor(ref.First, ref.Count))
