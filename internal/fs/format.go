@@ -197,6 +197,12 @@ type Format struct {
 	// DirBuckets enables paged child lists for large directories. Repositories
 	// created without it keep children inline forever.
 	DirBuckets bool
+	// Segments stores revision blocks and properties in batched segment
+	// objects instead of one loose object per revision. SegmentFrom is the
+	// first revision stored this way (0 = the whole repository).
+	Segments      bool
+	SegmentFrom   uint64
+	SegmentTarget uint64 // compaction target (revisions per segment)
 }
 
 // Marshal serializes format.
@@ -212,6 +218,11 @@ func (f *Format) Marshal() []byte {
 	}
 	if f.ChunkMask != 0 {
 		out += "\nCHUNK_MASK=" + strconv.FormatUint(f.ChunkMask, 10)
+	}
+	if f.Segments || f.SegmentFrom != 0 {
+		out += "\nSEGMENTS=1"
+		out += "\nSEGMENT_FROM=" + strconv.FormatUint(f.SegmentFrom, 10)
+		out += "\nSEGMENT_TARGET=" + strconv.FormatUint(f.SegmentTarget, 10)
 	}
 	if f.DirBuckets {
 		out += "\nDIR_BUCKETS=1"
@@ -250,6 +261,12 @@ func UnmarshalFormat(b []byte) (*Format, error) {
 			f.ChunkMask = v
 		case "DIR_BUCKETS":
 			f.DirBuckets = v == 1
+		case "SEGMENTS":
+			f.Segments = v == 1
+		case "SEGMENT_FROM":
+			f.SegmentFrom = v
+		case "SEGMENT_TARGET":
+			f.SegmentTarget = v
 		}
 	}
 	return f, nil

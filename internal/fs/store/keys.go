@@ -43,6 +43,16 @@ func (k *Keys) PackedDone(shard uint64) string { return k.p("revs", padShard(sha
 // PackedRevProps returns the packed revision-properties key.
 func (k *Keys) PackedRevProps(shard uint64) string { return k.p("revprops", padShard(shard)+".pack") }
 
+// Segment names a batched revision segment (format v2).
+func (k *Keys) Segment(shard, first, count uint64) string {
+	return k.p("segs", padShard(shard), fmt.Sprintf("%012d-%012d.seg", first, count))
+}
+
+// SegmentIndex names the per-shard segment index (format v2).
+func (k *Keys) SegmentIndex(shard uint64) string {
+	return k.p("segs", padShard(shard)+".idx")
+}
+
 // LooseRev returns the loose (active-shard) revision-block key.
 func (k *Keys) LooseRev(shard, rev uint64) string {
 	return k.p("revs-loose", padShard(shard), padRev(rev))

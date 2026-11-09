@@ -304,6 +304,17 @@ func (r *Repo) CommitTxn(txid, newRevProps) (newRev, error):
 
 ---
 
+## 5.9 Segment 提交格式（v2，进行中）
+
+为把对象数从 O(revisions) 降到 O(revisions/batch) 并实现在线 compaction，新增可选的 segment 格式：
+
+- `segs/<shard>/<first>-<count>.seg`：一批修订的 revblock+revprops，带 CRC32C；
+- `segs/<shard>.idx`：分片内有序索引（first/count/key/SHA-256），读路径二分定位；
+- 每批一条 `journal/<first>` WAL（v2），回放按批前滚；
+- `format` 增加 `SEGMENTS` / `SEGMENT_FROM` / `SEGMENT_TARGET`，v1 仓库不受影响。
+
+设计、提交协议、崩溃窗口、compaction 与迁移步骤见 [`存储引擎Segment格式设计.md`](存储引擎Segment格式设计.md)。当前已落地格式字段、键布局、segment 编解码与索引（含单测）；提交/读取/compaction 接线与迁移工具按文档阶段推进。
+
 ## 6. 读路径实现
 
 ```
