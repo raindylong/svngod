@@ -217,7 +217,8 @@ func (r *Repo) replayJournal() {
 			if rec.First != rev || rec.Count == 0 {
 				break
 			}
-			seg, _, serr := read(rec.SegmentKey)
+			segKey := r.keys.Segment(r.shard(rec.First), rec.First, rec.Count)
+			seg, _, serr := read(segKey)
 			if serr != nil {
 				break
 			}
@@ -231,7 +232,7 @@ func (r *Repo) replayJournal() {
 			}
 			if !segmentIndexHas(refs, rec) {
 				refs = appendSegmentRef(refs, segmentRef{First: rec.First, Count: rec.Count,
-					Key: rec.SegmentKey, SHA256: rec.SegmentSHA})
+					SHA256: rec.SegmentSHA})
 				if perr := r.store.Put(ctx, r.keys.SegmentIndex(r.shard(rec.First)), encodeSegmentIndex(refs)); perr != nil {
 					break
 				}
@@ -282,7 +283,7 @@ func (r *Repo) replayJournal() {
 // segmentIndexHas reports whether the index already contains this exact batch.
 func segmentIndexHas(refs []segmentRef, rec *CommitRecord) bool {
 	for _, ref := range refs {
-		if ref.First == rec.First && ref.Count == rec.Count && ref.Key == rec.SegmentKey && ref.SHA256 == rec.SegmentSHA {
+		if ref.First == rec.First && ref.Count == rec.Count && ref.SHA256 == rec.SegmentSHA {
 			return true
 		}
 	}

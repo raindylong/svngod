@@ -61,12 +61,12 @@ func TestFindSegment(t *testing.T) {
 }
 
 func TestSegmentIndexRoundTrip(t *testing.T) {
-	refs := []segmentRef{{First: 1, Count: 5, Key: "k1"}, {First: 6, Count: 2, Key: "k2"}}
+	refs := []segmentRef{{First: 1, Count: 5}, {First: 6, Count: 2}}
 	got, err := decodeSegmentIndex(encodeSegmentIndex(refs))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 || got[1].Key != "k2" {
+	if len(got) != 2 || got[1].First != 6 {
 		t.Fatalf("refs=%+v", got)
 	}
 	if _, err := decodeSegmentIndex(encodeSegmentIndex([]segmentRef{{First: 6}, {First: 3}})); err == nil {

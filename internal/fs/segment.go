@@ -34,7 +34,6 @@ type segmentData struct {
 type segmentRef struct {
 	First  uint64 `json:"first"`
 	Count  uint64 `json:"count"`
-	Key    string `json:"key"`
 	SHA256 string `json:"sha256"`
 }
 

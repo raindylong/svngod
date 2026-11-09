@@ -47,8 +47,8 @@ func (r *Repo) publishSegmentPlans(ctx context.Context, lease *commitLease, cur 
 		data := encodeSegment(g.seg)
 		sum := sha256.Sum256(data)
 		g.sha = hex.EncodeToString(sum[:])
-		g.ref = segmentRef{First: g.first, Count: g.count, Key: r.keys.Segment(g.shard, g.first, g.count), SHA256: g.sha}
-		if err := r.store.Put(ctx, g.ref.Key, data); err != nil {
+		g.ref = segmentRef{First: g.first, Count: g.count, SHA256: g.sha}
+		if err := r.store.Put(ctx, r.segmentKeyFor(g.first, g.count), data); err != nil {
 			for _, p := range plans {
 				errs[p.idx] = err
 			}
@@ -78,7 +78,7 @@ func (r *Repo) publishSegmentPlans(ctx context.Context, lease *commitLease, cur 
 			}
 			return revs, errs, err
 		}
-		if err := r.writeSegmentJournal(ctx, g.first, g.count, g.parent, lease.token, created, g.ref.Key, g.sha); err != nil {
+		if err := r.writeSegmentJournal(ctx, g.first, g.count, g.parent, lease.token, created, r.segmentKeyFor(g.first, g.count), g.sha); err != nil {
 			for _, p := range plans {
 				errs[p.idx] = err
 			}
@@ -176,7 +176,8 @@ func (r *Repo) segmentOwns(ctx context.Context, ref segmentRef, token string, pa
 		return false
 	}
 	rec, derr := DecodeCommitRecord(b)
-	if derr != nil || rec.Version != 2 || rec.Lease != token || rec.SegmentKey != ref.Key ||
+	if derr != nil || rec.Version != 2 || rec.Lease != token ||
+		rec.First != ref.First || rec.Count != ref.Count ||
 		rec.SegmentSHA != ref.SHA256 || rec.Parent != parent {
 		return false
 	}
@@ -210,7 +211,7 @@ func (r *Repo) segmentEntry(rev uint64, fresh bool) ([]byte, []byte, error) {
 	}
 	i := rev - seg.First
 	if i >= uint64(len(seg.Blocks)) {
-		return nil, nil, fmt.Errorf("fs: revision %d outside segment %s", rev, ref.Key)
+		return nil, nil, fmt.Errorf("fs: revision %d outside segment %d+%d", rev, ref.First, ref.Count)
 	}
 	// Copy: a subslice keeps the whole (possibly multi-megabyte) segment
 	// backing array alive, and the block cache would then hold one segment per
@@ -238,19 +239,27 @@ func (r *Repo) segmentIndex(sh uint64, fresh bool) ([]segmentRef, error) {
 	return decodeSegmentIndex(b)
 }
 
+// segmentKeyFor derives a segment's object key from its range, so indexes and
+// WAL records stay relative to the repository prefix (a scoped store may add
+// its own prefix; storing absolute keys double-prefixes them).
+func (r *Repo) segmentKeyFor(first, count uint64) string {
+	return r.keys.Segment(r.shard(first), first, count)
+}
+
 func (r *Repo) loadSegment(ref segmentRef) (*segmentData, error) {
-	key := cache.Key("segd/" + ref.Key)
+	objKey := r.segmentKeyFor(ref.First, ref.Count)
+	key := cache.Key("segd/" + objKey)
 	if b, ok := r.cache.Get(key); ok {
 		return decodeSegment(b)
 	}
-	b, err := r.store.Get(context.Background(), ref.Key, nil)
+	b, err := r.store.Get(context.Background(), objKey, nil)
 	if err != nil {
 		return nil, err
 	}
 	if ref.SHA256 != "" {
 		sum := sha256.Sum256(b)
 		if hex.EncodeToString(sum[:]) != ref.SHA256 {
-			return nil, fmt.Errorf("fs: segment %s checksum mismatch", ref.Key)
+			return nil, fmt.Errorf("fs: segment %s checksum mismatch", objKey)
 		}
 	}
 	cachePut(r.cache, key, b)
@@ -296,14 +305,14 @@ func (r *Repo) compactSegmentShard(ctx context.Context, sh uint64) error {
 	if err := r.store.Put(ctx, key, data); err != nil {
 		return err
 	}
-	ref := segmentRef{First: first, Count: merged.Count, Key: key, SHA256: hex.EncodeToString(sum[:])}
+	ref := segmentRef{First: first, Count: merged.Count, SHA256: hex.EncodeToString(sum[:])}
 	if err := r.store.Put(ctx, r.keys.SegmentIndex(sh), encodeSegmentIndex([]segmentRef{ref})); err != nil {
 		return err
 	}
 	cachePut(r.cache, cache.Key(fmt.Sprintf("segi/%d", sh)), encodeSegmentIndex([]segmentRef{ref}))
 	old := make([]string, 0, len(refs))
 	for _, ref := range refs {
-		old = append(old, ref.Key)
+		old = append(old, r.segmentKeyFor(ref.First, ref.Count))
 	}
 	go func() {
 		time.Sleep(60 * time.Second)

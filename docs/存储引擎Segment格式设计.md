@@ -116,7 +116,7 @@ u32 CRC32C(以上全部)
 
 - v1 仓库完全不受影响（`SEGMENTS` 默认 false）；新仓库可选择 `svnadmin create --segments`。
 - 读/写/回放/compaction 全部有单测；集成验收：
-  - 提交 100 万修订后对象数 ≈ revisions/K + shards（对比 v1 的 ≈3×revisions）；
+  - 提交 100 万修订后对象数 ≈ revisions/K + shards（对比 v1 的 ≈3×revisions）；实测 20 万修订 = 525 对象（§11.1）；
   - `verify --all-revs`、`dump/load` round-trip、崩溃注入（WAL 前后）全部通过；
   - compaction 期间并发读不失败；旧索引读者在宽限期内可继续读；
   - 写延迟与 v1 对比、GC 耗时对比。
@@ -143,6 +143,20 @@ u32 CRC32C(以上全部)
 
 - 迁移过程中发现并修复：`segmentEntry` 返回段内子切片会让每个缓存的 revblock 持有整个多 MB 段，20k 修订的 `verify` 因此 OOM；现返回拷贝。
 - 读取路径对段内修订取的是拷贝，缓存按 block/segment 分别计量。
+
+### 11.1 实测（S3 单 RustFS `svn-ext/svn-ext`，200,000 修订，K=64）
+
+| 指标 | v1（每修订对象 / 组提交） | v2（segment） |
+|---|---|---|
+| 写入吞吐 | 约 33–48 次/秒 | **385.2 次/秒**（200,000 修订 / 519s） |
+| 失败数 | — | 0 |
+| 仓库对象数 | 40 万级 | **525**（`segs/` 520 + 控制对象 5） |
+| 仓库体积 | — | 133 MiB |
+| 全量 verify | — | `1..200000 no integrity issues` |
+
+- S3 上每条 PUT 约 5–25ms，v1 每修订 2 次以上 PUT（block/props + journal/HEAD）成为吞吐上限；v2 每 64 修订只写 1 段 + 1 索引 + 1 批 WAL，再叠加一次 HEAD CAS，对象数下降 3 个数量级。
+- **过程中发现并修复（关键）**：`segmentRef`/`CommitRecord` 早期保存的是绝对对象键，在 scoped store（`svnadmin --endpoint`，内部 `RepoPrefix=<prefix>` + `BaseRepo=<repo>`）下该键会被二次加前缀，读回 404；现索引与 WAL 只记录 `First/Count/SHA256`，读取时用 `r.keys.Segment(r.shard(first), first, count)` 派生，与运行期前缀完全一致。修复后重新灌入 200k 修订并通过全量 verify。
+- 相对键同时消除了「同一仓库在不同前缀/不同实例下迁移后可读」的隐患：键由仓库内位置推导，不含部署路径。
 
 ## 10. 风险与取舍
 
