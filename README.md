@@ -59,6 +59,7 @@ quorum 模式示例（3 节点，任意 1 个节点故障仍可提交；2 个故
 `svnadmin journal -n 20 <repo>` 可查看最近的 WAL 记录（修订、父修订、法定人数、revblock 校验和）。
 `svnadmin repair --mirror-file FILE <repo>` 可在批量导入、进程被强杀或备节点恢复后，同步扫描并补齐备副本缺失的对象。
 `svnadmin gc [--keep-journal N] <repo>` 回收已被分片包取代的 loose 对象、孤儿 txn/文本，并裁剪 WAL。
+`svnadmin delete-repo -force [--dry-run] [--control-only] [--workers N] [--batch N] <repo>` 删除仓库：按仓库布局的已知键范围删除（不做慢速前缀列举）；`-control-only` 只删控制键（立即从服务移除，载荷留待离线清理）。
 
 在线提交默认开启组提交（`-commit-batch 16 -commit-window-ms 2`）：并发到达的提交共享一次租约与一次 HEAD CAS；`0` 关闭。
 

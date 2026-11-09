@@ -19,9 +19,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"svngod/internal/cdc"
@@ -52,6 +55,14 @@ type options struct {
 	gcGrace         int
 	chunkAvg        uint64
 	dirBuckets      bool
+	deleteWorkers   int
+	deleteDryRun    bool
+	deleteForce     bool
+	deleteNoSweep   bool
+	deleteHead      uint64
+	deleteBatch     int
+	deleteControl   bool
+
 	migrateDirs     string
 	migrateChunkAvg uint64
 }
@@ -194,6 +205,15 @@ func main() {
 		fs.StringVar(&o.migrateDirs, "dir-buckets", "", "on|off: page large directories (leave empty to keep)")
 		fs.Uint64Var(&o.migrateChunkAvg, "chunk-avg", 0, "new target average chunk size in bytes (0 keeps)")
 	}
+	if cmd == "delete-repo" {
+		fs.IntVar(&o.deleteWorkers, "workers", 16, "concurrent delete batches")
+		fs.BoolVar(&o.deleteDryRun, "dry-run", false, "count objects without deleting")
+		fs.BoolVar(&o.deleteForce, "force", false, "required: deletes every object of the repository")
+		fs.BoolVar(&o.deleteNoSweep, "no-sweep", false, "skip the content-addressed prefix sweep (repositories with only inline texts)")
+		fs.Uint64Var(&o.deleteHead, "head", 0, "use this HEAD when the repository metadata is already gone")
+		fs.IntVar(&o.deleteBatch, "batch", 1000, "keys per DELETE request (smaller batches are more reliable on some backends)")
+		fs.BoolVar(&o.deleteControl, "control-only", false, "delete only the repository's control keys (removes it from service; payload objects remain)")
+	}
 	if cmd == "verify" {
 		fs.BoolVar(&o.allRevs, "all-revs", false, "verify every historical revision, not just HEAD")
 		fs.BoolVar(&o.texts, "texts", false, "with --all-revs: read and hash every file text (slow)")
@@ -246,6 +266,8 @@ func main() {
 		doInfo(&o, repoName)
 	case "repair":
 		doRepair(&o, repoName)
+	case "delete-repo":
+		doDeleteRepo(&o, repoName)
 	case "migrate":
 		doMigrate(&o, repoName)
 	case "gc":
@@ -265,6 +287,7 @@ usage:
   svnadmin load   [--input FILE] [s3 flags] <repo>
   svnadmin verify [s3 flags] <repo>   # integrity walk; prints corrupted nodes
   svnadmin repair [--mirror-file FILE] <repo>  # synchronously reconcile mirrors
+  svnadmin delete-repo -force [s3 flags | --mirror-file FILE] <repo>  # delete every object of a repository
   svnadmin journal [-n N] [s3 flags | --mirror-file FILE] <repo>  # show WAL records
   svnadmin gc     [s3 flags] <repo>   # loose objects, txn bodies, unused texts
 
@@ -333,6 +356,172 @@ func doRepair(o *options, repoName string) {
 		fatal(err)
 	}
 	fmt.Printf("repaired %s head=%d\n", repoName, head)
+}
+
+// doDeleteRepo removes every object of a repository. Keys are derived from
+// the repository's own layout (control keys, packs, loose revs/revprops,
+// journal) instead of listing prefixes: a 625k-revision repository has ~2M
+// objects and RustFS pages a prefix listing at seconds per page. Content-
+// addressed leftovers are swept afterwards.
+func doDeleteRepo(o *options, repoName string) {
+	if !o.deleteForce && !o.deleteDryRun {
+		fatal(fmt.Errorf("delete-repo removes every object; pass -force (or -dry-run)"))
+	}
+	st, prefix, err := o.repoStore(repoName)
+	if err != nil {
+		fatal(err)
+	}
+	head := o.deleteHead
+	shardSz := uint64(4096)
+	if o.deleteControl {
+		// Control-only: make the repository disappear without touching the
+		// (possibly millions of) payload objects. Used when a backend's bulk
+		// delete is unreliable; the leftovers can be reclaimed offline.
+		keys := store.NewKeys(prefix)
+		ctx := context.Background()
+		keysList := []string{keys.Current(), keys.Format(), keys.UUID(), keys.CommitLock(), keys.CommitLock() + ".break"}
+		if !o.deleteDryRun {
+			if err := st.Delete(ctx, keysList); err != nil {
+				fatal(err)
+			}
+		}
+		fmt.Printf("delete-repo %q: control keys %s\n", repoName, map[bool]string{true: "counted", false: "deleted"}[o.deleteDryRun])
+		return
+	}
+	if head == 0 {
+		repo, err := fs.OpenRepo(st, prefix)
+		if err != nil {
+			fatal(fmt.Errorf("open %q (use -head N if its metadata is already deleted): %w", repoName, err))
+		}
+		if head, err = repo.HeadFresh(); err != nil {
+			fatal(err)
+		}
+		if sz := repo.ShardSize(); sz != 0 {
+			shardSz = sz
+		}
+	}
+	keys := store.NewKeys(prefix)
+	lastShard := head / shardSz
+	sub := func(name string) string {
+		if prefix == "" {
+			return name
+		}
+		return strings.Trim(prefix, "/") + "/" + name
+	}
+
+	batchSize := o.deleteBatch
+	if batchSize <= 0 || batchSize > 1000 {
+		batchSize = 1000
+	}
+	batches := make(chan []string, 64)
+	go func() {
+		defer close(batches)
+		cur := make([]string, 0, batchSize)
+		emit := func(k string) {
+			cur = append(cur, k)
+			if len(cur) == batchSize {
+				batches <- cur
+				cur = nil
+			}
+		}
+		for shard := uint64(0); shard <= lastShard; shard++ {
+			emit(keys.PackedRev(shard))
+			emit(keys.PackedIdx(shard))
+			emit(keys.PackedDone(shard))
+			emit(keys.PackedRevProps(shard))
+			first, last := shard*shardSz, shard*shardSz+shardSz-1
+			if last > head {
+				last = head
+			}
+			for rev := first; rev <= last; rev++ {
+				emit(keys.LooseRev(shard, rev))
+				emit(keys.LooseRevProps(shard, rev))
+			}
+		}
+		for rev := uint64(1); rev <= head; rev++ {
+			emit(keys.Journal(rev))
+		}
+		// Control keys last: a killed deletion leaves the repository openable,
+		// so the command can be re-run for the remaining objects.
+		for _, k := range []string{keys.Current(), keys.Format(), keys.UUID(),
+			keys.CommitLock(), keys.CommitLock() + ".break"} {
+			emit(k)
+		}
+		if len(cur) > 0 {
+			batches <- cur
+		}
+	}()
+
+	var deleted int64
+	var firstErr error
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	workers := o.deleteWorkers
+	if workers <= 0 {
+		workers = 16
+	}
+	ctx := context.Background()
+	start := time.Now()
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for b := range batches {
+				if o.deleteDryRun {
+					atomic.AddInt64(&deleted, int64(len(b)))
+					continue
+				}
+				var err error
+				for attempt := 0; attempt < 3; attempt++ {
+					c, cancel := context.WithTimeout(ctx, 90*time.Second)
+					err = st.Delete(c, b)
+					cancel()
+					if err == nil {
+						break
+					}
+				}
+				if err != nil {
+					log.Printf("delete batch of %d (first=%s) failed after retries: %v", len(b), b[0], err)
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					mu.Unlock()
+					continue
+				}
+				atomic.AddInt64(&deleted, int64(len(b)))
+			}
+		}()
+	}
+	done := make(chan struct{})
+	go func() {
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				n := atomic.LoadInt64(&deleted)
+				rate := float64(n) / time.Since(start).Seconds()
+				fmt.Printf("delete: %d objects, %.1f/s\n", n, rate)
+			}
+		}
+	}()
+	wg.Wait()
+	close(done)
+	if firstErr != nil {
+		fatal(fmt.Errorf("delete: %w", firstErr))
+	}
+	if !o.deleteDryRun && !o.deleteNoSweep {
+		for _, p := range []string{"texts/", "chunks/", "dirs/", "txn/", "dav-activities/", "dav-txns/", "bundles/", "locks/"} {
+			if err := store.DeletePrefix(ctx, st, sub(strings.TrimSuffix(p, "/"))); err != nil {
+				fatal(fmt.Errorf("sweep %s: %w", p, err))
+			}
+		}
+	}
+	fmt.Printf("delete-repo %q: head=%d, %d objects %s in %s\n", repoName, head, deleted,
+		map[bool]string{true: "counted", false: "deleted"}[o.deleteDryRun], time.Since(start).Round(time.Second))
 }
 
 func doInfo(o *options, repoName string) {
