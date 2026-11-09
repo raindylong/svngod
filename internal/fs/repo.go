@@ -14,6 +14,7 @@ import (
 	"log"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1400,6 +1401,15 @@ func (r *Repo) Verify(headRev uint64) ([]VerifyIssue, error) {
 // are checked once. With texts=false it still verifies that external text
 // objects exist.
 func (r *Repo) VerifyRange(from, to uint64, texts bool) ([]VerifyIssue, error) {
+	return r.VerifyRangeWith(from, to, texts, 1)
+}
+
+// VerifyRangeWith is VerifyRange with a worker count. Workers read disjoint
+// revision ranges, so a 10M-revision repository is checked in parallel instead
+// of one S3 round trip at a time. Segment indexes are validated first: a
+// dropped index entry would make whole revision ranges unreadable while every
+// remaining object still verifies.
+func (r *Repo) VerifyRangeWith(from, to uint64, texts bool, workers int) ([]VerifyIssue, error) {
 	if from == 0 {
 		from = 1
 	}
@@ -1410,13 +1420,72 @@ func (r *Repo) VerifyRange(from, to uint64, texts bool) ([]VerifyIssue, error) {
 	if to == 0 || to > head {
 		to = head
 	}
-	var issues []VerifyIssue
-	seen := make(map[NodeID]bool)
-	ctx := context.Background()
+	if from > to {
+		return nil, nil
+	}
 	// Full segment reads: a ranged read can only check the per-entry CRC, while
 	// verify must confirm the index SHA-256 of every segment object.
 	r.fullReads.Store(true)
 	defer r.fullReads.Store(false)
+
+	var issues []VerifyIssue
+	if r.segments {
+		idxIssues, ierr := r.verifySegmentIndexes(head)
+		if ierr != nil {
+			return nil, ierr
+		}
+		issues = append(issues, idxIssues...)
+	}
+	if workers <= 1 || to-from < 8 {
+		more, err := r.verifyRangeSeq(from, to, texts)
+		if err != nil {
+			return nil, err
+		}
+		issues = append(issues, more...)
+		sort.SliceStable(issues, func(i, j int) bool { return issues[i].Rev < issues[j].Rev })
+		return issues, nil
+	}
+	if workers > 64 {
+		workers = 64
+	}
+	span := (to - from + 1 + uint64(workers) - 1) / uint64(workers)
+	results := make([][]VerifyIssue, workers)
+	errs := make([]error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		lo := from + uint64(i)*span
+		if lo > to {
+			break
+		}
+		hi := lo + span - 1
+		if hi > to {
+			hi = to
+		}
+		wg.Add(1)
+		go func(i int, lo, hi uint64) {
+			defer wg.Done()
+			results[i], errs[i] = r.verifyRangeSeq(lo, hi, texts)
+		}(i, lo, hi)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, res := range results {
+		issues = append(issues, res...)
+	}
+	sort.SliceStable(issues, func(i, j int) bool { return issues[i].Rev < issues[j].Rev })
+	return issues, nil
+}
+
+// verifyRangeSeq walks [from,to] single-threaded. Callers own the fullReads
+// mode and any index-level checks.
+func (r *Repo) verifyRangeSeq(from, to uint64, texts bool) ([]VerifyIssue, error) {
+	var issues []VerifyIssue
+	seen := make(map[NodeID]bool)
+	ctx := context.Background()
 	for rev := from; rev <= to; rev++ {
 		rb, berr := r.readBlock(rev)
 		if berr != nil {

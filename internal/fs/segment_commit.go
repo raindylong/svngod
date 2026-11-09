@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"svngod/internal/cache"
@@ -63,6 +64,8 @@ func (r *Repo) publishSegmentPlans(ctx context.Context, lease *commitLease, cur 
 	}
 	// Index and per-batch WAL. The commit lease serialises writers, so a plain
 	// read-modify-write of the small index is safe.
+	var indexes []segmentIndexUpdate
+	var journals []segmentJournalWrite
 	for _, g := range groups {
 		refs, err := r.loadSegmentIndex(g.shard)
 		if err != nil {
@@ -72,18 +75,20 @@ func (r *Repo) publishSegmentPlans(ctx context.Context, lease *commitLease, cur 
 			return revs, errs, err
 		}
 		refs = appendSegmentRef(refs, g.ref)
-		if err := r.store.Put(ctx, r.keys.SegmentIndex(g.shard), encodeSegmentIndex(refs)); err != nil {
-			for _, p := range plans {
-				errs[p.idx] = err
-			}
-			return revs, errs, err
+		indexes = append(indexes, segmentIndexUpdate{shard: g.shard, data: encodeSegmentIndex(refs)})
+		journals = append(journals, segmentJournalWrite{
+			first: g.first, count: g.count, parent: g.parent,
+			key: r.segmentKeyFor(g.first, g.count), sha: g.sha,
+		})
+	}
+	// The shard index and the WAL record are independent: both must be durable
+	// before the HEAD CAS, but neither waits for the other. On object storage
+	// that saves one round trip per commit, which dominates small commits.
+	if err := r.writeSegmentMetadata(ctx, lease, created, indexes, journals); err != nil {
+		for _, p := range plans {
+			errs[p.idx] = err
 		}
-		if err := r.writeSegmentJournal(ctx, g.first, g.count, g.parent, lease.token, created, r.segmentKeyFor(g.first, g.count), g.sha); err != nil {
-			for _, p := range plans {
-				errs[p.idx] = err
-			}
-			return revs, errs, err
-		}
+		return revs, errs, err
 	}
 	last := plans[len(plans)-1].rev
 	nc := &Current{Head: last, Created: created}
@@ -461,4 +466,48 @@ func (r *Repo) compactSegmentShard(ctx context.Context, sh uint64) error {
 		}
 	}()
 	return nil
+}
+
+// segmentIndexUpdate is one shard's rewritten index, prepared under the lease.
+type segmentIndexUpdate struct {
+	shard uint64
+	data  []byte
+}
+
+// segmentJournalWrite is one prepared WAL record.
+type segmentJournalWrite struct {
+	first, count, parent uint64
+	key, sha             string
+}
+
+// writeSegmentMetadata writes every prepared index and WAL record concurrently
+// and waits for all of them. Both families must be durable before the HEAD CAS,
+// but not relative to each other; on object storage this saves one round trip
+// per commit, which dominates small commits. Errors are returned in completion
+// order; the first one aborts the publish (nothing is visible before the CAS).
+func (r *Repo) writeSegmentMetadata(ctx context.Context, lease *commitLease, created int64,
+	indexes []segmentIndexUpdate, journals []segmentJournalWrite) error {
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(indexes)+len(journals))
+	for _, ix := range indexes {
+		wg.Add(1)
+		go func(ix segmentIndexUpdate) {
+			defer wg.Done()
+			if err := r.store.Put(ctx, r.keys.SegmentIndex(ix.shard), ix.data); err != nil {
+				errCh <- err
+			}
+		}(ix)
+	}
+	for _, j := range journals {
+		wg.Add(1)
+		go func(j segmentJournalWrite) {
+			defer wg.Done()
+			if err := r.writeSegmentJournal(ctx, j.first, j.count, j.parent, lease.token, created, j.key, j.sha); err != nil {
+				errCh <- err
+			}
+		}(j)
+	}
+	wg.Wait()
+	close(errCh)
+	return <-errCh
 }

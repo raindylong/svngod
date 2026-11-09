@@ -51,6 +51,7 @@ type options struct {
 	fromRev       uint64
 	toRev         uint64
 	journalLimit  int
+	verifyWorkers int
 	keepJournal   uint64
 	gcGrace       int
 	gcTexts       bool
@@ -232,6 +233,7 @@ func main() {
 		fs.BoolVar(&o.texts, "texts", false, "with --all-revs: read and hash every file text (slow)")
 		fs.Uint64Var(&o.fromRev, "from", 1, "first revision for --all-revs")
 		fs.Uint64Var(&o.toRev, "to", 0, "last revision for --all-revs (0 = HEAD)")
+		fs.IntVar(&o.verifyWorkers, "workers", 1, "parallel workers for --all-revs")
 	}
 	if cmd == "journal" {
 		fs.IntVar(&o.journalLimit, "n", 20, "number of records to show")
@@ -300,7 +302,7 @@ usage:
   svnadmin create [--segments] [s3 flags | --mirror-file FILE] <repo>
   svnadmin dump   [--output FILE] [s3 flags] <repo>
   svnadmin load   [--input FILE] [s3 flags] <repo>
-  svnadmin verify [s3 flags] <repo>   # integrity walk; prints corrupted nodes
+  svnadmin verify [--all-revs [--workers N] [--texts]] [s3 flags] <repo>  # integrity walk
   svnadmin repair [--mirror-file FILE] <repo>  # synchronously reconcile mirrors
   svnadmin delete-repo -force [s3 flags | --mirror-file FILE] <repo>  # delete every object of a repository
   svnadmin journal [-n N] [s3 flags | --mirror-file FILE] <repo>  # show WAL records
@@ -737,8 +739,8 @@ func doVerify(o *options, repoName string) {
 		if to == 0 || to > head {
 			to = head
 		}
-		issues, err = repo.VerifyRange(from, to, o.texts)
-		scope := fmt.Sprintf("revs %d..%d (texts=%v)", from, to, o.texts)
+		issues, err = repo.VerifyRangeWith(from, to, o.texts, o.verifyWorkers)
+		scope := fmt.Sprintf("revs %d..%d (texts=%v, workers=%d)", from, to, o.texts, o.verifyWorkers)
 		if err != nil {
 			fatal(err)
 		}

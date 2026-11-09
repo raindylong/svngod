@@ -2,6 +2,7 @@ package fs
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -108,4 +109,44 @@ func (r *Repo) CollectOrphanSegments(ctx context.Context, grace time.Duration) (
 		next = cont
 	}
 	return deleted, nil
+}
+
+// verifySegmentIndexes checks that every shard index covers its revisions
+// contiguously from segmentFrom through HEAD. A silent gap (a lost index write,
+// a bad migration) leaves those revisions unreadable while HEAD and every
+// still-referenced object look healthy, so verify reports it explicitly.
+func (r *Repo) verifySegmentIndexes(head uint64) ([]VerifyIssue, error) {
+	var issues []VerifyIssue
+	for sh := uint64(0); sh <= r.shard(head); sh++ {
+		refs, err := r.loadSegmentIndex(sh)
+		if err != nil {
+			issues = append(issues, VerifyIssue{Rev: sh * r.shardSz, Err: fmt.Errorf("segment index %d unreadable: %w", sh, err)})
+			continue
+		}
+		want := sh * r.shardSz
+		if want < r.segmentFrom {
+			want = r.segmentFrom
+		}
+		last := (sh+1)*r.shardSz - 1
+		if last > head {
+			last = head
+		}
+		next := want
+		for _, ref := range refs {
+			if ref.Count == 0 {
+				issues = append(issues, VerifyIssue{Rev: next, Err: fmt.Errorf("segment index %d has an empty entry at %d", sh, ref.First)})
+				continue
+			}
+			if ref.First != next {
+				issues = append(issues, VerifyIssue{Rev: next, Err: fmt.Errorf("segment index %d covers %d, want %d", sh, ref.First, next)})
+			}
+			if end := ref.First + ref.Count; end > next {
+				next = end
+			}
+		}
+		if next <= last {
+			issues = append(issues, VerifyIssue{Rev: next, Err: fmt.Errorf("segment index %d ends at %d, HEAD needs %d", sh, next-1, last)})
+		}
+	}
+	return issues, nil
 }
