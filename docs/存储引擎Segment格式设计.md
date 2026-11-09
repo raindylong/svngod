@@ -70,7 +70,20 @@ S3（RustFS）实测 50 修订、19,408 字节的段：随机读一条修订传�
 - 条目只存 first/count/sha256，对象键由仓库前缀 + first/count 推导（scoped store 不会二次加前缀）；
 - 条目按 first 升序，区间不重叠；
 - 读路径二分查找 `rev ∈ [first, first+count)`；
-- 索引本身是可变对象：提交/compaction 在**提交租约**内读最新版本后整体 Put；跨进程由租约串行化。
+- 索引本身是可变对象：提交/compaction 在**提交租约**内读取，写入用 CAS（见 §3.1）；租约负责常规互斥，CAS 负责租约过期/停顿瞬间的安全底线。
+
+### 3.1 索引的原子写（CAS）
+
+租约正常时只有写者在动索引；但进程停顿、租约 TTL 过期后可能有第二个写者。为避免“后写覆盖前写、HEAD 指向索引里已不存在的条目”，索引写入遵守：
+
+- **读**：一次 GET 取回索引内容，用 `ContentETag(内容)` 作为期望 ETag（FileStore/MemoryStore/单段 S3 对象的 ETag 就是内容 MD5；遇到不透明 ETag 的网关，`Store.CAS` 会自动回退为读回内容比对）。因此常规路径不额外增加往返。
+- **写**：对象存在则 CAS，不存在则 `CreateIfAbsent`；失败返回 `ErrSegmentIndexConflict`，重试时重新读取并合并。
+- **拒绝覆盖已发布区间**：要写的区间与现有条目重叠、且现有条目起点 ≤ HEAD（即这些修订已经发布）时，直接报冲突，绝不覆盖；提交失败、客户端重试。
+- **回收未发布条目**：重叠条目的起点 > HEAD 说明它属于一次没有完成的发布（索引写了、HEAD CAS 未执行，或进程崩溃）。此时从 segment 对象重建该分片（重建会丢弃 > HEAD 的条目），再重试，避免这些修订号被永久占住。
+- **连续性校验**：写回前检查“分片从起点到本批末修订连续、无空洞/重叠”；会写出不连续索引的写入被拒绝并走重建，宁可失败也不写坏索引。
+- **失败回滚**：索引写成功后，若 WAL 写失败或 HEAD CAS 失败，撤回本次写入的条目（按 first+sha 精确匹配），使重试不会被未发布条目挡住。
+- **发布后自检**：HEAD CAS 成功后重读一次索引，确认本批条目仍在；若被租约违规者覆盖，立即补写并打印告警。这是“HEAD 说已发布、索引却不认”的最后一道兜底。
+
 
 ## 3. 提交协议（v2）
 
@@ -80,7 +93,7 @@ S3（RustFS）实测 50 修订、19,408 字节的段：随机读一条修订传�
 2. 为批内每个请求构建 `RevBlock` 与 `RevProps`（现有 `buildRevisionLocked`）。
 3. 按分片边界把批拆成 1..n 组；每组：
    - `encodeSegment(first,count,parent)` → Put `segs/<shard>/<first>-<count>.seg`；记录 SHA-256。
-4. 更新每组的分片索引：读取当前索引（租约内最新）→ 追加条目 → Put。
+4. 更新每组的分片索引：读取当前索引（租约内最新）→ 追加条目 → **CAS 写回**（规则见 §3.1）。
 5. 为每组写一条 WAL：`journal/<first>`，`CommitRecord{Version:2, First, Count, Parent, Lease, SegmentKey, SegmentSHA, Created}`。
 6. 一次 CAS `current` 到 `lastRev`（整批原子可见）。
 7. 分片完成（`lastRev+1` 是分片边界）或条目数超过阈值时，执行 compaction（见 §5）。
@@ -90,6 +103,8 @@ S3（RustFS）实测 50 修订、19,408 字节的段：随机读一条修订传�
 | 崩溃点 | 结果 |
 |---|---|
 | segment 写完、索引/WAL/current 未写 | 孤儿 segment，GC 可删；HEAD 不变，客户端未收到成功 |
+| 索引写完、WAL/current 未写 | 条目在 HEAD 之上，属未发布；下次同名区间提交会重建索引并回收它 |
+| 索引/WAL 写完、current CAS 失败 | 回滚索引条目；HEAD 不变，客户端重试 |
 | 索引写完、WAL/current 未写 | 索引指向未发布区间；读路径以 HEAD 截断，忽略越界条目；WAL 缺失则不前滚 |
 | WAL 写完、current 未 CAS | 回放：`head+1 == First` 且 segment 存在/SHA 匹配 → 更新索引（幂等）→ CAS 到 `First+Count-1` |
 | current CAS 成功 | 已发布；后续 compaction 不影响可见性 |

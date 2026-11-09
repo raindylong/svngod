@@ -326,7 +326,10 @@ func (s *S3Store) Head(ctx context.Context, key string) (string, bool, error) {
 			}
 			return err
 		}
-		etag = info.ETag
+		// CAS compares against the unquoted ETag (casOnce trims it), so Head
+		// must report the same form or every conditional write on a real S3
+		// gateway would look like a conflict.
+		etag = strings.Trim(info.ETag, `"`)
 		return nil
 	})
 	if err != nil {

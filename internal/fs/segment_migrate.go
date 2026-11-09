@@ -69,7 +69,9 @@ func (r *Repo) MigrateToSegments(ctx context.Context, purge bool) (int, error) {
 			return migrated, perr
 		}
 		ref := segmentRef{First: first, Count: seg.Count, SHA256: hex.EncodeToString(sum[:])}
-		if perr := r.store.Put(ctx, r.keys.SegmentIndex(sh), encodeSegmentIndex([]segmentRef{ref})); perr != nil {
+		if _, etag, existed, lerr := r.loadSegmentIndexETag(ctx, sh); lerr != nil {
+			return migrated, lerr
+		} else if perr := r.writeSegmentIndexCAS(ctx, sh, []segmentRef{ref}, etag, existed); perr != nil {
 			return migrated, perr
 		}
 		migrated += len(seg.Blocks)

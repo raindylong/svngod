@@ -62,29 +62,37 @@ func (r *Repo) publishSegmentPlans(ctx context.Context, lease *commitLease, cur 
 		}
 		return revs, errs, verr
 	}
-	// Index and per-batch WAL. The commit lease serialises writers, so a plain
-	// read-modify-write of the small index is safe.
-	var indexes []segmentIndexUpdate
+	// The shard index is a mutable object rewritten from a read-modify-write.
+	// The commit lease normally serialises those writes, but a process that
+	// stalls past the lease TTL must not be able to drop another writer's entry:
+	// every rewrite is therefore a compare-and-set on the index ETag, and a
+	// range already claimed by a different batch is refused instead of
+	// overwritten. WAL records are immutable unique keys and are written in
+	// parallel after the indexes.
 	var journals []segmentJournalWrite
 	for _, g := range groups {
-		refs, err := r.loadSegmentIndex(g.shard)
-		if err != nil {
-			for _, p := range plans {
-				errs[p.idx] = err
-			}
-			return revs, errs, err
-		}
-		refs = appendSegmentRef(refs, g.ref)
-		indexes = append(indexes, segmentIndexUpdate{shard: g.shard, data: encodeSegmentIndex(refs)})
 		journals = append(journals, segmentJournalWrite{
 			first: g.first, count: g.count, parent: g.parent,
 			key: r.segmentKeyFor(g.first, g.count), sha: g.sha,
 		})
 	}
-	// The shard index and the WAL record are independent: both must be durable
-	// before the HEAD CAS, but neither waits for the other. On object storage
-	// that saves one round trip per commit, which dominates small commits.
-	if err := r.writeSegmentMetadata(ctx, lease, created, indexes, journals); err != nil {
+	var written []segmentRef
+	for _, g := range groups {
+		if err := r.appendSegmentIndex(ctx, g.ref); err != nil {
+			for _, ref := range written {
+				r.rollbackSegmentIndex(ctx, ref)
+			}
+			for _, p := range plans {
+				errs[p.idx] = err
+			}
+			return revs, errs, err
+		}
+		written = append(written, g.ref)
+	}
+	if err := r.writeSegmentJournals(ctx, lease, created, journals); err != nil {
+		for _, ref := range written {
+			r.rollbackSegmentIndex(ctx, ref)
+		}
 		for _, p := range plans {
 			errs[p.idx] = err
 		}
@@ -94,6 +102,11 @@ func (r *Repo) publishSegmentPlans(ctx context.Context, lease *commitLease, cur 
 	nc := &Current{Head: last, Created: created}
 	if _, cerr := r.store.CAS(ctx, r.keys.Current(), etag, nc.Marshal()); cerr != nil {
 		if !errors.Is(cerr, store.ErrPreconditionFailed) {
+			// Nothing was published; drop our index entries so a retry at the
+			// same revisions is not blocked by an unpublished entry.
+			for _, ref := range written {
+				r.rollbackSegmentIndex(ctx, ref)
+			}
 			return revs, errs, cerr
 		}
 		now := cur.Head
@@ -114,9 +127,24 @@ func (r *Repo) publishSegmentPlans(ctx context.Context, lease *commitLease, cur 
 		if now < last {
 			last = now
 		}
+		r.setHead(last)
+		r.cache.Clear()
+		// Our unpublished entries above the new HEAD are dead weight: another
+		// writer reuses those revision numbers and would be blocked by them.
+		for _, ref := range written {
+			if last < ref.First+ref.Count-1 {
+				r.rollbackSegmentIndex(ctx, ref)
+			}
+		}
+		return revs, errs, nil
 	}
 	r.setHead(last)
 	r.cache.Clear()
+	// The batch is the published truth now. Re-check its index entries: a lease
+	// violator that rewrote the index between our CAS and the HEAD publication
+	// must not be able to leave HEAD pointing at revisions the index no longer
+	// names.
+	r.ensureIndexRefs(written)
 
 	// Compact a shard once its last revision is published. The merge runs in
 	// the background: it is O(shard size), and the commit that closed the shard
@@ -418,7 +446,21 @@ func (r *Repo) loadSegment(ref segmentRef) (*segmentData, error) {
 // Old segment keys are deleted after a grace period; readers resolving them
 // through an older index still succeed during that window.
 func (r *Repo) compactSegmentShard(ctx context.Context, sh uint64) error {
-	refs, err := r.loadSegmentIndex(sh)
+	for attempt := 0; attempt < 3; attempt++ {
+		err := r.compactSegmentShardOnce(ctx, sh)
+		if errors.Is(err, ErrSegmentIndexConflict) {
+			continue
+		}
+		return err
+	}
+	return fmt.Errorf("%w: compact shard %d", ErrSegmentIndexConflict, sh)
+}
+
+// compactSegmentShardOnce merges the shard once. The index swap is a CAS: a
+// concurrent commit that appended an entry between the read and the write makes
+// the swap fail instead of dropping that commit's segment from the index.
+func (r *Repo) compactSegmentShardOnce(ctx context.Context, sh uint64) error {
+	refs, etag, existed, err := r.loadSegmentIndexETag(ctx, sh)
 	if err != nil || len(refs) <= 1 {
 		return err
 	}
@@ -462,10 +504,9 @@ func (r *Repo) compactSegmentShard(ctx context.Context, sh uint64) error {
 		return err
 	}
 	ref := segmentRef{First: first, Count: merged.Count, SHA256: hex.EncodeToString(sum[:])}
-	if err := r.store.Put(ctx, r.keys.SegmentIndex(sh), encodeSegmentIndex([]segmentRef{ref})); err != nil {
+	if err := r.writeSegmentIndexCAS(ctx, sh, []segmentRef{ref}, etag, existed); err != nil {
 		return err
 	}
-	cachePut(r.cache, cache.Key(segmentIndexCacheKey(sh)), encodeSegmentIndex([]segmentRef{ref}))
 	old := make([]string, 0, len(refs))
 	for _, ref := range refs {
 		old = append(old, r.segmentKeyFor(ref.First, ref.Count))
@@ -479,36 +520,234 @@ func (r *Repo) compactSegmentShard(ctx context.Context, sh uint64) error {
 	return nil
 }
 
-// segmentIndexUpdate is one shard's rewritten index, prepared under the lease.
-type segmentIndexUpdate struct {
-	shard uint64
-	data  []byte
-}
-
 // segmentJournalWrite is one prepared WAL record.
 type segmentJournalWrite struct {
 	first, count, parent uint64
 	key, sha             string
 }
 
-// writeSegmentMetadata writes every prepared index and WAL record concurrently
-// and waits for all of them. Both families must be durable before the HEAD CAS,
-// but not relative to each other; on object storage this saves one round trip
-// per commit, which dominates small commits. Errors are returned in completion
-// order; the first one aborts the publish (nothing is visible before the CAS).
-func (r *Repo) writeSegmentMetadata(ctx context.Context, lease *commitLease, created int64,
-	indexes []segmentIndexUpdate, journals []segmentJournalWrite) error {
-	var wg sync.WaitGroup
-	errCh := make(chan error, len(indexes)+len(journals))
-	for _, ix := range indexes {
-		wg.Add(1)
-		go func(ix segmentIndexUpdate) {
-			defer wg.Done()
-			if err := r.store.Put(ctx, r.keys.SegmentIndex(ix.shard), ix.data); err != nil {
-				errCh <- err
-			}
-		}(ix)
+// ErrSegmentIndexConflict means another writer already owns the revision range
+// in the shard index. The commit is refused rather than overwriting it; with a
+// healthy commit lease this should never surface.
+var ErrSegmentIndexConflict = errors.New("fs: segment index entry owned by another writer")
+
+// loadSegmentIndexETag reads a shard index together with its ETag so the next
+// write can be a compare-and-set. existed=false means the object is absent and
+// the write must create it.
+func (r *Repo) loadSegmentIndexETag(ctx context.Context, sh uint64) (refs []segmentRef, etag string, existed bool, err error) {
+	b, err := r.store.Get(ctx, r.keys.SegmentIndex(sh), nil)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, "", false, nil
+		}
+		return nil, "", false, err
 	}
+	refs, err = decodeSegmentIndex(b)
+	if err != nil {
+		return nil, "", false, err
+	}
+	// The expected ETag is the content digest: FileStore, MemoryStore and
+	// single-part S3 objects all use it, so one GET is enough. A gateway with
+	// opaque ETags is handled inside Store.CAS, which falls back to hashing the
+	// body it finds.
+	return refs, store.ContentETag(b), true, nil
+}
+
+// writeSegmentIndexCAS stores one shard index only if it still has the ETag the
+// caller read (or is still absent). A lost race returns ErrSegmentIndexConflict.
+func (r *Repo) writeSegmentIndexCAS(ctx context.Context, sh uint64, refs []segmentRef, etag string, existed bool) error {
+	data := encodeSegmentIndex(refs)
+	key := r.keys.SegmentIndex(sh)
+	var err error
+	if existed {
+		_, err = r.store.CAS(ctx, key, etag, data)
+	} else {
+		err = r.store.CreateIfAbsent(ctx, key, data)
+	}
+	if err != nil {
+		if errors.Is(err, store.ErrPreconditionFailed) || errors.Is(err, store.ErrNotFound) {
+			return ErrSegmentIndexConflict
+		}
+		return err
+	}
+	cachePut(r.cache, cache.Key(segmentIndexCacheKey(sh)), data)
+	return nil
+}
+
+// exactSegment returns the entry that starts at first, if any.
+func exactSegment(refs []segmentRef, first uint64) (segmentRef, bool) {
+	for _, ref := range refs {
+		if ref.First == first {
+			return ref, true
+		}
+	}
+	return segmentRef{}, false
+}
+
+// appendSegmentIndex inserts one ref with CAS retries. It refuses to write a
+// ref whose range is already covered by a published entry, and refuses to write
+// a ref that would leave the shard's covered range non-contiguous -- writing a
+// broken index would turn a harmless race into unreadable revisions. Entries
+// entirely above HEAD belong to a publish that never happened; the shard is
+// rebuilt from its immutable objects (which drops them) and the append retried.
+func (r *Repo) appendSegmentIndex(ctx context.Context, ref segmentRef) error {
+	sh := r.shard(ref.First)
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		refs, etag, existed, err := r.loadSegmentIndexETag(ctx, sh)
+		if err != nil {
+			return err
+		}
+		if cur, ok := overlapSegment(refs, ref); ok {
+			if cur == ref {
+				return nil // our own earlier attempt
+			}
+			if head, herr := r.HeadFresh(); herr == nil && cur.First > head {
+				if r.rebuildIndexInline(ctx, sh, head) {
+					continue
+				}
+			}
+			return fmt.Errorf("%w: revisions %d+%d overlap %d+%d", ErrSegmentIndexConflict,
+				ref.First, ref.Count, cur.First, cur.Count)
+		}
+		newRefs := appendSegmentRef(refs, ref)
+		if !segmentIndexContiguous(newRefs, r.segmentStart(sh)) {
+			if head, herr := r.HeadFresh(); herr == nil {
+				if r.rebuildIndexInline(ctx, sh, head) {
+					continue
+				}
+			}
+			return fmt.Errorf("%w: shard %d would become non-contiguous", ErrSegmentIndexConflict, sh)
+		}
+		if err := r.writeSegmentIndexCAS(ctx, sh, newRefs, etag, existed); err != nil {
+			if errors.Is(err, ErrSegmentIndexConflict) {
+				lastErr = err
+				time.Sleep(time.Duration(attempt+1) * 20 * time.Millisecond)
+				continue
+			}
+			return err
+		}
+		return nil
+	}
+	if lastErr == nil {
+		lastErr = ErrSegmentIndexConflict
+	}
+	return fmt.Errorf("%w: shard %d", lastErr, sh)
+}
+
+// overlapSegment returns an entry whose range intersects ref.
+func overlapSegment(refs []segmentRef, ref segmentRef) (segmentRef, bool) {
+	end := ref.First + ref.Count
+	for _, cur := range refs {
+		if cur.First < end && ref.First < cur.First+cur.Count {
+			return cur, true
+		}
+	}
+	return segmentRef{}, false
+}
+
+// segmentStart is the first revision a shard's index must cover.
+func (r *Repo) segmentStart(sh uint64) uint64 {
+	if sh == 0 {
+		return r.segmentFrom
+	}
+	return sh * r.shardSz
+}
+
+// segmentIndexContiguous reports whether refs cover [start, ...) without gaps
+// or overlaps.
+func segmentIndexContiguous(refs []segmentRef, start uint64) bool {
+	next := start
+	for _, ref := range refs {
+		if ref.First != next {
+			return false
+		}
+		next = ref.First + ref.Count
+	}
+	return true
+}
+
+// rebuildIndexInline rebuilds one shard from its objects and replacing the
+// index, without acquiring the commit lease. Callers must already hold it (or
+// be the only writer), which the publish path does.
+func (r *Repo) rebuildIndexInline(ctx context.Context, sh, head uint64) bool {
+	rebuilt, err := r.rebuildSegmentIndex(ctx, sh, head)
+	if err != nil {
+		log.Printf("segment: inline rebuild shard %d: %v", sh, err)
+		return false
+	}
+	_, etag, existed, err := r.loadSegmentIndexETag(ctx, sh)
+	if err != nil {
+		return false
+	}
+	if err := r.writeSegmentIndexCAS(ctx, sh, rebuilt, etag, existed); err != nil {
+		log.Printf("segment: inline rebuild shard %d: write: %v", sh, err)
+		return false
+	}
+	return true
+}
+
+// rollbackSegmentIndex removes our ref after a publish aborted, so a retry at
+// the same revision range is not blocked by an unpublished entry.
+func (r *Repo) rollbackSegmentIndex(ctx context.Context, ref segmentRef) {
+	sh := r.shard(ref.First)
+	for attempt := 0; attempt < 3; attempt++ {
+		refs, etag, existed, err := r.loadSegmentIndexETag(ctx, sh)
+		if err != nil || !existed {
+			return
+		}
+		kept := refs[:0]
+		removed := false
+		for _, cur := range refs {
+			if cur.First == ref.First && cur.SHA256 == ref.SHA256 {
+				removed = true
+				continue
+			}
+			kept = append(kept, cur)
+		}
+		if !removed {
+			return
+		}
+		if err := r.writeSegmentIndexCAS(ctx, sh, kept, etag, existed); err == nil {
+			return
+		} else if !errors.Is(err, ErrSegmentIndexConflict) {
+			log.Printf("segment: roll back index %d: %v", sh, err)
+			return
+		}
+	}
+}
+
+// ensureIndexRefs re-checks published entries after the HEAD CAS. If a lease
+// violator rewrote the index in the meantime, the published HEAD still names
+// our batch as the truth, so our entries are restored (and the event logged).
+func (r *Repo) ensureIndexRefs(refs []segmentRef) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	for _, ref := range refs {
+		sh := r.shard(ref.First)
+		// One GET: if our entry is there, nothing else to do. The restore path
+		// (never taken in practice) pays for its own re-read.
+		cur, err := r.loadSegmentIndex(sh)
+		if err != nil {
+			log.Printf("segment: post-publish check shard %d: %v", sh, err)
+			continue
+		}
+		if ex, ok := exactSegment(cur, ref.First); ok && ex.SHA256 == ref.SHA256 {
+			continue
+		}
+		if err := r.appendSegmentIndex(ctx, ref); err != nil {
+			log.Printf("segment: restore index entry %d+%d: %v", ref.First, ref.Count, err)
+			continue
+		}
+		log.Printf("segment: index entry %d+%d was overwritten during publish; restored", ref.First, ref.Count)
+	}
+}
+
+// writeSegmentJournals writes every prepared WAL record concurrently. Each is
+// an immutable unique key; all must be durable before the HEAD CAS.
+func (r *Repo) writeSegmentJournals(ctx context.Context, lease *commitLease, created int64, journals []segmentJournalWrite) error {
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(journals))
 	for _, j := range journals {
 		wg.Add(1)
 		go func(j segmentJournalWrite) {

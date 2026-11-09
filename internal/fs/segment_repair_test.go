@@ -135,7 +135,7 @@ func TestRebuildRejectsOverlap(t *testing.T) {
 	if err := st.Put(context.Background(), r.keys.Segment(0, 3, 4), encodeSegment(fake)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.rebuildSegmentIndex(context.Background(), 0); err == nil {
+	if _, err := r.rebuildSegmentIndex(context.Background(), 0, 16); err == nil {
 		t.Fatal("rebuild accepted overlapping segment ranges")
 	}
 }

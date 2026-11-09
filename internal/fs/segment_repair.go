@@ -11,8 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"svngod/internal/cache"
 )
 
 // Segment indexes can be lost or lose one entry: the index is a mutable object
@@ -57,7 +55,11 @@ func parseSegmentKey(key string) (uint64, uint64, bool) {
 // Each object's digest is recomputed (the index stores it, and verify depends on
 // it). Overlapping ranges are rejected rather than guessed: writing a wrong
 // index would be worse than leaving the shard unrepaired.
-func (r *Repo) rebuildSegmentIndex(ctx context.Context, sh uint64) ([]segmentRef, error) {
+// maxRev bounds the rebuild to revisions that actually exist. Segments beyond
+// HEAD were written by a writer that never published them (index written, HEAD
+// CAS never ran, or the process died); keeping them would block the retry at
+// those revision numbers, so they are dropped.
+func (r *Repo) rebuildSegmentIndex(ctx context.Context, sh, maxRev uint64) ([]segmentRef, error) {
 	prefix := r.keys.SegmentDir(sh)
 	next := ""
 	var refs []segmentRef
@@ -108,6 +110,9 @@ func (r *Repo) rebuildSegmentIndex(ctx context.Context, sh uint64) ([]segmentRef
 	})
 	merged := refs[:0]
 	for _, ref := range refs {
+		if ref.First > maxRev {
+			continue
+		}
 		if len(merged) == 0 {
 			merged = append(merged, ref)
 			continue
@@ -136,23 +141,31 @@ func (r *Repo) rebuildSegmentIndex(ctx context.Context, sh uint64) ([]segmentRef
 // lease, so a concurrent commit cannot have its freshly appended entry dropped
 // by the rewrite. Returns the repaired entries.
 func (r *Repo) repairSegmentIndex(ctx context.Context, sh uint64) ([]segmentRef, error) {
+	head, err := r.HeadFresh()
+	if err != nil {
+		return nil, err
+	}
 	lease, err := r.acquireCommitLease(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer lease.Release(r.store)
-	refs, err := r.rebuildSegmentIndex(ctx, sh)
+	refs, err := r.rebuildSegmentIndex(ctx, sh, head)
 	if err != nil {
 		return nil, err
 	}
 	if len(refs) == 0 {
-		return nil, fmt.Errorf("shard %d has no segment objects to rebuild from", sh)
+		// Every object in this shard is beyond HEAD: an unpublished write.
+		// Leave no index behind rather than an empty one.
+		return nil, nil
 	}
-	data := encodeSegmentIndex(refs)
-	if err := r.store.Put(ctx, r.keys.SegmentIndex(sh), data); err != nil {
+	_, etag, existed, err := r.loadSegmentIndexETag(ctx, sh)
+	if err != nil {
 		return nil, err
 	}
-	cachePut(r.cache, cache.Key(segmentIndexCacheKey(sh)), data)
+	if err := r.writeSegmentIndexCAS(ctx, sh, refs, etag, existed); err != nil {
+		return nil, err
+	}
 	return refs, nil
 }
 
