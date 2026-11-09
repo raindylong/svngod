@@ -26,26 +26,44 @@ texts/ chunks/ dirs/                大文件/分块/目录桶，保持原样
 - `<shard>` 10 位十进制，`<first>/<count>` 12 位十进制；count 参与命名，compaction 发布更宽的 segment 时不会覆盖读者仍可能引用的旧对象。
 - 一个 segment 不跨分片；跨分片的提交批在边界处拆成多个 segment。
 
-### 2.1 Segment 编码
+### 2.1 Segment 编码（v2，带条目表）
 
 ```
-magic "SVNGSEG1" | u32 version=1 | u64 first | u64 count | u64 parent
+magic "SVNGSEG1" | u32 version=2 | u64 first | u64 count | u64 parent
+count × [ u64 blockOff | u32 blockLen | u32 propsLen | u32 CRC32C(entry) ]
 for i in 0..count-1: u32 blockLen | u32 propsLen | block | props
 u32 CRC32C(以上全部)
 ```
 
 - block 为现有 `RevBlock.Marshal()` 字节，props 为 `RevProps.Marshal()` 字节；
-- 解码校验 magic/长度/CRC/条目边界，任何不符即拒绝（视为损坏，交给副本/备份恢复）；
+- 条目表放在**头部之后**，因此读到 count（索引里有）就能用一次小的 Range GET 取回 `36 + 20×count` 字节的表；
+- 每个条目独立 CRC32C，支持只取一个条目并校验；整对象的 CRC32C（尾部）仍用于全量读；
+- v1 段（无表）保持可读：版本不是 2 时回退到整对象读，不需要迁移；
+- 解码校验 magic/长度/偏移单调/CRC/条目边界，任何不符即拒绝（视为损坏，交给副本/备份恢复）；
 - 单 segment 目标大小建议 ≤ 4 MiB（约 1024–4096 个小修订），可通过 `SEGMENT_TARGET` 配置。
 
-### 2.2 分片索引
+### 2.2 按修订 Range 读
+
+读一条修订只需要“表 + 该条目”，不是整个 segment：
+
+1. `Get(key, Range{0, 36+20×count})` → 解析表（进程内 LRU 缓存 256 个分片段，表命中即省掉这次 GET）；
+2. `Get(key, Range{entryOff+8, blockLen+propsLen})` → 校验条目 CRC 后返回 block/props 的拷贝。
+
+顺序访问自动升级为整段读：同一 segment 内连续请求 `rev, rev+1` 时，第二次改为一次整对象 GET，解码后放进进程内“已解码段”缓存（2 段），后续修订零网络开销——`svn log`/`blame`/`dump` 因此仍是一次 GET 服务一整个段，而 checkout 这类跳读只付 KB 级流量。
+
+`svnadmin verify` 会临时打开全量读模式（`fullReads`），确保每个段对象都按索引里的 SHA-256 校验；Range 读只能校验单条目 CRC，不承担这个职责。
+
+S3（RustFS）实测 50 修订、19,408 字节的段：随机读一条修订传输 1,423 字节 / 2 次 GET；连续读 10 条传输 20,837 字节 / 3 次 GET（表+首条目，随后整段一次）。
+
+### 2.3 分片索引
 
 `segs/<shard>.idx` 为有序 JSON：
 
 ```json
-[{"first":1,"count":64,"key":"segs/0000000000/000000000001-000000000064.seg","sha256":"..."}]
+[{"first":1,"count":64,"sha256":"..."}]
 ```
 
+- 条目只存 first/count/sha256，对象键由仓库前缀 + first/count 推导（scoped store 不会二次加前缀）；
 - 条目按 first 升序，区间不重叠；
 - 读路径二分查找 `rev ∈ [first, first+count)`；
 - 索引本身是可变对象：提交/compaction 在**提交租约**内读最新版本后整体 Put；跨进程由租约串行化。

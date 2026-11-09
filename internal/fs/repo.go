@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"svngod/internal/cache"
@@ -65,6 +66,18 @@ type Repo struct {
 	// cancelled the merge halfway through.
 	compactQ    chan uint64
 	compactOnce sync.Once
+	// segMetas caches parsed row tables; segDecoded caches whole decoded
+	// segments for sequential scans. Named separately from cache (which holds
+	// raw revision blocks) so a scan does not evict the block working set.
+	segMetas   *segMetaCache
+	segDecoded *segDecodeCache
+	// fullReads forces whole-object segment reads. Verify sets it so the index
+	// SHA-256 is checked; ranged reads only see the per-entry CRC.
+	fullReads atomic.Bool
+	// seqMu guards the sequential-read hint: same segment, previous revision.
+	seqMu   sync.Mutex
+	seqKey  string
+	seqNext uint64
 	// writeQuorum is the number of replicas a commit record must reach before
 	// publication (0/1 = single-node semantics, no WAL).
 	writeQuorum int
@@ -1400,6 +1413,10 @@ func (r *Repo) VerifyRange(from, to uint64, texts bool) ([]VerifyIssue, error) {
 	var issues []VerifyIssue
 	seen := make(map[NodeID]bool)
 	ctx := context.Background()
+	// Full segment reads: a ranged read can only check the per-entry CRC, while
+	// verify must confirm the index SHA-256 of every segment object.
+	r.fullReads.Store(true)
+	defer r.fullReads.Store(false)
 	for rev := from; rev <= to; rev++ {
 		rb, berr := r.readBlock(rev)
 		if berr != nil {

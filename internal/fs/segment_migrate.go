@@ -109,6 +109,7 @@ func (r *Repo) switchFormat() error {
 	r.segments = true
 	r.segmentFrom = f.SegmentFrom
 	r.segmentTarget = f.SegmentTarget
+	r.initCompaction()
 	return nil
 }
 

@@ -130,6 +130,14 @@ func (r *Repo) initCompaction() {
 	if r.segments && r.compactQ == nil {
 		r.compactQ = make(chan uint64, 256)
 	}
+	if r.segments {
+		if r.segMetas == nil {
+			r.segMetas = newSegMetaCache(256)
+		}
+		if r.segDecoded == nil {
+			r.segDecoded = newSegDecodeCache(2)
+		}
+	}
 }
 
 // enqueueCompaction schedules a completed shard. A full queue drops the shard
@@ -283,10 +291,56 @@ func (r *Repo) segmentEntry(rev uint64, fresh bool) ([]byte, []byte, error) {
 			return nil, nil, fmt.Errorf("fs: revision %d not in shard %d segment index", rev, sh)
 		}
 	}
+	objKey := r.segmentKeyFor(ref.First, ref.Count)
+	if r.fullReads.Load() {
+		// Verify path: read the whole object once per segment so the index
+		// SHA-256 is checked, then serve its revisions from memory.
+		if seg := r.segDecoded.get(objKey); seg != nil {
+			return segmentEntryAt(seg, rev, ref)
+		}
+		seg, err := r.verifySegmentFull(*ref)
+		if err != nil {
+			return nil, nil, err
+		}
+		r.segDecoded.put(objKey, seg)
+		return segmentEntryAt(seg, rev, ref)
+	}
+	// Sequential scans (log, blame, dump) walk a segment revision by revision.
+	// Detecting that turns the second read into one whole-segment GET that then
+	// serves the rest from memory; isolated reads stay ranged.
+	sequential := r.noteSegmentRead(objKey, rev)
+	if seg := r.segDecoded.get(objKey); seg != nil {
+		return segmentEntryAt(seg, rev, ref)
+	}
+	if !sequential {
+		block, props, err := r.readSegmentEntry(context.Background(), *ref, rev-ref.First)
+		if err == nil {
+			return block, props, nil
+		}
+		if !errors.Is(err, errSegmentV1) {
+			return nil, nil, err
+		}
+	}
 	seg, err := r.loadSegment(*ref)
 	if err != nil {
 		return nil, nil, err
 	}
+	r.segDecoded.put(objKey, seg)
+	return segmentEntryAt(seg, rev, ref)
+}
+
+// noteSegmentRead reports whether rev continues the previous read of this
+// segment, and records it as the new tail.
+func (r *Repo) noteSegmentRead(objKey string, rev uint64) bool {
+	r.seqMu.Lock()
+	defer r.seqMu.Unlock()
+	seq := r.seqKey == objKey && r.seqNext == rev
+	r.seqKey, r.seqNext = objKey, rev+1
+	return seq
+}
+
+// segmentEntryAt extracts one revision from a decoded segment.
+func segmentEntryAt(seg *segmentData, rev uint64, ref *segmentRef) ([]byte, []byte, error) {
 	i := rev - seg.First
 	if i >= uint64(len(seg.Blocks)) {
 		return nil, nil, fmt.Errorf("fs: revision %d outside segment %d+%d", rev, ref.First, ref.Count)
