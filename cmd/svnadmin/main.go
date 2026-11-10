@@ -908,47 +908,54 @@ func doGC(o *options, repoName string) {
 	if err != nil {
 		fatal(err)
 	}
-	n, err := repo.CollectLoose(context.Background())
-	if err != nil {
-		fatal(err)
+	ctx := context.Background()
+	grace := time.Duration(o.gcGrace) * time.Second
+	// Long collections report their phase every 5 seconds; a full sweep of a
+	// large repository can run for hours.
+	var mu sync.Mutex
+	last := time.Now()
+	progress := fs.GCProgress(func(phase string, done, total int) {
+		mu.Lock()
+		defer mu.Unlock()
+		if time.Since(last) < 5*time.Second {
+			return
+		}
+		last = time.Now()
+		if total > 0 {
+			fmt.Fprintf(os.Stderr, "gc: %s %d/%d\n", phase, done, total)
+		} else {
+			fmt.Fprintf(os.Stderr, "gc: %s %d\n", phase, done)
+		}
+	})
+	phase := func(name string, fn func() (int, error)) int {
+		t := time.Now()
+		n, perr := fn()
+		if perr != nil {
+			fatal(perr)
+		}
+		fmt.Printf("gc: %-9s %8d  %s\n", name, n, time.Since(t).Round(time.Millisecond))
+		return n
 	}
-	tn, err := repo.CollectTxnDataGrace(context.Background(), time.Duration(o.gcGrace)*time.Second)
-	if err != nil {
-		fatal(err)
-	}
+	n := phase("loose", func() (int, error) { return repo.CollectLooseProgress(ctx, progress) })
+	tn := phase("txn-data", func() (int, error) { return repo.CollectTxnDataGrace(ctx, grace) })
 	// Collecting unreferenced texts walks every revision, which costs minutes
 	// per 100k revisions on object storage. It is a leak-reclamation pass, never
 	// needed for correctness, so routine GC skips it and ops opt in with -texts.
 	tx := 0
 	if o.gcTexts {
-		tx, err = repo.CollectTextsGrace(context.Background(), time.Duration(o.gcGrace)*time.Second)
-		if err != nil {
-			fatal(err)
-		}
+		tx = phase("texts", func() (int, error) { return repo.CollectTextsGraceProgress(ctx, grace, progress) })
 	}
-	jn, err := repo.TrimJournal(o.keepJournal)
-	if err != nil {
-		fatal(err)
-	}
+	jn := phase("journal", func() (int, error) { return repo.TrimJournal(o.keepJournal) })
 	merged := 0
 	if o.gcCompact {
-		merged, err = repo.CompactSegments(context.Background())
-		if err != nil {
-			fatal(err)
-		}
+		merged = phase("segments", func() (int, error) { return repo.CompactSegmentsProgress(ctx, progress) })
 	}
 	// The segment sweep takes the commit lease while it deletes, so a short age
 	// filter is safe and lets one gc run clear the superseded segments that its
 	// own compaction just left behind.
-	orphans, err := repo.CollectOrphanSegments(context.Background(), time.Minute)
-	if err != nil {
-		fatal(err)
-	}
-	fmt.Printf("gc: removed %d loose objects, %d orphaned txn bodies and %d unreferenced texts from %q (journal: %d records dropped)\n",
-		n, tn, tx, repoName, jn)
-	if merged > 0 || orphans > 0 {
-		fmt.Printf("gc: merged %d segment shards, removed %d orphaned segments\n", merged, orphans)
-	}
+	orphans := phase("orphans", func() (int, error) { return repo.CollectOrphanSegmentsProgress(ctx, time.Minute, progress) })
+	fmt.Printf("gc: %q done (loose=%d txn=%d texts=%d merged=%d orphans=%d journal=%d)\n",
+		repoName, n, tn, tx, merged, orphans, jn)
 }
 
 func doJournal(o *options, repoName string) {

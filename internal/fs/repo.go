@@ -2114,6 +2114,12 @@ func cachePut(c *cache.LRU, k cache.Key, b []byte) {
 	c.Put(k, b)
 }
 
+// GCProgress reports long-running collection progress. phase names the step
+// ("loose", "texts-scan", "texts", "segments", "orphans"); done/total are item
+// counts, with total 0 when the size is unknown. Callbacks may run from worker
+// goroutines and must be cheap.
+type GCProgress func(phase string, done, total int)
+
 // CollectLoose deletes loose revision and revprops objects that belong to
 // shards already packed. PackShard leaves them behind (readers switch to the
 // pack via the .done marker), so storage and repair listings grew without
@@ -2121,6 +2127,11 @@ func cachePut(c *cache.LRU, k cache.Key, b []byte) {
 // known from HEAD, so this deletes exact keys instead of listing a prefix that
 // may hold tens of thousands of objects.
 func (r *Repo) CollectLoose(ctx context.Context) (int, error) {
+	return r.CollectLooseProgress(ctx, nil)
+}
+
+// CollectLooseProgress is CollectLoose with phase progress.
+func (r *Repo) CollectLooseProgress(ctx context.Context, progress GCProgress) (int, error) {
 	if r.segments {
 		// Segment repositories have no per-revision loose objects (revision 0
 		// stays loose but is tiny); compaction reclaims old segments instead.
@@ -2138,6 +2149,9 @@ func (r *Repo) CollectLoose(ctx context.Context) (int, error) {
 		}
 		n, err := r.collectLooseShard(ctx, shard)
 		deleted += n
+		if progress != nil {
+			progress("loose", deleted, 0)
+		}
 		if err != nil {
 			return deleted, err
 		}
@@ -2363,6 +2377,11 @@ func (r *Repo) CollectTexts(ctx context.Context) (int, error) {
 // GC pass racing an upload would otherwise delete live data. Objects younger
 // than grace are left for the next pass.
 func (r *Repo) CollectTextsGrace(ctx context.Context, grace time.Duration) (int, error) {
+	return r.CollectTextsGraceProgress(ctx, grace, nil)
+}
+
+// CollectTextsGraceProgress is CollectTextsGrace with phase progress.
+func (r *Repo) CollectTextsGraceProgress(ctx context.Context, grace time.Duration, progress GCProgress) (int, error) {
 	head, err := r.Head()
 	if err != nil {
 		return 0, err
@@ -2415,6 +2434,9 @@ func (r *Repo) CollectTextsGrace(ctx context.Context, grace time.Duration) (int,
 		if !parts[i].dirScanOK {
 			dirScanOK = false
 		}
+	}
+	if progress != nil {
+		progress("texts-scan", int(head+1), int(head+1))
 	}
 	prefix := r.keys.ListingPrefix("texts")
 	next := ""

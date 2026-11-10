@@ -24,6 +24,11 @@ const segmentOrphanAge = time.Minute
 // under the commit lease, so a concurrent commit can neither be lost nor
 // observe a half-written index.
 func (r *Repo) CompactSegments(ctx context.Context) (int, error) {
+	return r.CompactSegmentsProgress(ctx, nil)
+}
+
+// CompactSegmentsProgress is CompactSegments with per-shard progress.
+func (r *Repo) CompactSegmentsProgress(ctx context.Context, progress GCProgress) (int, error) {
 	if !r.segments {
 		return 0, nil
 	}
@@ -53,6 +58,9 @@ func (r *Repo) CompactSegments(ctx context.Context) (int, error) {
 			return merged, rerr
 		}
 		merged++
+		if progress != nil {
+			progress("segments", int(sh)+1, int(r.shard(head))+1)
+		}
 	}
 	return merged, nil
 }
@@ -63,6 +71,11 @@ func (r *Repo) CompactSegments(ctx context.Context) (int, error) {
 // index. Indexes are read fresh: the sweep must never delete a segment a live
 // compaction is about to publish.
 func (r *Repo) CollectOrphanSegments(ctx context.Context, grace time.Duration) (int, error) {
+	return r.CollectOrphanSegmentsProgress(ctx, grace, nil)
+}
+
+// CollectOrphanSegmentsProgress is CollectOrphanSegments with progress.
+func (r *Repo) CollectOrphanSegmentsProgress(ctx context.Context, grace time.Duration, progress GCProgress) (int, error) {
 	if !r.segments {
 		return 0, nil
 	}
@@ -140,6 +153,12 @@ func (r *Repo) CollectOrphanSegments(ctx context.Context, grace time.Duration) (
 			return deleted, err
 		}
 		deleted += len(victims)
+		if progress != nil {
+			progress("orphans", deleted, len(candidates))
+		}
+	}
+	if progress != nil {
+		progress("orphans", deleted, len(candidates))
 	}
 	return deleted, nil
 }
