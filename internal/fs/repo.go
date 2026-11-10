@@ -1147,14 +1147,7 @@ func (r *Repo) commitTxn(baseRev uint64, changes []Change, revProps map[string]s
 	// rejected (native svn raises E160024 here) instead of silently
 	// last-write-wins over each other.
 	for _, ch := range changes {
-		// Root / directory changes: svn clients routinely attach root and
-		// directory property changes (e.g. svn:date) to every commit.
-		// A directory's node-rev moves whenever any child changes, so a
-		// strict check here would falsely reject disjoint-path commits
-		// ("/svn/demo conflicts"). Children's add/modify/delete carry their
-		// own Change entries and are still guarded below, so skipping
-		// directories loses no lost-update protection.
-		if ch.Path == "/" || ch.Kind == KindDir {
+		if ch.Path == "/" {
 			continue
 		}
 		// Prefer the client's own base revision for this path; fall back to
@@ -1162,6 +1155,33 @@ func (r *Repo) commitTxn(baseRev uint64, changes []Change, revProps map[string]s
 		base := ch.BaseRev
 		if base == 0 {
 			base = baseRev
+		}
+		// Root / directory property changes: svn clients routinely attach root
+		// and directory property changes (e.g. svn:date) to every commit. A
+		// directory's node-rev moves whenever any child changes, so a strict
+		// check here would falsely reject disjoint-path commits. Children carry
+		// their own Change entries and are guarded below.
+		//
+		// A directory delete or copy target is different: applying it over a
+		// directory that gained content since the client's base destroys
+		// another writer's commit (observed as a silently lost file).
+		if ch.Kind == KindDir && ch.Action == ActionModify {
+			continue
+		}
+		if ch.Kind == KindDir {
+			hnr, herr := r.Resolve(cur.Head, ch.Path)
+			if herr == nil {
+				if base > 0 && hnr.Node.Rev > base {
+					log.Printf("fs: commit OOD dir path=%s headRev=%d baseRev=%d -> reject", ch.Path, hnr.Node.Rev, base)
+					return 0, &OutOfDateError{Path: ch.Path}
+				}
+				if base == 0 && ch.Action == ActionAdd {
+					return 0, &OutOfDateError{Path: ch.Path}
+				}
+				continue
+			}
+			// Absent at HEAD: fall through to the generic deleted-in-window
+			// and missing-path handling below.
 		}
 		if len(ch.Delta) > 0 && base == 0 {
 			log.Printf("fs: commit OOD delta without a base path=%s", ch.Path)

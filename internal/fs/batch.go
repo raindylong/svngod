@@ -265,7 +265,6 @@ func (r *Repo) buildRevisionLocked(ctx context.Context, root *tnode, parent, N, 
 	return rb.Marshal(), rp.Marshal(), nil
 }
 
-
 // batchPlan is one successfully built revision waiting for publication.
 type batchPlan struct {
 	idx   int
@@ -341,12 +340,32 @@ func (r *Repo) lookupTree(root *tnode, path string) (*tnode, bool) {
 // out-of-date loop: the node is looked up in the evolving tree (which already
 // contains the batch's earlier revisions) instead of the published HEAD.
 func (r *Repo) checkChangeInTree(root *tnode, ch *Change, baseRev uint64) error {
-	if ch.Noop || ch.Path == "/" || ch.Kind == KindDir {
+	if ch.Noop || ch.Path == "/" {
 		return nil
 	}
 	base := ch.BaseRev
 	if base == 0 {
 		base = baseRev
+	}
+	// Directory property changes are routine and carry no subtree semantics; a
+	// directory's node-rev moves whenever any child changes, so checking those
+	// would reject unrelated concurrent commits. A delete or copy *target* is
+	// different: applying it over a directory that gained content since the
+	// client's base silently destroys another writer's commit, which is exactly
+	// what the per-path out-of-date check exists to prevent.
+	if ch.Kind == KindDir {
+		if ch.Action == ActionModify {
+			return nil
+		}
+		if t, ok := r.lookupTree(root, ch.Path); ok {
+			if base > 0 && t.id.Rev > base {
+				return &OutOfDateError{Path: ch.Path}
+			}
+			if base == 0 && ch.Action == ActionAdd {
+				return &OutOfDateError{Path: ch.Path}
+			}
+			return nil
+		}
 	}
 	t, ok := r.lookupTree(root, ch.Path)
 	if ok {
