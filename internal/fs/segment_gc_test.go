@@ -178,23 +178,46 @@ func TestCollectOrphanChangeFragments(t *testing.T) {
 	}
 }
 
-// TestSegmentIndexDigest: the digest is stable for a repository and changes when
-// a shard index is lost. Cross-replica equality is exercised end to end by
-// `svnadmin replicas` (see docs); this pins the function itself.
-func TestSegmentIndexDigest(t *testing.T) {
+// TestReplicaDigest: the digest is stable, covers revprop overrides, and changes
+// when a shard index is lost. Cross-replica equality is exercised end to end by
+// `svnadmin replicas`; this pins the function itself.
+func TestReplicaDigest(t *testing.T) {
 	r := segRepo(t, "repos/dig")
 	commitBatches(t, r, 1, 4)
-	d1, err := r.SegmentIndexDigest()
+	d1, err := r.ReplicaDigest()
 	if err != nil || d1 == "" {
 		t.Fatalf("digest=%q err=%v", d1, err)
 	}
-	if d2, _ := r.SegmentIndexDigest(); d2 != d1 {
+	if d2, _ := r.ReplicaDigest(); d2 != d1 {
 		t.Fatalf("digest not stable: %q != %q", d1, d2)
 	}
+	// A revprop override changes the digest (the mutable side must be covered).
+	if err := r.UpdateRevProps(2, map[string]string{"svn:log": "edited"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	d2, err := r.ReplicaDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d2 == d1 {
+		t.Fatal("digest unchanged after a revprop edit")
+	}
+	// Changing the override's content (not just its presence) must show up too.
+	if err := r.UpdateRevProps(2, map[string]string{"svn:log": "edited again"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	d3, err := r.ReplicaDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d3 == d2 {
+		t.Fatal("digest unchanged after editing the override content")
+	}
+	// A lost shard index must change it as well.
 	if err := r.store.Delete(context.Background(), []string{r.keys.SegmentIndex(0)}); err != nil {
 		t.Fatal(err)
 	}
-	if d3, _ := r.SegmentIndexDigest(); d3 == d1 {
+	if d4, _ := r.ReplicaDigest(); d4 == d3 {
 		t.Fatal("digest unchanged after deleting an index")
 	}
 }

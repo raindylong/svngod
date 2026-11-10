@@ -2747,9 +2747,14 @@ func isMutableKey(key string) bool {
 // of thousands of revisions behind. A record only matters for the crash window
 // before HEAD is published; an acknowledged revision is already described by
 // its published HEAD and packs, and an unacknowledged one may be dropped.
+// segs/ and seg-revprops/ are cheap to list (one object per batch or shard,
+// not per revision) and are the only copy of a format-v2 repository's revisions
+// and edited properties. Leaving them out meant a standby that missed a
+// segment write was never repaired and would read a missing object after
+// failover.
 var repairPrefixes = []string{
 	"revs/", "revs-loose/", "revprops/", "revprops-loose/",
-	"texts/", "chunks/", "dirs/", "locks/",
+	"texts/", "chunks/", "dirs/", "locks/", "segs/", "seg-revprops/",
 }
 
 // listRepairObjects lists the repository objects repair needs, without the

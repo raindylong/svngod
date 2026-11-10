@@ -55,6 +55,7 @@ type options struct {
 	verifyWorkers int
 	rebuildIndex  bool
 	verifyMembers bool
+	repairMembers bool
 	keepJournal   uint64
 	gcGrace       int
 	gcTexts       bool
@@ -213,6 +214,7 @@ func main() {
 	}
 	if cmd == "replicas" {
 		fs.BoolVar(&o.verifyMembers, "verify", false, "also walk every revision on each member")
+		fs.BoolVar(&o.repairMembers, "repair", false, "run the mirror repair pass before comparing")
 	}
 	if cmd == "verify" {
 		fs.BoolVar(&o.allRevs, "all-revs", false, "verify every historical revision, not just HEAD")
@@ -276,7 +278,7 @@ func main() {
 	case "gc":
 		doGC(&o, repoName)
 	case "replicas":
-		doReplicas(&o, repoName, o.verifyMembers)
+		doReplicas(&o, repoName, o.verifyMembers, o.repairMembers)
 	default:
 		usage()
 		os.Exit(2)
@@ -327,13 +329,22 @@ func memberStore(e mirrorEntry) (store.Store, error) {
 // doReplicas reports each mirror member's HEAD, UUID and shard-index digest.
 // Any difference means a replica is behind or damaged; -verify additionally
 // walks every revision on each member.
-func doReplicas(o *options, repoName string, verify bool) {
+func doReplicas(o *options, repoName string, verify, repair bool) {
 	if o.mirrorFile == "" {
 		fatal(errors.New("replicas requires --mirror-file"))
 	}
 	entries, _, repoPrefix, err := readMirrorFile(o.mirrorFile)
 	if err != nil {
 		fatal(err)
+	}
+	if repair {
+		if ms, _, merr := o.mirrorStore(repoName); merr == nil {
+			if rp, ok := ms.(interface{ RepairNow() }); ok {
+				fmt.Println("replicas: running mirror repair before the comparison")
+				rp.RepairNow()
+			}
+			closeStore(ms)
+		}
 	}
 	keyPrefix := strings.Trim(repoPrefix, "/") + "/" + repoName
 	var firstHead uint64
@@ -355,7 +366,7 @@ func doReplicas(o *options, repoName string, verify bool) {
 		}
 		head, herr := r.HeadFresh()
 		uuid, _ := r.UUID()
-		digest, derr := r.SegmentIndexDigest()
+		digest, derr := r.ReplicaDigest()
 		if herr != nil || derr != nil {
 			fmt.Printf("member[%d]: head err=%v digest err=%v\n", i, herr, derr)
 			drift = true
@@ -413,7 +424,7 @@ usage:
   svnadmin repair [--mirror-file FILE] [--rebuild-index] <repo>  # reconcile mirrors / rebuild segment indexes
   svnadmin delete-repo -force [s3 flags | --mirror-file FILE] <repo>  # delete every object of a repository
   svnadmin journal [-n N] [s3 flags | --mirror-file FILE] <repo>  # show WAL records
-  svnadmin replicas [-verify] --mirror-file FILE <repo>  # per-member HEAD/UUID/index drift
+  svnadmin replicas [-verify] [-repair] --mirror-file FILE <repo>  # per-member drift (HEAD/UUID/index/revprops)
   svnadmin gc [-texts] [s3 flags] <repo>  # loose objects, txn bodies, segment compaction (-texts: unreferenced texts, slow)
 
 s3 flags: --endpoint H:PORT --access-key K --secret-key S --bucket B [--prefix P] [--ssl]

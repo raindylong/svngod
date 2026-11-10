@@ -103,6 +103,7 @@ S3（RustFS）实测 50 修订、19,408 字节的段：随机读一条修订传�
 | 崩溃点 | 结果 |
 |---|---|
 | segment 写完、索引/WAL/current 未写 | 孤儿 segment，GC 可删；HEAD 不变，客户端未收到成功 |
+| 段/索引/覆盖层写入未到备副本 | 镜像 repair 会列出 `segs/` 与 `seg-revprops/` 并补齐（原先遗漏，2026-11 修复）；`svnadmin replicas` 可发现漂移 |
 | 索引写完、WAL/current 未写 | 条目在 HEAD 之上，属未发布；下次同名区间提交会重建索引并回收它 |
 | 索引/WAL 写完、current CAS 失败 | 回滚索引条目；HEAD 不变，客户端重试 |
 | 索引写完、WAL/current 未写 | 索引指向未发布区间；读路径以 HEAD 截断，忽略越界条目；WAL 缺失则不前滚 |

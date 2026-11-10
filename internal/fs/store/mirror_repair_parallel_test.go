@@ -104,3 +104,32 @@ func compareCurrentBytes(key string, a, b []byte) int {
 	}
 	return 0
 }
+
+// TestRepairCopiesSegmentObjects: a format-v2 repository's revisions live in
+// segs/ and its edited properties in seg-revprops/. Repair used to skip both,
+// so a standby that missed one write stayed broken forever and would read a
+// missing object after failover.
+func TestRepairCopiesSegmentObjects(t *testing.T) {
+	ctx := context.Background()
+	a, b := NewMemoryStore(), NewMemoryStore()
+	m := NewMirror([]Store{a, b}, WithRepoPrefix("repos/x"))
+	defer m.Close()
+
+	keys := []string{
+		"repos/x/segs/0000000000/000000000001-000000000004.seg",
+		"repos/x/segs/0000000000.idx",
+		"repos/x/seg-revprops/0000000000/000000000002",
+		"repos/x/seg-revprops/0000000000.idx",
+	}
+	for _, k := range keys {
+		if err := a.Put(ctx, k, []byte(k)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.RepairNow()
+	for _, k := range keys {
+		if ok, _ := b.Exists(ctx, k); !ok {
+			t.Fatalf("repair did not copy %s", k)
+		}
+	}
+}

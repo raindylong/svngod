@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 )
@@ -188,20 +189,22 @@ func (r *Repo) verifySegmentIndexes(head uint64) ([]VerifyIssue, error) {
 // equal for scoped stores whose repository prefix is empty.
 func normalizeListKey(k string) string { return strings.TrimPrefix(k, "/") }
 
-// SegmentIndexDigest returns a stable digest of every shard index up to HEAD.
-// Two replicas of the same repository must report the same value; a mismatch
-// means an index (or the HEAD it belongs to) drifted on one of them, which
-// `svnadmin replicas` uses to detect lag or corruption explicitly.
-func (r *Repo) SegmentIndexDigest() (string, error) {
-	if !r.segments {
-		return "", nil
-	}
+// ReplicaDigest returns a stable digest of what makes two replicas of the same
+// repository equivalent for reads: the format parameters, every shard index and
+// every revision-property override (list and content). `svnadmin replicas`
+// compares it across members to turn silent drift into an explicit error.
+func (r *Repo) ReplicaDigest() (string, error) {
 	head, err := r.HeadFresh()
 	if err != nil {
 		return "", err
 	}
 	h := sha256.New()
-	fmt.Fprintf(h, "head=%d segfrom=%d\n", head, r.segmentFrom)
+	fmt.Fprintf(h, "segments=%v shard=%d from=%d target=%d head=%d\n",
+		r.segments, r.shardSz, r.segmentFrom, r.segmentTarget, head)
+	if !r.segments {
+		return hex.EncodeToString(h.Sum(nil)), nil
+	}
+	ctx := context.Background()
 	for sh := uint64(0); sh <= r.shard(head); sh++ {
 		refs, err := r.loadSegmentIndex(sh)
 		if err != nil {
@@ -210,6 +213,28 @@ func (r *Repo) SegmentIndexDigest() (string, error) {
 		fmt.Fprintf(h, "%d:", sh)
 		for _, ref := range refs {
 			fmt.Fprintf(h, "%d+%d+%s,", ref.First, ref.Count, ref.SHA256)
+		}
+		overrides, err := r.segRevPropsOverrides(sh, true)
+		if err != nil {
+			return "", err
+		}
+		revs := make([]uint64, 0, len(overrides))
+		for rev := range overrides {
+			revs = append(revs, rev)
+		}
+		sort.Slice(revs, func(i, j int) bool { return revs[i] < revs[j] })
+		fmt.Fprintf(h, " ov=%v", revs)
+		for _, rev := range revs {
+			b, ok, rerr := r.loadSegRevPropsRaw(ctx, sh, rev)
+			if rerr != nil {
+				return "", rerr
+			}
+			if !ok {
+				fmt.Fprintf(h, " %d:missing", rev)
+				continue
+			}
+			sum := sha256.Sum256(b)
+			fmt.Fprintf(h, " %d:%x", rev, sum)
 		}
 		h.Write([]byte("\n"))
 	}
