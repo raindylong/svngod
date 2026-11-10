@@ -2,8 +2,10 @@ package dump
 
 import (
 	"bytes"
+	"context"
 	"testing"
 
+	"svngod/internal/cdc"
 	"svngod/internal/fs"
 	"svngod/internal/fs/store"
 )
@@ -168,4 +170,66 @@ func TestDumpLoadRoundTrip(t *testing.T) {
 	}
 
 	assertSameTree(t, src, dst)
+}
+
+// TestDumpLoadRoundTripSegmentsWithOverrides checks a format-v2 repository
+// whose revision properties were edited (stored as overrides) dumps and loads
+// faithfully into another v2 repository, and that the loaded repository carries
+// the values in its segments rather than in overrides.
+func TestDumpLoadRoundTripSegmentsWithOverrides(t *testing.T) {
+	base := store.NewMemoryStore()
+	src, err := fs.CreateRepoSegments(base, "repos/v2src", 8, 64, cdc.DefaultParams(), false, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit := func(base uint64, changes ...fs.Change) uint64 {
+		t.Helper()
+		revs, errs, cerr := src.CommitBatch([]fs.BatchCommit{{BaseRev: base, Changes: changes}})
+		if cerr != nil || errs[0] != nil {
+			t.Fatalf("commit: %v %v", cerr, errs)
+		}
+		return revs[0]
+	}
+	r1 := commit(0,
+		fs.Change{Path: "/trunk", Action: fs.ActionAdd, Kind: fs.KindDir},
+		fs.Change{Path: "/trunk/a.txt", Action: fs.ActionAdd, Kind: fs.KindFile, Data: []byte("a")})
+	r2 := commit(r1,
+		fs.Change{Path: "/trunk/b.txt", Action: fs.ActionAdd, Kind: fs.KindFile, Data: []byte("b")})
+	commit(r2,
+		fs.Change{Path: "/trunk/a.txt", Action: fs.ActionModify, Kind: fs.KindFile, Data: []byte("a2")})
+	// Two edits: the second must merge into the first override.
+	if err := src.UpdateRevProps(2, map[string]string{"svn:log": "edited log", "x:custom": "v1"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.UpdateRevProps(2, map[string]string{"x:custom": "v2"}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	if err := Dump(src, &buf); err != nil {
+		t.Fatal(err)
+	}
+	dst, err := fs.CreateRepoSegments(store.NewMemoryStore(), "repos/v2dst", 8, 64, cdc.DefaultParams(), false, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Load(dst, bytes.NewReader(buf.Bytes())); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	assertSameTree(t, src, dst)
+	rp, err := dst.GetRevProps(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rp.Props["svn:log"] != "edited log" || rp.Props["x:custom"] != "v2" {
+		t.Fatalf("loaded props=%+v", rp.Props)
+	}
+	if !dst.SegmentsEnabled() {
+		t.Fatal("destination is not a segment repository")
+	}
+	// The loaded revision properties are committed values; no override is
+	// needed to serve them.
+	if ok, _ := dst.Store().Exists(context.Background(), dst.Keys().SegRevPropsIndex(0)); ok {
+		t.Fatal("loaded repository stores properties as an override")
+	}
 }

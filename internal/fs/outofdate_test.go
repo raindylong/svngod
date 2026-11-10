@@ -85,3 +85,27 @@ func TestDirectoryPropChangeNotConflicted(t *testing.T) {
 		t.Fatalf("rev=%d, want 3", rev)
 	}
 }
+
+// TestStaleCopyOverDirectoryRejected: copying onto a directory that another
+// writer changed since the client's base must conflict rather than replace it.
+func TestStaleCopyOverDirectoryRejected(t *testing.T) {
+	r := segRepo(t, "repos/oodcp")
+	mustCommit(t, r, 0,
+		Change{Path: "/src", Action: ActionAdd, Kind: KindDir},
+		Change{Path: "/src/s.txt", Action: ActionAdd, Kind: KindFile, Data: []byte("s")},
+		Change{Path: "/dst", Action: ActionAdd, Kind: KindDir},
+		Change{Path: "/dst/d.txt", Action: ActionAdd, Kind: KindFile, Data: []byte("d")})
+	// Another writer changes /dst at revision 2.
+	mustCommit(t, r, 1, Change{Path: "/dst/new.txt", Action: ActionAdd, Kind: KindFile, Data: []byte("n")})
+	// A stale client (base 1) copies /src onto /dst.
+	_, errs, err := r.CommitBatch([]BatchCommit{{BaseRev: 1, Changes: []Change{{
+		Path: "/dst", Action: ActionCopy, Kind: KindDir,
+		CopyFromPath: "/src", CopyFromRev: 1,
+	}}}})
+	if err == nil && errs[0] == nil {
+		t.Fatal("stale copy over a changed directory was accepted")
+	}
+	if _, rerr := r.Resolve(2, "/dst/new.txt"); rerr != nil {
+		t.Fatalf("concurrent file lost: %v", rerr)
+	}
+}
