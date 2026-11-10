@@ -103,8 +103,17 @@ func (r *Repo) segRevProps(rev uint64, fresh bool) (*RevProps, bool, error) {
 	// A fresh read must not trust the cached list: another process may have
 	// created the override just now, so it always asks for the object.
 	b, ok, err := r.loadSegRevPropsRaw(context.Background(), sh, rev)
-	if err != nil || !ok {
+	if err != nil {
 		return nil, false, err
+	}
+	if !ok {
+		if revs[rev] {
+			// The list says this revision was edited but the object is gone.
+			// Falling back to the committed value would silently revert the
+			// edit, so report the loss instead.
+			return nil, false, fmt.Errorf("fs: revision %d property override is missing", rev)
+		}
+		return nil, false, nil
 	}
 	rp, err := UnmarshalRevProps(b)
 	if err != nil {

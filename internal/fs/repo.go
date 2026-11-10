@@ -1520,6 +1520,7 @@ func (r *Repo) verifyRangeSeq(from, to uint64, texts bool) ([]VerifyIssue, error
 			issues = append(issues, VerifyIssue{Rev: rev, Err: berr})
 			continue
 		}
+		issues = append(issues, r.verifyRevisionSemantics(rev, rb)...)
 		for _, e := range rb.nodeTbl {
 			nid := NodeID{Rev: rb.Rev, ID: e.ID}
 			if seen[nid] {
@@ -1635,6 +1636,32 @@ func (r *Repo) verifyRangeSeq(from, to uint64, texts bool) ([]VerifyIssue, error
 		}
 	}
 	return issues, nil
+}
+
+// verifyRevisionSemantics checks the invariants that survive byte-level
+// validation: the block must belong to its revision, follow the previous one,
+// name a root node written at this revision, and carry readable properties.
+// A segment whose entries were mapped to the wrong revisions still passes the
+// CRC and SHA checks, so these are checked separately.
+func (r *Repo) verifyRevisionSemantics(rev uint64, rb *RevBlock) []VerifyIssue {
+	var out []VerifyIssue
+	if rb.Rev != rev {
+		out = append(out, VerifyIssue{Rev: rev, Err: fmt.Errorf("block belongs to revision %d", rb.Rev)})
+	}
+	wantParent := uint64(0)
+	if rev > 0 {
+		wantParent = rev - 1
+	}
+	if rb.PrevRev != wantParent {
+		out = append(out, VerifyIssue{Rev: rev, Err: fmt.Errorf("parent revision %d, want %d", rb.PrevRev, wantParent)})
+	}
+	if rb.Root.Rev != rev {
+		out = append(out, VerifyIssue{Rev: rev, Err: fmt.Errorf("root node is from revision %d", rb.Root.Rev)})
+	}
+	if _, err := r.loadRevProps(rev); err != nil {
+		out = append(out, VerifyIssue{Rev: rev, Err: fmt.Errorf("revision properties: %w", err)})
+	}
+	return out
 }
 
 // applyChange mutates the working tree for one Change.
