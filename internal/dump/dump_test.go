@@ -361,3 +361,34 @@ func TestLoadReplaySkipsLargeText(t *testing.T) {
 	}
 	assertSameTree(t, src, dst)
 }
+
+// TestLoadRangeSplitsImport loads a dump in two ranges and checks the result
+// matches a single full import.
+func TestLoadRangeSplitsImport(t *testing.T) {
+	src := buildPrefixRepo(t, "", "repos/rsrc", 5)
+	var buf bytes.Buffer
+	if err := Dump(src, &buf); err != nil {
+		t.Fatal(err)
+	}
+	dst, err := fs.CreateRepo(store.NewMemoryStore(), "repos/rdst", 8, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := LoadRange(dst, bytes.NewReader(buf.Bytes()), 0, 3); err != nil {
+		t.Fatalf("first range: %v", err)
+	}
+	if h, _ := dst.Head(); h != 3 {
+		t.Fatalf("after --to 3 head=%d", h)
+	}
+	if err := LoadRange(dst, bytes.NewReader(buf.Bytes()), 4, 0); err != nil {
+		t.Fatalf("second range: %v", err)
+	}
+	if h, _ := dst.Head(); h != 5 {
+		t.Fatalf("after --from 4 head=%d", h)
+	}
+	assertSameTree(t, src, dst)
+	// A `from` beyond HEAD+1 would silently lose history: refuse it.
+	if err := LoadRange(dst, bytes.NewReader(buf.Bytes()), 9, 0); err == nil {
+		t.Fatal("--from past HEAD+1 was accepted")
+	}
+}

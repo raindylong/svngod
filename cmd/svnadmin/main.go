@@ -15,6 +15,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -23,6 +25,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -54,6 +57,8 @@ type options struct {
 	journalLimit    int
 	verifyWorkers   int
 	textWorkers     int
+	loadFrom        uint64
+	loadTo          uint64
 	rebuildIndex    bool
 	verifyMembers   bool
 	repairVerify    bool
@@ -251,6 +256,8 @@ func main() {
 	}
 	if cmd == "load" {
 		fs.StringVar(&input, "input", "", "read dump from file (default stdin)")
+		fs.Uint64Var(&o.loadFrom, "from", 0, "first revision number to apply (earlier ones must already exist)")
+		fs.Uint64Var(&o.loadTo, "to", 0, "last revision number to apply (0 = all)")
 	}
 	if err := fs.Parse(rest); err != nil {
 		os.Exit(2)
@@ -444,6 +451,8 @@ func doReplicas(o *options, repoName string, verify, repair bool) {
 		writeReplicaMetrics(o.replicaTextfile, repoName, stats, drift)
 	}
 	if drift {
+		fmt.Println("replicas: differences:")
+		reportDriftDiffs(entries, keyPrefix)
 		fmt.Println("replicas: DRIFT")
 		os.Exit(1)
 	}
@@ -506,7 +515,7 @@ func usage() {
 usage:
   svnadmin create [--segments] [s3 flags | --mirror-file FILE] <repo>
   svnadmin dump   [--output FILE] [s3 flags] <repo>
-  svnadmin load   [--input FILE] [s3 flags] <repo>
+  svnadmin load   [--input FILE] [--from N] [--to N] [s3 flags] <repo>  # resumable
   svnadmin verify [--all-revs [--workers N] [--texts] [--repair-index]] [s3 flags] <repo>  # integrity walk
   svnadmin repair [--mirror-file FILE] [--rebuild-index] <repo>  # reconcile mirrors / rebuild segment indexes
   svnadmin delete-repo -force [s3 flags | --mirror-file FILE] <repo>  # delete every object of a repository
@@ -1063,7 +1072,7 @@ func doLoad(o *options, repoName, input string) {
 		defer f.Close()
 		r = f
 	}
-	if err := dump.Load(repo, r); err != nil {
+	if err := dump.LoadRange(repo, r, o.loadFrom, o.loadTo); err != nil {
 		fatal(err)
 	}
 	head, _ := repo.Head()
@@ -1073,4 +1082,115 @@ func doLoad(o *options, repoName, input string) {
 func fatal(err error) {
 	fmt.Fprintf(os.Stderr, "svnadmin: %v\n", err)
 	os.Exit(1)
+}
+
+// reportDriftDiffs lists the concrete objects that differ between members, so
+// an operator can tell which side lost or corrupted one. Segment objects are
+// compared by size (content comparison would download every segment from every
+// member); indexes and revprop-override objects are small and compared by hash.
+func reportDriftDiffs(entries []mirrorEntry, keyPrefix string) {
+	type view struct {
+		label string
+		st    store.Store
+		sizes map[string]int64
+	}
+	var views []view
+	for _, e := range entries {
+		st, err := memberStore(e)
+		if err != nil {
+			continue
+		}
+		v := view{label: e.Endpoint + e.Root, st: st, sizes: map[string]int64{}}
+		for _, p := range []string{keyPrefix + "/segs/", keyPrefix + "/seg-revprops/"} {
+			next := ""
+			for {
+				objs, cont, lerr := st.ListPrefix(context.Background(), p, next, 1000)
+				if lerr != nil {
+					break
+				}
+				for _, o := range objs {
+					v.sizes[o.Key] = o.Size
+				}
+				if cont == "" || cont == next {
+					break
+				}
+				next = cont
+			}
+		}
+		views = append(views, v)
+	}
+	defer func() {
+		for _, v := range views {
+			closeStore(v.st)
+		}
+	}()
+	if len(views) < 2 {
+		return
+	}
+	set := map[string]bool{}
+	for _, v := range views {
+		for k := range v.sizes {
+			set[k] = true
+		}
+	}
+	keys := make([]string, 0, len(set))
+	for k := range set {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	shown := 0
+	for _, k := range keys {
+		var missing []string
+		var sizes []int64
+		for _, v := range views {
+			if sz, ok := v.sizes[k]; ok {
+				sizes = append(sizes, sz)
+			} else {
+				missing = append(missing, v.label)
+			}
+		}
+		if len(missing) > 0 {
+			fmt.Printf("  %s: missing on %s\n", k, strings.Join(missing, ", "))
+		} else {
+			sizeDiff := false
+			for _, sz := range sizes[1:] {
+				if sz != sizes[0] {
+					sizeDiff = true
+				}
+			}
+			if sizeDiff {
+				fmt.Printf("  %s: size differs %v\n", k, sizes)
+			} else if strings.HasSuffix(k, ".idx") || strings.Contains(k, "/seg-revprops/") {
+				var sums []string
+				diff := false
+				for _, v := range views {
+					b, gerr := v.st.Get(context.Background(), k, nil)
+					if gerr != nil {
+						sums = append(sums, "unreadable")
+						diff = true
+						continue
+					}
+					sum := sha256.Sum256(b)
+					sums = append(sums, hex.EncodeToString(sum[:8]))
+				}
+				for _, sm := range sums[1:] {
+					if sm != sums[0] {
+						diff = true
+					}
+				}
+				if diff {
+					fmt.Printf("  %s: content differs %v\n", k, sums)
+				} else {
+					continue
+				}
+			} else {
+				continue
+			}
+		}
+		shown++
+		if shown >= 40 {
+			fmt.Println("  … (further differences omitted)")
+			break
+		}
+	}
 }

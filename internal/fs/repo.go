@@ -1656,6 +1656,12 @@ var verifyTextWorkers atomic.Int64
 
 func init() { verifyTextWorkers.Store(4) }
 
+// verifyReadSlots bounds concurrent text verifications across every worker,
+// range and repository in the process. `--workers` times `--text-workers` is
+// otherwise unbounded, and a weak or shared object store must not be hit by
+// 64 simultaneous GETs because two tuning knobs were raised.
+var verifyReadSlots = make(chan struct{}, 32)
+
 // SetVerifyTextWorkers changes the per-revision text-check concurrency.
 func SetVerifyTextWorkers(n int) {
 	if n < 1 {
@@ -1686,6 +1692,8 @@ func (r *Repo) verifyNodesParallel(rev uint64, rb *RevBlock, seen map[NodeID]boo
 		go func(nid NodeID) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			verifyReadSlots <- struct{}{}
+			defer func() { <-verifyReadSlots }()
 			res := r.verifyNode(rev, nid, true)
 			if len(res) == 0 {
 				return

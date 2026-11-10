@@ -60,6 +60,14 @@ func decodeProps(data []byte) (map[string]string, error) {
 
 // Load reads an svn dump v2 stream and replays it into repo via CommitTxn.
 func Load(repo *fs.Repo, r io.Reader) error {
+	return LoadRange(repo, r, 0, 0)
+}
+
+// LoadRange loads revision numbers in [from,to] (0 = unbounded on that side).
+// Revisions the target already has are skipped, so a range load can continue an
+// interrupted import; `from` must not exceed the target's HEAD+1, otherwise the
+// result would silently miss history.
+func LoadRange(repo *fs.Repo, r io.Reader, from, to uint64) error {
 	// (uuid handling below: adopt the dump's UUID when loading into an empty
 	// repository)
 	br := bufio.NewReader(r)
@@ -83,6 +91,9 @@ func Load(repo *fs.Repo, r io.Reader) error {
 	// and the remaining ones are appended on top of the existing HEAD. Loading
 	// is per-revision atomic, so re-running the same dump continues where it
 	// stopped instead of duplicating history.
+	if from > 0 && from > startHead+1 {
+		return fmt.Errorf("dump: --from %d but repository head is %d (history would be missing)", from, startHead)
+	}
 	lastRev = startHead
 	skipping := false
 
@@ -127,8 +138,11 @@ func Load(repo *fs.Repo, r io.Reader) error {
 			if err := flush(); err != nil {
 				return err
 			}
-			if n, perr := strconv.ParseUint(strings.TrimSpace(rn), 10, 64); perr == nil && n <= startHead {
-				skipping = true
+			if n, perr := strconv.ParseUint(strings.TrimSpace(rn), 10, 64); perr == nil {
+				if to > 0 && n > to {
+					return nil // requested range complete
+				}
+				skipping = n <= startHead || (from > 0 && n < from)
 			} else {
 				skipping = false
 			}
