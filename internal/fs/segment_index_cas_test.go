@@ -36,7 +36,7 @@ func TestSegmentIndexCASMergesConcurrentWriters(t *testing.T) {
 		t.Fatalf("stale CAS err=%v, want conflict", err)
 	}
 	// Retrying through the helper re-reads and merges.
-	if err := r.appendSegmentIndex(ctx, refB); err != nil {
+	if _, err := r.appendSegmentIndex(ctx, refB); err != nil {
 		t.Fatal(err)
 	}
 	refs, err := r.loadSegmentIndex(0)
@@ -58,7 +58,7 @@ func TestAppendRefusesPublishedRange(t *testing.T) {
 	}
 	commitBatches(t, r, 1, 4) // head=4, index 1+4
 	ctx := context.Background()
-	err = r.appendSegmentIndex(ctx, segmentRef{First: 1, Count: 4, SHA256: "deadbeef"})
+	_, err = r.appendSegmentIndex(ctx, segmentRef{First: 1, Count: 4, SHA256: "deadbeef"})
 	if !errors.Is(err, ErrSegmentIndexConflict) {
 		t.Fatalf("err=%v, want conflict", err)
 	}
@@ -94,7 +94,7 @@ func TestAppendReclaimsUnpublishedEntry(t *testing.T) {
 	if err := st.Put(ctx, r.keys.SegmentIndex(0), encodeSegmentIndex(append(refs, orphan))); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.appendSegmentIndex(ctx, segmentRef{First: 5, Count: 2, SHA256: "beef"}); err != nil {
+	if _, err := r.appendSegmentIndex(ctx, segmentRef{First: 5, Count: 2, SHA256: "beef"}); err != nil {
 		t.Fatalf("append over unpublished entry: %v", err)
 	}
 	got, err := r.loadSegmentIndex(0)

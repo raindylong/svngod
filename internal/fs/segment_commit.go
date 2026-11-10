@@ -84,8 +84,9 @@ func (r *Repo) publishSegmentPlans(ctx context.Context, lease *commitLease, cur 
 	// batch) otherwise pays the index round trips twice in sequence.
 	written := make([]segmentRef, len(groups))
 	appendErrs := make([]error, len(groups))
+	refCounts := make([]int, len(groups))
 	if len(groups) == 1 {
-		appendErrs[0] = r.appendSegmentIndex(ctx, groups[0].ref)
+		refCounts[0], appendErrs[0] = r.appendSegmentIndex(ctx, groups[0].ref)
 		written[0] = groups[0].ref
 	} else {
 		var wg sync.WaitGroup
@@ -94,7 +95,7 @@ func (r *Repo) publishSegmentPlans(ctx context.Context, lease *commitLease, cur 
 			wg.Add(1)
 			go func(i int, ref segmentRef) {
 				defer wg.Done()
-				appendErrs[i] = r.appendSegmentIndex(ctx, ref)
+				refCounts[i], appendErrs[i] = r.appendSegmentIndex(ctx, ref)
 			}(i, g.ref)
 		}
 		wg.Wait()
@@ -179,9 +180,15 @@ func (r *Repo) publishSegmentPlans(ctx context.Context, lease *commitLease, cur 
 	// Compact a shard once its last revision is published. The merge runs in
 	// the background: it is O(shard size), and the commit that closed the shard
 	// must not wait for it (a client timeout would cancel it midway).
-	for _, g := range groups {
+	for i, g := range groups {
 		if (g.first+g.count)%r.shardSz == 0 {
-			r.enqueueCompaction(g.shard)
+			r.enqueueCompaction(g.shard, false)
+			continue
+		}
+		// The active shard's index would otherwise grow with every commit and be
+		// rewritten in full each time; merge it when it reaches the threshold.
+		if n := refCounts[i]; n > 0 && n%segmentCompactionThreshold == 0 {
+			r.enqueueCompaction(g.shard, true)
 		}
 	}
 	return revs, errs, nil
@@ -191,7 +198,7 @@ func (r *Repo) publishSegmentPlans(ctx context.Context, lease *commitLease, cur 
 // The worker starts on the first enqueue so v1 repositories spawn no goroutine.
 func (r *Repo) initCompaction() {
 	if r.segments && r.compactQ == nil {
-		r.compactQ = make(chan uint64, 256)
+		r.compactQ = make(chan compactJob, 256)
 	}
 	if r.segments {
 		if r.segMetas == nil {
@@ -203,34 +210,49 @@ func (r *Repo) initCompaction() {
 	}
 }
 
-// enqueueCompaction schedules a completed shard. A full queue drops the shard
-// (compaction is an optimisation, never required for correctness) and the next
-// GC pass or the next shard completion retries it.
-func (r *Repo) enqueueCompaction(sh uint64) {
+// compactJob is one shard queued for merging. partial marks a shard that is
+// still being written to (the active shard): it is merged without waiting for
+// the shard to fill up, which bounds the shard index's size.
+type compactJob struct {
+	shard   uint64
+	partial bool
+}
+
+// segmentCompactionThreshold is the index size that triggers merging the active
+// shard. Without it a busy repository that never reaches the next shard
+// boundary accumulates one index entry per commit and rewrites the whole index
+// on every commit (write amplification quadratic in the number of commits).
+const segmentCompactionThreshold = 64
+
+// enqueueCompaction schedules a shard. A full queue drops the job (compaction is
+// an optimisation, never required for correctness); the next trigger or GC
+// retries it.
+func (r *Repo) enqueueCompaction(sh uint64, partial bool) {
 	if r.compactQ == nil {
 		return
 	}
 	r.compactOnce.Do(func() { go r.compactLoop() })
 	select {
-	case r.compactQ <- sh:
+	case r.compactQ <- compactJob{shard: sh, partial: partial}:
 	default:
 		log.Printf("segment: compaction queue full, shard %d postponed", sh)
 	}
 }
 
 func (r *Repo) compactLoop() {
-	for sh := range r.compactQ {
-		r.runCompaction(sh)
+	for job := range r.compactQ {
+		r.runCompaction(job)
 	}
 }
 
 // runCompaction merges one shard, retrying while another process holds the
 // commit lease.
-func (r *Repo) runCompaction(sh uint64) {
+func (r *Repo) runCompaction(job compactJob) {
+	sh := job.shard
 	backoff := time.Second
 	for attempt := 0; attempt < 6; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		err := r.compactCompletedShard(ctx, sh)
+		err := r.compactShard(ctx, sh, !job.partial)
 		cancel()
 		if err == nil {
 			return
@@ -245,11 +267,10 @@ func (r *Repo) runCompaction(sh uint64) {
 	log.Printf("segment: compact shard %d: commit lease busy, postponed", sh)
 }
 
-// compactCompletedShard merges a shard only after HEAD has passed its end and
-// only under the commit lease: the lease serialises the index read-modify-write
-// with concurrent commits, so a merge can never drop a newly published batch
-// (the old code merged inline for the same reason).
-func (r *Repo) compactCompletedShard(ctx context.Context, sh uint64) error {
+// compactShard merges a shard under the commit lease. requireComplete makes it
+// wait until HEAD passed the shard's end (the normal trigger); a partial shard
+// is merged as it is, which keeps the active shard's index bounded.
+func (r *Repo) compactShard(ctx context.Context, sh uint64, requireComplete bool) error {
 	cur, _, err := r.readCurrentStrict()
 	if err != nil {
 		return err
@@ -257,15 +278,19 @@ func (r *Repo) compactCompletedShard(ctx context.Context, sh uint64) error {
 	// A shard spans revisions sh*shardSz .. (sh+1)*shardSz-1, so it is complete
 	// once HEAD reached its last revision.
 	forShard := (sh+1)*r.shardSz - 1
-	if cur.Head < forShard {
+	if requireComplete && cur.Head < forShard {
 		return nil
+	}
+	if cur.Head < sh*r.shardSz {
+		return nil // the shard has nothing yet
 	}
 	lease, err := r.acquireCommitLease(ctx)
 	if err != nil {
 		return err
 	}
 	defer lease.Release(r.store)
-	if cur, _, cerr := r.readCurrentStrict(); cerr != nil || cur.Head < forShard {
+	if cur, _, cerr := r.readCurrentStrict(); cerr != nil ||
+		(requireComplete && cur.Head < forShard) || cur.Head < sh*r.shardSz {
 		return cerr
 	}
 	r.journalMu.Lock()
@@ -661,24 +686,24 @@ func exactSegment(refs []segmentRef, first uint64) (segmentRef, bool) {
 // broken index would turn a harmless race into unreadable revisions. Entries
 // entirely above HEAD belong to a publish that never happened; the shard is
 // rebuilt from its immutable objects (which drops them) and the append retried.
-func (r *Repo) appendSegmentIndex(ctx context.Context, ref segmentRef) error {
+func (r *Repo) appendSegmentIndex(ctx context.Context, ref segmentRef) (int, error) {
 	sh := r.shard(ref.First)
 	var lastErr error
 	for attempt := 0; attempt < 4; attempt++ {
 		refs, etag, existed, err := r.loadSegmentIndexETag(ctx, sh)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if cur, ok := overlapSegment(refs, ref); ok {
 			if cur == ref {
-				return nil // our own earlier attempt
+				return len(refs), nil // our own earlier attempt
 			}
 			if head, herr := r.HeadFresh(); herr == nil && cur.First > head {
 				if r.rebuildIndexInline(ctx, sh, head) {
 					continue
 				}
 			}
-			return fmt.Errorf("%w: revisions %d+%d overlap %d+%d", ErrSegmentIndexConflict,
+			return 0, fmt.Errorf("%w: revisions %d+%d overlap %d+%d", ErrSegmentIndexConflict,
 				ref.First, ref.Count, cur.First, cur.Count)
 		}
 		newRefs := appendSegmentRef(refs, ref)
@@ -688,7 +713,7 @@ func (r *Repo) appendSegmentIndex(ctx context.Context, ref segmentRef) error {
 					continue
 				}
 			}
-			return fmt.Errorf("%w: shard %d would become non-contiguous", ErrSegmentIndexConflict, sh)
+			return 0, fmt.Errorf("%w: shard %d would become non-contiguous", ErrSegmentIndexConflict, sh)
 		}
 		if err := r.writeSegmentIndexCAS(ctx, sh, newRefs, etag, existed); err != nil {
 			if errors.Is(err, ErrSegmentIndexConflict) {
@@ -696,14 +721,14 @@ func (r *Repo) appendSegmentIndex(ctx context.Context, ref segmentRef) error {
 				time.Sleep(time.Duration(attempt+1) * 20 * time.Millisecond)
 				continue
 			}
-			return err
+			return 0, err
 		}
-		return nil
+		return len(newRefs), nil
 	}
 	if lastErr == nil {
 		lastErr = ErrSegmentIndexConflict
 	}
-	return fmt.Errorf("%w: shard %d", lastErr, sh)
+	return 0, fmt.Errorf("%w: shard %d", lastErr, sh)
 }
 
 // overlapSegment returns an entry whose range intersects ref.
@@ -806,7 +831,7 @@ func (r *Repo) ensureIndexRefs(refs []segmentRef) {
 		if ex, ok := exactSegment(cur, ref.First); ok && ex.SHA256 == ref.SHA256 {
 			continue
 		}
-		if err := r.appendSegmentIndex(ctx, ref); err != nil {
+		if _, err := r.appendSegmentIndex(ctx, ref); err != nil {
 			log.Printf("segment: restore index entry %d+%d: %v", ref.First, ref.Count, err)
 			continue
 		}

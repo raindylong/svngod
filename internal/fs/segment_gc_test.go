@@ -275,3 +275,50 @@ func TestCompactionHonoursSegmentTarget(t *testing.T) {
 		t.Fatalf("second compaction changed the index: %+v", again)
 	}
 }
+
+// TestActiveShardCompactionBoundsIndex: a shard that never fills accumulates one
+// index entry per commit. The background compactor must merge it once the index
+// reaches the threshold, so a busy repository's index does not grow without
+// bound (which made every commit rewrite an ever-larger object).
+func TestActiveShardCompactionBoundsIndex(t *testing.T) {
+	st := store.NewMemoryStore()
+	if _, err := CreateRepoSegments(st, "repos/active", 4096, 64, cdc.DefaultParams(), false, 64); err != nil {
+		t.Fatal(err)
+	}
+	r, err := OpenRepo(st, "repos/active")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 140; i++ {
+		if _, errs, cerr := r.CommitBatch([]BatchCommit{{Changes: []Change{{
+			Path: fmt.Sprintf("/f%03d.txt", i), Action: ActionAdd, Kind: KindFile, Data: []byte("x"),
+		}}}}); cerr != nil || errs[0] != nil {
+			t.Fatalf("commit %d: %v %v", i, cerr, errs)
+		}
+	}
+	// The compactor is asynchronous: wait for it to bring the index down.
+	deadline := time.Now().Add(10 * time.Second)
+	var refs []segmentRef
+	for {
+		refs, err = r.loadSegmentIndex(0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(refs) < segmentCompactionThreshold || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(refs) >= segmentCompactionThreshold {
+		t.Fatalf("active shard index still has %d entries (threshold %d)", len(refs), segmentCompactionThreshold)
+	}
+	for rev := uint64(1); rev <= 140; rev++ {
+		if _, err := r.readBlock(rev); err != nil {
+			t.Fatalf("read %d: %v", rev, err)
+		}
+	}
+	issues, err := r.VerifyRange(1, 140, false)
+	if err != nil || len(issues) != 0 {
+		t.Fatalf("verify: issues=%v err=%v", issues, err)
+	}
+}

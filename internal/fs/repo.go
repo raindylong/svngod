@@ -61,11 +61,11 @@ type Repo struct {
 	segments      bool
 	segmentFrom   uint64
 	segmentTarget uint64
-	// compactQ carries completed shard numbers to the background compactor.
+	// compactQ carries shards to the background compactor.
 	// Merging a full shard costs O(shard size); doing it inline made the commit
 	// that closed the shard wait for the merge, and a client that timed out
 	// cancelled the merge halfway through.
-	compactQ    chan uint64
+	compactQ    chan compactJob
 	compactOnce sync.Once
 	// segMetas caches parsed row tables; segDecoded caches whole decoded
 	// segments for sequential scans. Named separately from cache (which holds
