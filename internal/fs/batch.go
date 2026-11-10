@@ -413,8 +413,11 @@ func (r *Repo) CommitBatch(reqs []BatchCommit) ([]uint64, []error, error) {
 	if len(reqs) == 0 {
 		return revs, errs, nil
 	}
-	if len(reqs) > journalReplayWindow {
-		return revs, errs, fmt.Errorf("fs: batch of %d exceeds the %d-revision replay window", len(reqs), journalReplayWindow)
+	// Replay follows the batch's own Count (it re-reads HEAD each step), so
+	// batches are not limited by journalReplayWindow. Keep only a sanity bound
+	// against a caller building an absurd slice.
+	if len(reqs) > maxCommitBatch {
+		return revs, errs, fmt.Errorf("fs: batch of %d exceeds the %d-revision limit", len(reqs), maxCommitBatch)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -637,3 +640,8 @@ func (r *Repo) readRootLocked(rev uint64) (*tnode, error) {
 	}
 	return r.loadNode(hb.Root)
 }
+
+// maxCommitBatch bounds one CommitBatch call. It is a memory/lease sanity limit,
+// not a replay limit: a crash after the WAL record rolls the whole batch forward
+// whatever its size.
+const maxCommitBatch = 1 << 16

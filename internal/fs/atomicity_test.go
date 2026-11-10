@@ -224,3 +224,52 @@ func testOneFault(t *testing.T, failAt int, hard bool, span int) bool {
 	}
 	return true
 }
+
+// TestLargeBatchReplayBeyondWindow commits a batch larger than the old 256
+// replay window, crashes it at the HEAD CAS (so only the WAL record is durable)
+// and checks that reopening publishes the whole batch.
+func TestLargeBatchReplayBeyondWindow(t *testing.T) {
+	st := &faultStore{Store: store.NewMemoryStore()}
+	r, err := CreateRepoSegments(st, "repos/bigbatch", 4096, 64, cdc.DefaultParams(), false, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One baseline revision so HEAD is non-zero.
+	if _, errs, cerr := r.CommitBatch([]BatchCommit{{Changes: []Change{
+		{Path: "/base", Action: ActionAdd, Kind: KindFile, Data: []byte("b")}}}}); cerr != nil || errs[0] != nil {
+		t.Fatalf("baseline: %v %v", cerr, errs)
+	}
+	reqs := make([]BatchCommit, 300)
+	for i := range reqs {
+		reqs[i] = BatchCommit{Changes: []Change{{
+			Path: fmt.Sprintf("/n%03d", i), Action: ActionAdd, Kind: KindFile, Data: []byte("x"),
+		}}}
+	}
+	st.reset()
+	// Writers: segment, index, journal, current CAS. Fail the CAS so the batch
+	// is durable only in the WAL.
+	st.failAt = 4
+	if _, _, cerr := r.CommitBatch(reqs); cerr == nil {
+		t.Fatal("batch commit succeeded despite the injected CAS failure")
+	}
+	st.heal()
+	_ = st.Delete(context.Background(), []string{r.keys.CommitLock()})
+	r2, err := OpenRepo(st, "repos/bigbatch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := r2.HeadFresh()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head != 301 {
+		t.Fatalf("HEAD=%d after replay, want 301", head)
+	}
+	issues, err := r2.VerifyRangeWith(1, head, false, 4)
+	if err != nil || len(issues) != 0 {
+		t.Fatalf("verify after large-batch replay: issues=%v err=%v", issues, err)
+	}
+	if _, err := r2.Resolve(head, "/n299"); err != nil {
+		t.Fatalf("last revision of the batch unreadable: %v", err)
+	}
+}
