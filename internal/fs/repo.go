@@ -2083,7 +2083,13 @@ func (r *Repo) CollectTxnDataGrace(ctx context.Context, grace time.Duration) (in
 	prefix := r.keys.ListingPrefix("dav-txns")
 	refRe := regexp.MustCompile(`"dataRef":"([0-9a-f]+)"`)
 	referenced := map[string]bool{}
+	activityIDs := map[string]bool{}
 	var dataKeys []store.ListedObj
+	type changeFragment struct {
+		act string
+		obj store.ListedObj
+	}
+	var changeFrags []changeFragment
 	next := ""
 	for {
 		objs, n, err := r.store.ListPrefix(ctx, prefix, next, 500)
@@ -2096,9 +2102,14 @@ func (r *Repo) CollectTxnDataGrace(ctx context.Context, grace time.Duration) (in
 				dataKeys = append(dataKeys, o)
 				continue
 			}
+			if id, ok := changeFragmentID(rel); ok {
+				changeFrags = append(changeFrags, changeFragment{act: id, obj: o})
+				continue
+			}
 			if !strings.HasSuffix(rel, ".json") {
 				continue
 			}
+			activityIDs[strings.TrimSuffix(strings.TrimPrefix(rel, "activity-"), ".json")] = true
 			b, err := r.store.Get(ctx, o.Key, nil)
 			if err != nil {
 				continue
@@ -2121,6 +2132,16 @@ func (r *Repo) CollectTxnDataGrace(ctx context.Context, grace time.Duration) (in
 			}
 			victims = append(victims, k.Key)
 		}
+	}
+	// Staged change fragments whose activity manifest is gone belong to a
+	// commit that finished (or died) and whose background cleanup did not run
+	// to completion (process exit). They are unreachable: a restore needs the
+	// manifest.
+	for _, cf := range changeFrags {
+		if activityIDs[cf.act] || tooYoung(cf.obj, grace) {
+			continue
+		}
+		victims = append(victims, cf.obj.Key)
 	}
 	if len(victims) == 0 {
 		return 0, nil
@@ -2437,4 +2458,18 @@ func (r *Repo) loadRevPropsFresh(rev uint64) (*RevProps, error) {
 		return rp, nil
 	}
 	return nil, errors.New("fs: revision props not found in pack")
+}
+
+// changeFragmentID extracts the activity id from a dav-txns/changes/<id>/<sha>
+// listing key.
+func changeFragmentID(rel string) (string, bool) {
+	rest, ok := strings.CutPrefix(rel, "changes/")
+	if !ok {
+		return "", false
+	}
+	i := strings.IndexByte(rest, '/')
+	if i <= 0 || i == len(rest)-1 {
+		return "", false
+	}
+	return rest[:i], true
 }

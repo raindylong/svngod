@@ -137,3 +137,43 @@ func TestCollectOrphanSegmentsKeepsYoung(t *testing.T) {
 		t.Fatal("young orphan was deleted")
 	}
 }
+
+// TestCollectOrphanChangeFragments reaps staged change fragments whose activity
+// manifest is gone, and keeps those of a live session.
+func TestCollectOrphanChangeFragments(t *testing.T) {
+	st := store.NewMemoryStore()
+	r, err := CreateRepoSegments(st, "repos/frags", 8, 64, cdc.DefaultParams(), false, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	put := func(id, path string) {
+		key := r.keys.Prefix + "/dav-txns/changes/" + id + "/" + path
+		if err := st.Put(ctx, key, []byte(`{"path":"`+path+`"}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A finished session whose manifest is gone (async cleanup or a crash).
+	put("dead", "aaa")
+	put("dead", "bbb")
+	// A live session: manifest present.
+	if err := st.Put(ctx, r.keys.Prefix+"/dav-txns/activity-live.json", []byte(`{"ID":"live","Created":9999999999}`)); err != nil {
+		t.Fatal(err)
+	}
+	put("live", "ccc")
+
+	n, err := r.CollectTxnDataGrace(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("collected %d fragments, want 2", n)
+	}
+	alive := func(k string) bool { ok, _ := st.Exists(ctx, k); return ok }
+	if !alive(r.keys.Prefix + "/dav-txns/changes/live/ccc") {
+		t.Fatal("live session's fragment was deleted")
+	}
+	if alive(r.keys.Prefix + "/dav-txns/changes/dead/aaa") {
+		t.Fatal("orphan fragment survived")
+	}
+}

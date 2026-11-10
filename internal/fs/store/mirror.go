@@ -1200,6 +1200,16 @@ func (m *MirrorStore) DeletePrimary(ctx context.Context, keys []string) error {
 	return nil
 }
 
+// DeletePrefixPrimary drops a prefix on the elected primary only.
+func (m *MirrorStore) DeletePrefixPrimary(ctx context.Context, prefix string) error {
+	p, pi := m.primary()
+	if err := DeletePrefix(ctx, p, prefix); err != nil {
+		m.markDown(pi)
+		return err
+	}
+	return nil
+}
+
 // DeletePrefix drops a whole prefix on the primary and on healthy standbys.
 func (m *MirrorStore) DeletePrefix(ctx context.Context, prefix string) error {
 	p, pi := m.primary()

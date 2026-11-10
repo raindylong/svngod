@@ -63,6 +63,23 @@ func DeletePrefix(ctx context.Context, s Store, prefix string) error {
 	return nil
 }
 
+// PrefixDeleterPrimary drops a prefix on the authoritative replica only. Used
+// for transient state whose standby copies do not matter (a finished commit
+// session's staged fragments): mirroring thousands of deletes competes with the
+// commits that follow and can knock a standby out of service.
+type PrefixDeleterPrimary interface {
+	DeletePrefixPrimary(ctx context.Context, prefix string) error
+}
+
+// DeletePrefixPrimary drops a prefix on the primary when the store can, else
+// everywhere.
+func DeletePrefixPrimary(ctx context.Context, s Store, prefix string) error {
+	if pd, ok := s.(PrefixDeleterPrimary); ok {
+		return pd.DeletePrefixPrimary(ctx, prefix)
+	}
+	return DeletePrefix(ctx, s, prefix)
+}
+
 // AllWriter is implemented by stores that can write one object to every
 // healthy replica and require all of them (used for revision properties,
 // which are mutable and must not diverge between processes).

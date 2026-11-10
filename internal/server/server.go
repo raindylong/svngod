@@ -189,7 +189,8 @@ type Server struct {
 	repoMapMu   sync.Mutex
 	repos       atomic.Pointer[repoSet] // current per-repo overrides (hot-swappable)
 	repoCache   map[string]*fs.Repo     // per-name repo singletons (shared r.mu)
-	uploads     chan struct{}       // nil when uploads are unlimited
+	txnCleanup  chan txnCleanupItem     // background fragment cleanup
+	uploads     chan struct{}           // nil when uploads are unlimited
 	upMu        sync.Mutex
 	userUploads map[string]int
 	m           *metrics
@@ -208,7 +209,9 @@ func New(cfg Config) *Server {
 		repoCache:   map[string]*fs.Repo{},
 		userUploads: map[string]int{},
 		m:           newMetrics(cfg.MaxConcurrentUploads),
+		txnCleanup:  make(chan txnCleanupItem, 1024),
 	}
+	go s.txnCleanupLoop()
 	if cfg.MaxConcurrentUploads > 0 {
 		s.uploads = make(chan struct{}, cfg.MaxConcurrentUploads)
 	}

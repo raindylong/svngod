@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"svngod/internal/fs"
@@ -84,14 +85,18 @@ func activityDataKey(repo *fs.Repo, ref string) string {
 	return repo.Keys().Prefix + "/dav-txns/data/" + ref
 }
 
-// activityChangesPrefix holds one fragment object per pending path.
+// activityChangesPrefix is the listing prefix of one transaction's change
+// fragments. It uses the listing form (no leading slash for scoped stores) so
+// the keys it returns can be compared and re-read directly.
 func activityChangesPrefix(repo *fs.Repo, id string) string {
-	return repo.Keys().Prefix + "/dav-txns/changes/" + id + "/"
+	return repo.Keys().ListingPrefix("dav-txns", "changes", id)
 }
 
+// activityChangeKey is the object key of one change fragment (the store adds
+// its own repository prefix).
 func activityChangeKey(repo *fs.Repo, id, path string) string {
 	sum := sha1.Sum([]byte(path))
-	return activityChangesPrefix(repo, id) + hex.EncodeToString(sum[:])
+	return repo.Keys().Prefix + "/dav-txns/changes/" + id + "/" + hex.EncodeToString(sum[:])
 }
 
 // fragmentInlineCap is the largest body embedded in a change fragment.
@@ -355,11 +360,42 @@ func (s *Server) dropActivityState(repo *fs.Repo, actID string) {
 		return
 	}
 	ctx := context.Background()
-	if err := store.DeletePrefix(ctx, repo.Store(), activityChangesPrefix(repo, actID)); err != nil {
-		log.Printf("txn: drop changes %s: %v", actID, err)
-	}
+	// Remove the manifest first: once it is gone no process can resurrect the
+	// transaction. The per-change fragments are garbage from that point on and
+	// are reclaimed in the background -- one object per staged file, and paying
+	// ~150ms per delete on the client's critical path made a 500-file commit
+	// wait tens of seconds after its revision was already durable.
 	if err := repo.Store().Delete(ctx, []string{activityStateKey(repo, actID)}); err != nil {
 		log.Printf("txn: drop %s: %v", actID, err)
+	}
+	item := txnCleanupItem{repo: repo, actID: actID}
+	select {
+	case s.txnCleanup <- item:
+	default:
+		s.cleanTxnFragments(item)
+	}
+}
+
+// txnCleanupItem is one transaction whose staged fragments are being reclaimed.
+type txnCleanupItem struct {
+	repo  *fs.Repo
+	actID string
+}
+
+// cleanTxnFragments deletes the staged changes of a finished transaction on the
+// authoritative replica. Standby copies are harmless (no manifest points at
+// them) and are left to the repair/GC passes.
+func (s *Server) cleanTxnFragments(it txnCleanupItem) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	if err := store.DeletePrefixPrimary(ctx, it.repo.Store(), activityChangesPrefix(it.repo, it.actID)); err != nil {
+		log.Printf("txn: drop changes %s: %v", it.actID, err)
+	}
+}
+
+func (s *Server) txnCleanupLoop() {
+	for it := range s.txnCleanup {
+		s.cleanTxnFragments(it)
 	}
 }
 
@@ -467,10 +503,16 @@ func (s *Server) loadTxnChanges(repo *fs.Repo, repoName, txid string) {
 	tx.changesLoaded = true
 }
 
+// fragmentParallelism bounds concurrent fragment reads while a commit is
+// assembled. A 30k-file commit used to fetch its changes one round trip at a
+// time, which on object storage is tens of minutes; the fragments are
+// independent immutable objects, so they are read in parallel.
+const fragmentParallelism = 32
+
 // loadChangeFragments reads every persisted change of one activity.
 func loadChangeFragments(ctx context.Context, repo *fs.Repo, actID string) []persistedChange {
 	prefix := activityChangesPrefix(repo, actID)
-	var out []persistedChange
+	var keys []string
 	next := ""
 	for {
 		objs, n, err := repo.Store().ListPrefix(ctx, prefix, next, 500)
@@ -479,25 +521,46 @@ func loadChangeFragments(ctx context.Context, repo *fs.Repo, actID string) []per
 			break
 		}
 		for _, o := range objs {
-			data, err := repo.Store().Get(ctx, o.Key, nil)
-			if err != nil {
-				if err != store.ErrNotFound {
-					log.Printf("txn: read change %s: %v", o.Key, err)
-				}
-				continue
-			}
-			var pc persistedChange
-			if err := json.Unmarshal(data, &pc); err != nil || pc.Path == "" {
-				continue
-			}
-			out = append(out, pc)
+			keys = append(keys, o.Key)
 		}
 		if n == "" || n == next {
 			break
 		}
 		next = n
 	}
-	return out
+	out := make([]persistedChange, len(keys))
+	ok := make([]bool, len(keys))
+	sem := make(chan struct{}, fragmentParallelism)
+	var wg sync.WaitGroup
+	for i, key := range keys {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, key string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			data, err := repo.Store().Get(ctx, key, nil)
+			if err != nil {
+				if err != store.ErrNotFound {
+					log.Printf("txn: read change %s: %v", key, err)
+				}
+				return
+			}
+			var pc persistedChange
+			if err := json.Unmarshal(data, &pc); err != nil || pc.Path == "" {
+				return
+			}
+			out[i] = pc
+			ok[i] = true
+		}(i, key)
+	}
+	wg.Wait()
+	frags := out[:0]
+	for i := range out {
+		if ok[i] {
+			frags = append(frags, out[i])
+		}
+	}
+	return frags
 }
 
 // ensureActivitiesLoaded restores persisted commit sessions for a repository.
@@ -511,7 +574,7 @@ func (s *Server) ensureActivitiesLoaded(repoName string, repo *fs.Repo) {
 	s.mu.Unlock()
 
 	ctx := context.Background()
-	prefix := repo.Keys().Prefix + "/dav-txns/"
+	prefix := repo.Keys().ListingPrefix("dav-txns")
 	next := ""
 	var manifests []persistedActivity
 	for {
@@ -521,10 +584,11 @@ func (s *Server) ensureActivitiesLoaded(repoName string, repo *fs.Repo) {
 			break
 		}
 		for _, o := range objs {
-			if strings.Contains(o.Key, "/dav-txns/changes/") {
+			rel := strings.TrimPrefix(o.Key, prefix)
+			if strings.HasPrefix(rel, "changes/") || strings.HasPrefix(rel, "data/") {
 				continue
 			}
-			if len(o.Key) < len("activity-") || o.Key[len(o.Key)-5:] != ".json" {
+			if !strings.HasPrefix(rel, "activity-") || !strings.HasSuffix(rel, ".json") {
 				continue
 			}
 			data, err := repo.Store().Get(ctx, o.Key, nil)
