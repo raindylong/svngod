@@ -105,3 +105,35 @@ func TestCollectOrphanSegments(t *testing.T) {
 		t.Fatalf("read after sweep: %v", err)
 	}
 }
+
+// TestCollectOrphanSegmentsKeepsYoung checks the age filter: an unreferenced
+// object written moments ago is left alone (it may belong to a compaction that
+// is between writing the merged segment and swapping the index).
+func TestCollectOrphanSegmentsKeepsYoung(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.NewFileStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := CreateRepoSegments(st, "repos/young", 8, 64, cdc.DefaultParams(), false, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, errs, err := r.CommitBatch(batchAdds("/keep")); err != nil || errs[0] != nil {
+		t.Fatalf("commit: %v %v", err, errs)
+	}
+	orphan := r.keys.Segment(0, 1, 999)
+	if err := st.Put(context.Background(), orphan, []byte("fresh")); err != nil {
+		t.Fatal(err)
+	}
+	n, err := r.CollectOrphanSegments(context.Background(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("deleted %d young objects, want 0", n)
+	}
+	if ok, _ := st.Exists(context.Background(), orphan); !ok {
+		t.Fatal("young orphan was deleted")
+	}
+}

@@ -76,18 +76,39 @@ func (r *Repo) publishSegmentPlans(ctx context.Context, lease *commitLease, cur 
 			key: r.segmentKeyFor(g.first, g.count), sha: g.sha,
 		})
 	}
-	var written []segmentRef
-	for _, g := range groups {
-		if err := r.appendSegmentIndex(ctx, g.ref); err != nil {
-			for _, ref := range written {
+	// One group per shard, so their index updates touch different objects and
+	// can run concurrently. A commit that crosses a shard boundary (large
+	// batch) otherwise pays the index round trips twice in sequence.
+	written := make([]segmentRef, len(groups))
+	appendErrs := make([]error, len(groups))
+	if len(groups) == 1 {
+		appendErrs[0] = r.appendSegmentIndex(ctx, groups[0].ref)
+		written[0] = groups[0].ref
+	} else {
+		var wg sync.WaitGroup
+		for i, g := range groups {
+			written[i] = g.ref
+			wg.Add(1)
+			go func(i int, ref segmentRef) {
+				defer wg.Done()
+				appendErrs[i] = r.appendSegmentIndex(ctx, ref)
+			}(i, g.ref)
+		}
+		wg.Wait()
+	}
+	for _, aerr := range appendErrs {
+		if aerr == nil {
+			continue
+		}
+		for i, ref := range written {
+			if appendErrs[i] == nil {
 				r.rollbackSegmentIndex(ctx, ref)
 			}
-			for _, p := range plans {
-				errs[p.idx] = err
-			}
-			return revs, errs, err
 		}
-		written = append(written, g.ref)
+		for _, p := range plans {
+			errs[p.idx] = aerr
+		}
+		return revs, errs, aerr
 	}
 	if err := r.writeSegmentJournals(ctx, lease, created, journals); err != nil {
 		for _, ref := range written {

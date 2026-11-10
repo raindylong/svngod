@@ -2080,7 +2080,7 @@ func (r *Repo) CollectTxnData(ctx context.Context) (int, error) {
 // body is written before the manifest that references it is updated, so a GC
 // pass racing a native commit could otherwise delete a live body.
 func (r *Repo) CollectTxnDataGrace(ctx context.Context, grace time.Duration) (int, error) {
-	prefix := r.keys.Prefix + "/dav-txns/"
+	prefix := r.keys.ListingPrefix("dav-txns")
 	refRe := regexp.MustCompile(`"dataRef":"([0-9a-f]+)"`)
 	referenced := map[string]bool{}
 	var dataKeys []store.ListedObj
@@ -2195,7 +2195,7 @@ func (r *Repo) CollectTextsGrace(ctx context.Context, grace time.Duration) (int,
 			}
 		}
 	}
-	prefix := r.keys.Prefix + "/texts/"
+	prefix := r.keys.ListingPrefix("texts")
 	next := ""
 	var victims []string
 	for {
@@ -2217,7 +2217,7 @@ func (r *Repo) CollectTextsGrace(ctx context.Context, grace time.Duration) (int,
 		}
 		next = n
 	}
-	chunkPrefix := r.keys.Prefix + "/chunks/"
+	chunkPrefix := r.keys.ListingPrefix("chunks")
 	next = ""
 	for {
 		objs, n, err := r.store.ListPrefix(ctx, chunkPrefix, next, 500)
@@ -2239,7 +2239,7 @@ func (r *Repo) CollectTextsGrace(ctx context.Context, grace time.Duration) (int,
 		next = n
 	}
 	if dirScanOK {
-		dirPrefix := r.keys.Prefix + "/dirs/"
+		dirPrefix := r.keys.ListingPrefix("dirs")
 		next = ""
 		for {
 			objs, n, err := r.store.ListPrefix(ctx, dirPrefix, next, 500)

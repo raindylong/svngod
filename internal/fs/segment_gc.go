@@ -3,15 +3,16 @@ package fs
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 )
 
 // segmentOrphanAge is the minimum age of an unreferenced segment object before
-// GC deletes it. Compaction writes the merged object before it swaps the index,
-// so a copy that is still unreferenced after this long belongs to a compaction
-// that died (a live one swaps within seconds).
-const segmentOrphanAge = 30 * time.Minute
+// GC considers deleting it. The delete phase runs under the commit lease, which
+// is what actually guarantees that no compaction is mid-flight; the age filter
+// only avoids churning objects this pass just listed.
+const segmentOrphanAge = time.Minute
 
 // CompactSegments merges every shard whose index holds more than one segment.
 // Shard-completion compaction only fires when a shard fills, so a repository
@@ -69,6 +70,43 @@ func (r *Repo) CollectOrphanSegments(ctx context.Context, grace time.Duration) (
 	if err != nil {
 		return 0, err
 	}
+	// List candidates without holding any lock: a listing can take a while on a
+	// large repository and must not block commits.
+	prefix := r.keys.ListingPrefix("segs")
+	var candidates []string
+	next := ""
+	for {
+		objs, cont, err := r.store.ListPrefix(ctx, prefix, next, 1000)
+		if err != nil {
+			return 0, err
+		}
+		for _, o := range objs {
+			if !strings.HasSuffix(o.Key, ".seg") {
+				continue
+			}
+			if o.ModTime.IsZero() || time.Since(o.ModTime) < grace {
+				continue
+			}
+			candidates = append(candidates, normalizeListKey(o.Key))
+		}
+		if cont == "" || cont == next {
+			break
+		}
+		next = cont
+	}
+	if len(candidates) == 0 {
+		return 0, nil
+	}
+	// Deletion must not race a live compaction: it writes the merged object
+	// before swapping the index, so an object can be unreferenced yet about to
+	// become the published copy. Holding the commit lease excludes exactly that
+	// window; the index set is re-read while it is held.
+	lease, err := r.acquireCommitLease(ctx)
+	if err != nil {
+		log.Printf("segment: orphan sweep skipped, commit lease busy: %v", err)
+		return 0, nil
+	}
+	defer lease.Release(r.store)
 	keep := map[string]bool{}
 	for sh := uint64(0); sh <= r.shard(head); sh++ {
 		refs, err := r.loadSegmentIndex(sh)
@@ -76,37 +114,29 @@ func (r *Repo) CollectOrphanSegments(ctx context.Context, grace time.Duration) (
 			return 0, err
 		}
 		for _, ref := range refs {
-			keep[r.segmentKeyFor(ref.First, ref.Count)] = true
+			keep[normalizeListKey(r.segmentKeyFor(ref.First, ref.Count))] = true
 		}
 	}
-	prefix := r.keys.Prefix + "/segs/"
 	deleted := 0
-	next := ""
-	for {
-		objs, cont, err := r.store.ListPrefix(ctx, prefix, next, 1000)
-		if err != nil {
+	for start := 0; start < len(candidates); start += 500 {
+		end := start + 500
+		if end > len(candidates) {
+			end = len(candidates)
+		}
+		batch := candidates[start:end]
+		victims := make([]string, 0, len(batch))
+		for _, k := range batch {
+			if !keep[k] {
+				victims = append(victims, k)
+			}
+		}
+		if len(victims) == 0 {
+			continue
+		}
+		if err := r.store.Delete(ctx, victims); err != nil {
 			return deleted, err
 		}
-		victims := make([]string, 0, len(objs))
-		for _, o := range objs {
-			if !strings.HasSuffix(o.Key, ".seg") || keep[o.Key] {
-				continue
-			}
-			if o.ModTime.IsZero() || time.Since(o.ModTime) < grace {
-				continue
-			}
-			victims = append(victims, o.Key)
-		}
-		if len(victims) > 0 {
-			if err := r.store.Delete(ctx, victims); err != nil {
-				return deleted, err
-			}
-			deleted += len(victims)
-		}
-		if cont == "" || cont == next {
-			break
-		}
-		next = cont
+		deleted += len(victims)
 	}
 	return deleted, nil
 }
@@ -150,3 +180,8 @@ func (r *Repo) verifySegmentIndexes(head uint64) ([]VerifyIssue, error) {
 	}
 	return issues, nil
 }
+
+// normalizeListKey puts a key in the form Store.ListPrefix returns (relative to
+// the store prefix, no leading slash), so references and listed objects compare
+// equal for scoped stores whose repository prefix is empty.
+func normalizeListKey(k string) string { return strings.TrimPrefix(k, "/") }

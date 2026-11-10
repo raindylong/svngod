@@ -692,7 +692,10 @@ func doGC(o *options, repoName string) {
 			fatal(err)
 		}
 	}
-	orphans, err := repo.CollectOrphanSegments(context.Background(), time.Duration(o.gcGrace)*time.Second)
+	// The segment sweep takes the commit lease while it deletes, so a short age
+	// filter is safe and lets one gc run clear the superseded segments that its
+	// own compaction just left behind.
+	orphans, err := repo.CollectOrphanSegments(context.Background(), time.Minute)
 	if err != nil {
 		fatal(err)
 	}

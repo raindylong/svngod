@@ -1,6 +1,9 @@
 package store
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // Keys builds object keys for a single repository. All keys are rooted under
 // a repo prefix. Numeric parts are zero-padded so ListPrefix enumeration is
@@ -46,6 +49,14 @@ func (k *Keys) PackedRevProps(shard uint64) string { return k.p("revprops", padS
 // Segment names a batched revision segment (format v2).
 func (k *Keys) Segment(shard, first, count uint64) string {
 	return k.p("segs", padShard(shard), fmt.Sprintf("%012d-%012d.seg", first, count))
+}
+
+// Dir returns a listing prefix for the given key parts. Listing returns keys
+// relative to the store prefix (no leading slash), while Keys methods keep the
+// leading slash of an empty repository prefix, so GC must compare both sides in
+// this form or it will treat every live object as unreferenced.
+func (k *Keys) ListingPrefix(parts ...string) string {
+	return strings.TrimPrefix(k.p(parts...), "/") + "/"
 }
 
 // SegmentDir is the listing prefix of one shard's segment objects.
