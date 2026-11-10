@@ -41,20 +41,31 @@ var journalCRC = crc32.MakeTable(crc32.Castagnoli)
 type CommitRecord struct {
 	Version int    `json:"v"`
 	Rev     uint64 `json:"rev"`
-	// Version 2 (segment format) describes a whole batch:
-	First      uint64 `json:"first,omitempty"`
-	Count      uint64 `json:"count,omitempty"`
+	// Version 2 (segment format) describes a whole batch. Groups lists every
+	// shard segment the batch wrote; replay publishes all of them or none, so a
+	// batch that crosses a shard boundary cannot be replayed halfway.
+	First       uint64        `json:"first,omitempty"`
+	Count       uint64        `json:"count,omitempty"`
+	SegmentKey  string        `json:"segment_key,omitempty"`
+	SegmentSHA  string        `json:"segment_sha256,omitempty"`
+	Groups      []CommitGroup `json:"groups,omitempty"`
+	Parent      uint64        `json:"parent"`
+	Lease       string        `json:"lease,omitempty"`
+	Created     int64         `json:"created"`
+	RevBlockKey string        `json:"revblock"`
+	RevBlockSHA string        `json:"revblock_sha256"`
+	PropsKey    string        `json:"props"`
+	Author      string        `json:"author,omitempty"`
+	Log         string        `json:"log,omitempty"`
+	Quorum      int           `json:"quorum"`
+}
+
+// CommitGroup is one shard's slice of a segmented commit batch.
+type CommitGroup struct {
+	First      uint64 `json:"first"`
+	Count      uint64 `json:"count"`
 	SegmentKey string `json:"segment_key,omitempty"`
-	SegmentSHA string `json:"segment_sha256,omitempty"`
-	Parent      uint64 `json:"parent"`
-	Lease       string `json:"lease,omitempty"`
-	Created     int64  `json:"created"`
-	RevBlockKey string `json:"revblock"`
-	RevBlockSHA string `json:"revblock_sha256"`
-	PropsKey    string `json:"props"`
-	Author      string `json:"author,omitempty"`
-	Log         string `json:"log,omitempty"`
-	Quorum      int    `json:"quorum"`
+	SegmentSHA string `json:"segment_sha256"`
 }
 
 // EncodeCommitRecord frames a record: 8-byte magic, big-endian length, CRC32C
@@ -217,24 +228,56 @@ func (r *Repo) replayJournal() {
 			if rec.First != rev || rec.Count == 0 {
 				break
 			}
-			segKey := r.keys.Segment(r.shard(rec.First), rec.First, rec.Count)
-			seg, _, serr := read(segKey)
-			if serr != nil {
-				break
+			groups := rec.Groups
+			if len(groups) == 0 {
+				// Records written before groups were introduced describe exactly
+				// one shard segment.
+				groups = []CommitGroup{{First: rec.First, Count: rec.Count, SegmentSHA: rec.SegmentSHA}}
 			}
-			sum := sha256.Sum256(seg)
-			if hex.EncodeToString(sum[:]) != rec.SegmentSHA {
-				break
+			// The whole batch must be contiguous and complete before anything is
+			// published: replaying one shard of a two-shard batch would expose a
+			// partially applied commit.
+			want := rec.First
+			for _, g := range groups {
+				if g.Count == 0 || g.First != want {
+					return
+				}
+				want += g.Count
 			}
-			refs, ierr := r.loadSegmentIndex(r.shard(rec.First))
-			if ierr != nil {
-				break
+			if want != rec.First+rec.Count {
+				return
 			}
-			if !segmentIndexHas(refs, rec) {
-				refs = appendSegmentRef(refs, segmentRef{First: rec.First, Count: rec.Count,
-					SHA256: rec.SegmentSHA})
-				if perr := r.store.Put(ctx, r.keys.SegmentIndex(r.shard(rec.First)), encodeSegmentIndex(refs)); perr != nil {
-					break
+			type pendingGroup struct {
+				shard uint64
+				ref   segmentRef
+			}
+			pend := make([]pendingGroup, 0, len(groups))
+			for _, g := range groups {
+				segKey := r.keys.Segment(r.shard(g.First), g.First, g.Count)
+				seg, _, serr := read(segKey)
+				if serr != nil {
+					return
+				}
+				sum := sha256.Sum256(seg)
+				if hex.EncodeToString(sum[:]) != g.SegmentSHA {
+					return
+				}
+				pend = append(pend, pendingGroup{shard: r.shard(g.First),
+					ref: segmentRef{First: g.First, Count: g.Count, SHA256: g.SegmentSHA}})
+			}
+			// All segments exist: make every shard index name its segment, then
+			// publish the batch with one CAS.
+			for _, pg := range pend {
+				refs, ierr := r.loadSegmentIndex(pg.shard)
+				if ierr != nil {
+					return
+				}
+				if segmentIndexHasRef(refs, pg.ref) {
+					continue
+				}
+				refs = appendSegmentRef(refs, pg.ref)
+				if perr := r.store.Put(ctx, r.keys.SegmentIndex(pg.shard), encodeSegmentIndex(refs)); perr != nil {
+					return
 				}
 			}
 			cur, etag, cerr := r.readCurrent()
@@ -248,7 +291,8 @@ func (r *Repo) replayJournal() {
 			}
 			r.setHead(last)
 			r.cache.Clear()
-			log.Printf("journal: rolled forward revisions %d..%d (segment, head was %d)", rec.First, last, head)
+			log.Printf("journal: rolled forward revisions %d..%d (segment, %d group(s), head was %d)",
+				rec.First, last, len(groups), head)
 			head = last
 			rev = head + 1
 			continue
@@ -284,6 +328,16 @@ func (r *Repo) replayJournal() {
 func segmentIndexHas(refs []segmentRef, rec *CommitRecord) bool {
 	for _, ref := range refs {
 		if ref.First == rec.First && ref.Count == rec.Count && ref.SHA256 == rec.SegmentSHA {
+			return true
+		}
+	}
+	return false
+}
+
+// segmentIndexHasRef reports whether the index contains this exact segment.
+func segmentIndexHasRef(refs []segmentRef, want segmentRef) bool {
+	for _, ref := range refs {
+		if ref == want {
 			return true
 		}
 	}

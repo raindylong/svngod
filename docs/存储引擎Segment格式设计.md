@@ -94,7 +94,7 @@ S3（RustFS）实测 50 修订、19,408 字节的段：随机读一条修订传�
 3. 按分片边界把批拆成 1..n 组；每组：
    - `encodeSegment(first,count,parent)` → Put `segs/<shard>/<first>-<count>.seg`；记录 SHA-256。
 4. 更新每组的分片索引：读取当前索引（租约内最新）→ 追加条目 → **CAS 写回**（规则见 §3.1）。
-5. 为每组写一条 WAL：`journal/<first>`，`CommitRecord{Version:2, First, Count, Parent, Lease, SegmentKey, SegmentSHA, Created}`。
+5. 为**整批写一条** WAL：`journal/<批首修订>`，`CommitRecord{Version:2, First, Count, Parent, Lease, Created, Groups:[{First, Count, SegmentKey, SegmentSHA}...]}`。一条记录描述全部组分片段，回放因此是“全有或全无”——按组各写一条时，崩溃在两条记录之间会让回放发布半个批次（2026-11 故障注入发现并修复）。
 6. 一次 CAS `current` 到 `lastRev`（整批原子可见）。
 7. 分片完成（`lastRev+1` 是分片边界）或条目数超过阈值时，执行 compaction（见 §5）。
 
@@ -180,8 +180,9 @@ seg-revprops/<shard>.idx     该分片有覆盖的修订号列表（有序 JSON�
 
 ## 6. 批量 WAL 与回放
 
-- 每批一条记录（而不是每修订一条），键为 `journal/<first>`；
-- 回放以 HEAD+1 为起点，连续读取；记录 v2 → 校验 segment 存在且 SHA 匹配 → 确保索引含该条目 → CAS 前滚；
+- 每批一条记录（而不是每修订一条），键为 `journal/<批首修订>`；记录里 `Groups` 列出该批写出的每个分片段；
+- 回放以 HEAD+1 为起点，连续读取；记录 v2 → 先校验**所有组**：区间连续、每个 segment 存在且 SHA 匹配；全部通过后才补齐各分片索引并一次 CAS 到批末，任一缺失则整批不发布；
+- 旧格式（无 `Groups` 的单组记录）按单组处理，升级不需要迁移；
 - `TrimJournal` 在 v2 下按索引中的 segment 起点删除整批记录（精确键，不 list）；
 - 保留窗口按“批数”而非修订数配置（默认 4096 批 ≈ 26 万修订 @K=64）。
 
@@ -237,6 +238,15 @@ seg-revprops/<shard>.idx     该分片有覆盖的修订号列表（有序 JSON�
 - S3 上每条 PUT 约 5–25ms，v1 每修订 2 次以上 PUT（block/props + journal/HEAD）成为吞吐上限；v2 每 64 修订只写 1 段 + 1 索引 + 1 批 WAL，再叠加一次 HEAD CAS，对象数下降 3 个数量级。
 - **过程中发现并修复（关键）**：`segmentRef`/`CommitRecord` 早期保存的是绝对对象键，在 scoped store（`svnadmin --endpoint`，内部 `RepoPrefix=<prefix>` + `BaseRepo=<repo>`）下该键会被二次加前缀，读回 404；现索引与 WAL 只记录 `First/Count/SHA256`，读取时用 `r.keys.Segment(r.shard(first), first, count)` 派生，与运行期前缀完全一致。修复后重新灌入 200k 修订并通过全量 verify。
 - 相对键同时消除了「同一仓库在不同前缀/不同实例下迁移后可读」的隐患：键由仓库内位置推导，不含部署路径。
+
+### 11.2 写故障注入（原子性回归）
+
+`internal/fs/atomicity_test.go` 在提交发布路径的每一个写点注入失败，分两种模型：
+
+- **soft**：该次写失败，进程继续（回滚路径可执行）；
+- **hard**：失败后所有后续写都失败（模拟进程死亡，回滚也执行不了）。
+
+覆盖单分片（2 修订）与跨分片（10 修订，2 组）两种批次。每次故障后重新打开仓库（触发 WAL 回放），断言：HEAD 只能是旧值或“旧值+整批长度”（绝不出现部分发布）；HEAD 之下全部可读且 `verify` 干净；随后一次正常提交恰好落在 HEAD+1（证明没有残留条目阻塞）。
 
 ## 10. 风险与取舍
 

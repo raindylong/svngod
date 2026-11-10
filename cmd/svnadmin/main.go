@@ -724,8 +724,18 @@ func doJournal(o *options, repoName string) {
 		return
 	}
 	for _, rec := range recs {
-		fmt.Printf("rev %d parent %d quorum %d lease %s created %d sha %s log %q\n",
-			rec.Rev, rec.Parent, rec.Quorum, rec.Lease, rec.Created, rec.RevBlockSHA[:12], rec.Log)
+		// A version-2 record carries the segment digest (and, for a batch that
+		// crossed a shard boundary, one entry per group); version 1 carried the
+		// rev-block digest.
+		sum := rec.SegmentSHA
+		if sum == "" {
+			sum = rec.RevBlockSHA
+		}
+		if len(sum) > 12 {
+			sum = sum[:12]
+		}
+		fmt.Printf("rev %d parent %d quorum %d lease %s created %d sha %s groups %d log %q\n",
+			rec.Rev, rec.Parent, rec.Quorum, rec.Lease, rec.Created, sum, len(rec.Groups), rec.Log)
 	}
 }
 

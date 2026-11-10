@@ -76,6 +76,8 @@ func (r *Repo) publishSegmentPlans(ctx context.Context, lease *commitLease, cur 
 			key: r.segmentKeyFor(g.first, g.count), sha: g.sha,
 		})
 	}
+	batchFirst := plans[0].rev
+	batchCount := plans[len(plans)-1].rev - batchFirst + 1
 	// One group per shard, so their index updates touch different objects and
 	// can run concurrently. A commit that crosses a shard boundary (large
 	// batch) otherwise pays the index round trips twice in sequence.
@@ -110,7 +112,7 @@ func (r *Repo) publishSegmentPlans(ctx context.Context, lease *commitLease, cur 
 		}
 		return revs, errs, aerr
 	}
-	if err := r.writeSegmentJournals(ctx, lease, created, journals); err != nil {
+	if err := r.writeSegmentJournalBatch(ctx, batchFirst, batchCount, journals, lease.token, cur.Head, created); err != nil {
 		for _, ref := range written {
 			r.rollbackSegmentIndex(ctx, ref)
 		}
@@ -764,21 +766,28 @@ func (r *Repo) ensureIndexRefs(refs []segmentRef) {
 	}
 }
 
-// writeSegmentJournals writes every prepared WAL record concurrently. Each is
-// an immutable unique key; all must be durable before the HEAD CAS.
-func (r *Repo) writeSegmentJournals(ctx context.Context, lease *commitLease, created int64, journals []segmentJournalWrite) error {
-	var wg sync.WaitGroup
-	errCh := make(chan error, len(journals))
-	for _, j := range journals {
-		wg.Add(1)
-		go func(j segmentJournalWrite) {
-			defer wg.Done()
-			if err := r.writeSegmentJournal(ctx, j.first, j.count, j.parent, lease.token, created, j.key, j.sha); err != nil {
-				errCh <- err
-			}
-		}(j)
+// writeSegmentJournalBatch appends one WAL record describing every shard
+// segment of the batch. A per-group record would let replay publish one shard
+// of a two-shard batch after a crash, exposing a partially applied commit; one
+// record makes the batch all-or-nothing.
+func (r *Repo) writeSegmentJournalBatch(ctx context.Context, first, count uint64,
+	groups []segmentJournalWrite, leaseToken string, parent uint64, created int64) error {
+	if !r.journal || len(groups) == 0 {
+		return nil
 	}
-	wg.Wait()
-	close(errCh)
-	return <-errCh
+	rec := &CommitRecord{
+		Version: 2, Rev: first, First: first, Count: count,
+		Parent: parent, Lease: leaseToken, Created: created,
+		SegmentKey: groups[0].key, SegmentSHA: groups[0].sha,
+		Quorum: r.writeQuorum,
+	}
+	for _, g := range groups {
+		rec.Groups = append(rec.Groups, CommitGroup{
+			First: g.first, Count: g.count, SegmentKey: g.key, SegmentSHA: g.sha,
+		})
+	}
+	if err := r.store.Put(ctx, r.keys.Journal(first), EncodeCommitRecord(rec)); err != nil {
+		return fmt.Errorf("journal: %w", err)
+	}
+	return nil
 }
