@@ -520,7 +520,7 @@ func (r *Repo) compactSegmentShardOnce(ctx context.Context, sh uint64) error {
 	go func() {
 		time.Sleep(60 * time.Second)
 		for _, k := range old {
-			_ = r.store.Delete(context.Background(), []string{k})
+			_ = r.deletePrimaryOrAll(context.Background(), []string{k})
 		}
 	}()
 	return nil

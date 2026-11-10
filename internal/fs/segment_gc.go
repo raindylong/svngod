@@ -2,6 +2,8 @@ package fs
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"strings"
@@ -133,7 +135,7 @@ func (r *Repo) CollectOrphanSegments(ctx context.Context, grace time.Duration) (
 		if len(victims) == 0 {
 			continue
 		}
-		if err := r.store.Delete(ctx, victims); err != nil {
+		if err := r.deletePrimaryOrAll(ctx, victims); err != nil {
 			return deleted, err
 		}
 		deleted += len(victims)
@@ -185,3 +187,31 @@ func (r *Repo) verifySegmentIndexes(head uint64) ([]VerifyIssue, error) {
 // the store prefix, no leading slash), so references and listed objects compare
 // equal for scoped stores whose repository prefix is empty.
 func normalizeListKey(k string) string { return strings.TrimPrefix(k, "/") }
+
+// SegmentIndexDigest returns a stable digest of every shard index up to HEAD.
+// Two replicas of the same repository must report the same value; a mismatch
+// means an index (or the HEAD it belongs to) drifted on one of them, which
+// `svnadmin replicas` uses to detect lag or corruption explicitly.
+func (r *Repo) SegmentIndexDigest() (string, error) {
+	if !r.segments {
+		return "", nil
+	}
+	head, err := r.HeadFresh()
+	if err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	fmt.Fprintf(h, "head=%d segfrom=%d\n", head, r.segmentFrom)
+	for sh := uint64(0); sh <= r.shard(head); sh++ {
+		refs, err := r.loadSegmentIndex(sh)
+		if err != nil {
+			return "", err
+		}
+		fmt.Fprintf(h, "%d:", sh)
+		for _, ref := range refs {
+			fmt.Fprintf(h, "%d+%d+%s,", ref.First, ref.Count, ref.SHA256)
+		}
+		h.Write([]byte("\n"))
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}

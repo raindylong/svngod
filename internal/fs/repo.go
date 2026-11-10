@@ -2065,13 +2065,22 @@ func (r *Repo) CollectLoose(ctx context.Context) (int, error) {
 // Deletes are independent and run concurrently: RustFS needs seconds for a
 // 1000-key batch, and a serial pass over 625k revisions would take hours.
 // deleteLoose uses the primary-only path when the store is a mirror.
-func (r *Repo) deleteLoose(ctx context.Context, keys []string) error {
+// deletePrimaryOrAll removes keys from the authoritative replica when the store
+// has one. Bulk cleanup (superseded segments, packed loose objects) uses it: the
+// standby copies are unreferenced and harmless, while mirroring thousands of
+// deletes competes with commits and can exceed the standby write budget, taking
+// a live node out of service.
+func (r *Repo) deletePrimaryOrAll(ctx context.Context, keys []string) error {
 	if pd, ok := r.store.(interface {
 		DeletePrimary(context.Context, []string) error
 	}); ok {
 		return pd.DeletePrimary(ctx, keys)
 	}
 	return r.store.Delete(ctx, keys)
+}
+
+func (r *Repo) deleteLoose(ctx context.Context, keys []string) error {
+	return r.deletePrimaryOrAll(ctx, keys)
 }
 
 func (r *Repo) collectLooseShard(ctx context.Context, shard uint64) (int, error) {

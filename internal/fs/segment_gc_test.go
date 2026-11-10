@@ -177,3 +177,24 @@ func TestCollectOrphanChangeFragments(t *testing.T) {
 		t.Fatal("orphan fragment survived")
 	}
 }
+
+// TestSegmentIndexDigest: the digest is stable for a repository and changes when
+// a shard index is lost. Cross-replica equality is exercised end to end by
+// `svnadmin replicas` (see docs); this pins the function itself.
+func TestSegmentIndexDigest(t *testing.T) {
+	r := segRepo(t, "repos/dig")
+	commitBatches(t, r, 1, 4)
+	d1, err := r.SegmentIndexDigest()
+	if err != nil || d1 == "" {
+		t.Fatalf("digest=%q err=%v", d1, err)
+	}
+	if d2, _ := r.SegmentIndexDigest(); d2 != d1 {
+		t.Fatalf("digest not stable: %q != %q", d1, d2)
+	}
+	if err := r.store.Delete(context.Background(), []string{r.keys.SegmentIndex(0)}); err != nil {
+		t.Fatal(err)
+	}
+	if d3, _ := r.SegmentIndexDigest(); d3 == d1 {
+		t.Fatal("digest unchanged after deleting an index")
+	}
+}

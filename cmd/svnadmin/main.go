@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -53,6 +54,7 @@ type options struct {
 	journalLimit  int
 	verifyWorkers int
 	rebuildIndex  bool
+	verifyMembers bool
 	keepJournal   uint64
 	gcGrace       int
 	gcTexts       bool
@@ -130,30 +132,9 @@ func (o *options) repoStore(localPath string) (store.Store, string, error) {
 // mirrorStore builds a MirrorStore from a --mirror-file JSON array so the repo
 // can be created once across a local-primary + S3-standby (or any mix) set.
 func (o *options) mirrorStore(name string) (store.Store, string, error) {
-	data, err := os.ReadFile(o.mirrorFile)
+	entries, quorum, repoPrefix, err := readMirrorFile(o.mirrorFile)
 	if err != nil {
 		return nil, "", err
-	}
-	var entries []mirrorEntry
-	var quorum int
-	repoPrefix := "repos"
-	trimmed := bytes.TrimSpace(data)
-	if len(trimmed) > 0 && trimmed[0] == '{' {
-		// Object form: {"mirrors":[...],"quorum":2}
-		var obj struct {
-			Mirrors []mirrorEntry `json:"mirrors"`
-			Quorum  int           `json:"quorum"`
-			Prefix  string        `json:"prefix"`
-		}
-		if err := json.Unmarshal(trimmed, &obj); err != nil {
-			return nil, "", fmt.Errorf("parse --mirror-file: %v", err)
-		}
-		entries, quorum = obj.Mirrors, obj.Quorum
-		if obj.Prefix != "" {
-			repoPrefix = obj.Prefix
-		}
-	} else if err := json.Unmarshal(data, &entries); err != nil {
-		return nil, "", fmt.Errorf("parse --mirror-file: %v", err)
 	}
 	ms := make([]store.Store, 0, len(entries))
 	for _, e := range entries {
@@ -230,6 +211,9 @@ func main() {
 		fs.IntVar(&o.deleteBatch, "batch", 1000, "keys per DELETE request (smaller batches are more reliable on some backends)")
 		fs.BoolVar(&o.deleteControl, "control-only", false, "delete only the repository's control keys (removes it from service; payload objects remain)")
 	}
+	if cmd == "replicas" {
+		fs.BoolVar(&o.verifyMembers, "verify", false, "also walk every revision on each member")
+	}
 	if cmd == "verify" {
 		fs.BoolVar(&o.allRevs, "all-revs", false, "verify every historical revision, not just HEAD")
 		fs.BoolVar(&o.texts, "texts", false, "with --all-revs: read and hash every file text (slow)")
@@ -291,10 +275,131 @@ func main() {
 		doMigrate(&o, repoName)
 	case "gc":
 		doGC(&o, repoName)
+	case "replicas":
+		doReplicas(&o, repoName, o.verifyMembers)
 	default:
 		usage()
 		os.Exit(2)
 	}
+}
+
+// readMirrorFile parses a --mirror-file (array or {"mirrors":[...],"quorum":N,"prefix":P}).
+func readMirrorFile(path string) ([]mirrorEntry, int, string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	var entries []mirrorEntry
+	var quorum int
+	repoPrefix := "repos"
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		var obj struct {
+			Mirrors []mirrorEntry `json:"mirrors"`
+			Quorum  int           `json:"quorum"`
+			Prefix  string        `json:"prefix"`
+		}
+		if err := json.Unmarshal(trimmed, &obj); err != nil {
+			return nil, 0, "", fmt.Errorf("parse --mirror-file: %v", err)
+		}
+		entries, quorum = obj.Mirrors, obj.Quorum
+		if obj.Prefix != "" {
+			repoPrefix = obj.Prefix
+		}
+	} else if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, 0, "", fmt.Errorf("parse --mirror-file: %v", err)
+	}
+	return entries, quorum, repoPrefix, nil
+}
+
+// memberStore opens one mirror member as an independent view of the repository
+// (keys relative to the bucket/root, repository prefix applied by the caller).
+func memberStore(e mirrorEntry) (store.Store, error) {
+	if e.Type == "s3" {
+		return store.NewS3Store(store.S3Config{
+			Endpoint: e.Endpoint, AccessKey: e.Access, SecretKey: e.Secret,
+			Bucket: e.Bucket, Region: "us-east-1", UseSSL: e.SSL,
+		})
+	}
+	return store.NewFileStore(e.Root)
+}
+
+// doReplicas reports each mirror member's HEAD, UUID and shard-index digest.
+// Any difference means a replica is behind or damaged; -verify additionally
+// walks every revision on each member.
+func doReplicas(o *options, repoName string, verify bool) {
+	if o.mirrorFile == "" {
+		fatal(errors.New("replicas requires --mirror-file"))
+	}
+	entries, _, repoPrefix, err := readMirrorFile(o.mirrorFile)
+	if err != nil {
+		fatal(err)
+	}
+	keyPrefix := strings.Trim(repoPrefix, "/") + "/" + repoName
+	var firstHead uint64
+	var firstDigest, firstUUID string
+	drift := false
+	for i, e := range entries {
+		st, serr := memberStore(e)
+		if serr != nil {
+			fmt.Printf("member[%d] %s: %v\n", i, e.Endpoint+e.Root, serr)
+			drift = true
+			continue
+		}
+		r, oerr := fs.OpenRepo(st, keyPrefix)
+		if oerr != nil {
+			fmt.Printf("member[%d] %s: %v\n", i, e.Endpoint+e.Root, oerr)
+			drift = true
+			closeStore(st)
+			continue
+		}
+		head, herr := r.HeadFresh()
+		uuid, _ := r.UUID()
+		digest, derr := r.SegmentIndexDigest()
+		if herr != nil || derr != nil {
+			fmt.Printf("member[%d]: head err=%v digest err=%v\n", i, herr, derr)
+			drift = true
+			closeStore(st)
+			continue
+		}
+		fmt.Printf("member[%d] %s head=%d uuid=%s index=%s\n", i, e.Endpoint+e.Root, head, uuid, short(digest))
+		if i == 0 {
+			firstHead, firstDigest, firstUUID = head, digest, uuid
+		} else if head != firstHead || digest != firstDigest || uuid != firstUUID {
+			drift = true
+		}
+		if verify {
+			issues, verr := r.VerifyRangeWith(1, head, false, 4)
+			if verr != nil || len(issues) > 0 {
+				fmt.Printf("member[%d] verify: %d issue(s) err=%v\n", i, len(issues), verr)
+				for _, is := range issues {
+					fmt.Printf("  rev=%d %v\n", is.Rev, is.Err)
+				}
+				drift = true
+			} else {
+				fmt.Printf("member[%d] verify: no issues\n", i)
+			}
+		}
+		closeStore(st)
+	}
+	if drift {
+		fmt.Println("replicas: DRIFT")
+		os.Exit(1)
+	}
+	fmt.Println("replicas: consistent")
+}
+
+func closeStore(st store.Store) {
+	if c, ok := st.(interface{ Close() }); ok {
+		c.Close()
+	}
+}
+
+func short(s string) string {
+	if len(s) > 12 {
+		return s[:12]
+	}
+	return s
 }
 
 func usage() {
@@ -308,6 +413,7 @@ usage:
   svnadmin repair [--mirror-file FILE] [--rebuild-index] <repo>  # reconcile mirrors / rebuild segment indexes
   svnadmin delete-repo -force [s3 flags | --mirror-file FILE] <repo>  # delete every object of a repository
   svnadmin journal [-n N] [s3 flags | --mirror-file FILE] <repo>  # show WAL records
+  svnadmin replicas [-verify] --mirror-file FILE <repo>  # per-member HEAD/UUID/index drift
   svnadmin gc [-texts] [s3 flags] <repo>  # loose objects, txn bodies, segment compaction (-texts: unreferenced texts, slow)
 
 s3 flags: --endpoint H:PORT --access-key K --secret-key S --bucket B [--prefix P] [--ssl]
