@@ -72,7 +72,7 @@ func (r *Repo) publishSegmentPlans(ctx context.Context, lease *commitLease, cur 
 	var journals []segmentJournalWrite
 	for _, g := range groups {
 		journals = append(journals, segmentJournalWrite{
-			first: g.first, count: g.count, parent: g.parent,
+			first: g.first, count: g.count,
 			key: r.segmentKeyFor(g.first, g.count), sha: g.sha,
 		})
 	}
@@ -281,30 +281,6 @@ func appendSegmentRef(refs []segmentRef, ref segmentRef) []segmentRef {
 		}
 	}
 	return append(refs, ref)
-}
-
-// writeSegmentJournal records one batch in the WAL (version 2).
-func (r *Repo) writeSegmentJournal(ctx context.Context, first, count, parent uint64, lease string,
-	created int64, key, sha string) error {
-	if !r.journal {
-		return nil
-	}
-	rec := &CommitRecord{
-		Version:    2,
-		Rev:        first,
-		Parent:     parent,
-		Lease:      lease,
-		Created:    created,
-		SegmentKey: key,
-		SegmentSHA: sha,
-		First:      first,
-		Count:      count,
-		Quorum:     r.writeQuorum,
-	}
-	if err := r.store.Put(ctx, r.keys.Journal(first), EncodeCommitRecord(rec)); err != nil {
-		return fmt.Errorf("journal: %w", err)
-	}
-	return nil
 }
 
 // segmentOwns reports whether the published segment record still belongs to
@@ -545,8 +521,8 @@ func (r *Repo) compactSegmentShardOnce(ctx context.Context, sh uint64) error {
 
 // segmentJournalWrite is one prepared WAL record.
 type segmentJournalWrite struct {
-	first, count, parent uint64
-	key, sha             string
+	first, count uint64
+	key, sha     string
 }
 
 // ErrSegmentIndexConflict means another writer already owns the revision range
