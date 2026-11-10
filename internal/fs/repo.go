@@ -2215,6 +2215,59 @@ func tooYoung(o store.ListedObj, grace time.Duration) bool {
 	return grace > 0 && !o.ModTime.IsZero() && time.Since(o.ModTime) < grace
 }
 
+// textRefs is one worker's slice of the reference scan.
+type textRefs struct {
+	texts, chunks, dirs map[string]bool
+	dirScanOK           bool
+}
+
+// collectTextRefs builds the reference sets for revisions [from,to].
+func (r *Repo) collectTextRefs(from, to uint64) (textRefs, error) {
+	out := textRefs{
+		texts: map[string]bool{}, chunks: map[string]bool{}, dirs: map[string]bool{},
+		dirScanOK: true,
+	}
+	for rev := from; rev <= to; rev++ {
+		rb, err := r.readBlock(rev)
+		if err != nil {
+			return out, err
+		}
+		for _, id := range rb.NodeIDs() {
+			nr, err := rb.GetNode(id)
+			if err != nil {
+				return out, err
+			}
+			if nr.Kind == KindFile && nr.TextRep == TextRepExternal && nr.TextRef != "" {
+				out.texts[nr.TextRef] = true
+			}
+			if nr.Kind == KindFile && nr.TextRep == TextRepChunked {
+				if crefs, err := cdc.Parse(nr.Text); err == nil {
+					for _, ref := range crefs {
+						out.chunks[cdc.HashHex(ref)] = true
+					}
+				}
+			}
+			if nr.Kind == KindDir && nr.TextRep == TextRepExternal && nr.TextRef != "" {
+				out.dirs[nr.TextRef] = true
+				table, terr := r.dirTableOf(nr)
+				if terr != nil || table == nil {
+					// Fail closed: without the table we cannot know which
+					// buckets are referenced, so do not collect dir objects.
+					log.Printf("gc: cannot read dir table %s at rev %d: %v", nr.TextRef, rev, terr)
+					out.dirScanOK = false
+					continue
+				}
+				for _, ref := range table.Refs {
+					if ref != "" {
+						out.dirs[ref] = true
+					}
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
 // CollectTexts deletes external text objects that no node-rev references,
 // with no grace period (tests and an explicit offline pass).
 func (r *Repo) CollectTexts(ctx context.Context) (int, error) {
@@ -2230,46 +2283,53 @@ func (r *Repo) CollectTextsGrace(ctx context.Context, grace time.Duration) (int,
 	if err != nil {
 		return 0, err
 	}
+	// Walk the history in parallel: the scan only reads immutable blocks and
+	// tables, and on a 200k-revision repository it dominates `gc -texts`.
+	const scanWorkers = 8
+	total := head + 1
+	workers := scanWorkers
+	if uint64(workers) > total {
+		workers = int(total)
+	}
+	parts := make([]textRefs, workers)
+	partErrs := make([]error, workers)
+	span := (total + uint64(workers) - 1) / uint64(workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		lo := uint64(i) * span
+		hi := lo + span - 1
+		if hi > head {
+			hi = head
+		}
+		if lo > head {
+			break
+		}
+		wg.Add(1)
+		go func(i int, lo, hi uint64) {
+			defer wg.Done()
+			parts[i], partErrs[i] = r.collectTextRefs(lo, hi)
+		}(i, lo, hi)
+	}
+	wg.Wait()
 	refs := map[string]bool{}
 	chunkRefs := map[string]bool{}
 	dirRefs := map[string]bool{}
 	dirScanOK := true
-	for rev := uint64(0); rev <= head; rev++ {
-		rb, err := r.readBlock(rev)
-		if err != nil {
-			return 0, err
+	for i := range parts {
+		if partErrs[i] != nil {
+			return 0, partErrs[i]
 		}
-		for _, id := range rb.NodeIDs() {
-			nr, err := rb.GetNode(id)
-			if err != nil {
-				return 0, err
-			}
-			if nr.Kind == KindFile && nr.TextRep == TextRepExternal && nr.TextRef != "" {
-				refs[nr.TextRef] = true
-			}
-			if nr.Kind == KindFile && nr.TextRep == TextRepChunked {
-				if crefs, err := cdc.Parse(nr.Text); err == nil {
-					for _, ref := range crefs {
-						chunkRefs[cdc.HashHex(ref)] = true
-					}
-				}
-			}
-			if nr.Kind == KindDir && nr.TextRep == TextRepExternal && nr.TextRef != "" {
-				dirRefs[nr.TextRef] = true
-				table, terr := r.dirTableOf(nr)
-				if terr != nil || table == nil {
-					// Fail closed: without the table we cannot know which
-					// buckets are referenced, so do not collect dir objects.
-					log.Printf("gc: cannot read dir table %s at rev %d: %v", nr.TextRef, rev, terr)
-					dirScanOK = false
-					continue
-				}
-				for _, ref := range table.Refs {
-					if ref != "" {
-						dirRefs[ref] = true
-					}
-				}
-			}
+		for k := range parts[i].texts {
+			refs[k] = true
+		}
+		for k := range parts[i].chunks {
+			chunkRefs[k] = true
+		}
+		for k := range parts[i].dirs {
+			dirRefs[k] = true
+		}
+		if !parts[i].dirScanOK {
+			dirScanOK = false
 		}
 	}
 	prefix := r.keys.ListingPrefix("texts")

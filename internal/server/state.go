@@ -701,6 +701,62 @@ func (s *Server) reapExpiredActivities() {
 		}
 		s.dropActivityState(repo, a.id)
 	}
+	// Sessions created by another replica are only in the store; they never
+	// enter this process's maps, so the in-memory pass above cannot see them.
+	s.reapPersistedSessions()
+}
+
+// reapPersistedSessions scans the repositories this process has open and drops
+// stored commit sessions older than sessionTTL that were never restored here.
+func (s *Server) reapPersistedSessions() {
+	s.repoMapMu.Lock()
+	repos := make(map[string]*fs.Repo, len(s.repoCache))
+	for name, repo := range s.repoCache {
+		repos[name] = repo
+	}
+	s.repoMapMu.Unlock()
+	now := time.Now().Unix()
+	for name, repo := range repos {
+		if repo == nil {
+			continue
+		}
+		ctx := context.Background()
+		prefix := repo.Keys().ListingPrefix("dav-txns")
+		next := ""
+		for {
+			objs, cont, err := repo.Store().ListPrefix(ctx, prefix, next, 200)
+			if err != nil {
+				log.Printf("txn: reap %s: list: %v", name, err)
+				break
+			}
+			for _, o := range objs {
+				rel := strings.TrimPrefix(o.Key, prefix)
+				if !strings.HasPrefix(rel, "activity-") || !strings.HasSuffix(rel, ".json") {
+					continue
+				}
+				data, err := repo.Store().Get(ctx, o.Key, nil)
+				if err != nil {
+					continue
+				}
+				var pa persistedActivity
+				if json.Unmarshal(data, &pa) != nil || pa.ID == "" {
+					continue
+				}
+				if pa.Created <= 0 || now-pa.Created <= int64(sessionTTL/time.Second) {
+					continue
+				}
+				if _, ok := s.activityByID(pa.ID); ok {
+					continue // the in-memory pass already dropped it
+				}
+				log.Printf("txn: reaping persisted session %s (repo %s)", pa.ID, name)
+				s.dropActivityState(repo, pa.ID)
+			}
+			if cont == "" || cont == next {
+				break
+			}
+			next = cont
+		}
+	}
 }
 
 // RunMaintenance periodically reaps abandoned commit sessions. Call it once

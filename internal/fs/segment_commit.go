@@ -487,35 +487,100 @@ func (r *Repo) compactSegmentShardOnce(ctx context.Context, sh uint64) error {
 	if last-first+1 != total {
 		return fmt.Errorf("segment: shard %d index has a gap (%d entries, span %d-%d)", sh, total, first, last)
 	}
-	merged := &segmentData{First: first, Count: last - first + 1, Parent: first - 1}
-	for _, ref := range refs {
-		seg, serr := r.loadSegment(ref)
+	// Merge into segments of at most SEGMENT_TARGET revisions, not one segment
+	// per shard: a 4096-revision shard with target 64 would otherwise become a
+	// 4 MiB object and every random read would fetch it whole, which is exactly
+	// what the target exists to bound. A single batch larger than the target
+	// stays intact (segments are immutable and published).
+	target := r.segmentTarget
+	if target == 0 {
+		target = r.shardSz
+	}
+	var plans []segmentRef
+	for i := 0; i < len(refs); {
+		planFirst := refs[i].First
+		planEnd := planFirst
+		for i < len(refs) {
+			refEnd := refs[i].First + refs[i].Count
+			cand := refEnd - planFirst
+			if planEnd > planFirst && cand > target {
+				break
+			}
+			planEnd = refEnd
+			i++
+		}
+		plans = append(plans, segmentRef{First: planFirst, Count: planEnd - planFirst})
+	}
+	// Read the shard's segments in parallel: a completed shard can hold dozens
+	// of target-sized segments, and a serial merge paid one round trip each.
+	sources := make([]*segmentData, len(refs))
+	srcErrs := make([]error, len(refs))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 8)
+	for i, ref := range refs {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, ref segmentRef) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			sources[i], srcErrs[i] = r.loadSegment(ref)
+		}(i, ref)
+	}
+	wg.Wait()
+	for _, serr := range srcErrs {
 		if serr != nil {
 			return serr
 		}
-		for i := uint64(0); i < seg.Count; i++ {
-			idx := ref.First + i - first
-			for uint64(len(merged.Blocks)) <= idx {
-				merged.Blocks = append(merged.Blocks, nil)
-				merged.Props = append(merged.Props, nil)
-			}
-			merged.Blocks[idx] = seg.Blocks[i]
-			merged.Props[idx] = seg.Props[i]
+	}
+	newRefs := make([]segmentRef, 0, len(plans))
+	keepKeys := map[string]bool{}
+	for _, plan := range plans {
+		if existing, ok := exactSegment(refs, plan.First); ok && existing.Count == plan.Count {
+			// Already exactly this segment: reuse it instead of re-encoding.
+			newRefs = append(newRefs, existing)
+			keepKeys[r.segmentKeyFor(existing.First, existing.Count)] = true
+			continue
 		}
+		merged := &segmentData{First: plan.First, Count: plan.Count, Parent: plan.First - 1}
+		for ri, ref := range refs {
+			if ref.First+ref.Count <= plan.First || ref.First >= plan.First+plan.Count {
+				continue
+			}
+			seg := sources[ri]
+			for i := uint64(0); i < seg.Count; i++ {
+				rev := ref.First + i
+				if rev < plan.First || rev >= plan.First+plan.Count {
+					continue
+				}
+				idx := rev - plan.First
+				for uint64(len(merged.Blocks)) <= idx {
+					merged.Blocks = append(merged.Blocks, nil)
+					merged.Props = append(merged.Props, nil)
+				}
+				merged.Blocks[idx] = seg.Blocks[i]
+				merged.Props[idx] = seg.Props[i]
+			}
+		}
+		data := encodeSegment(merged)
+		sum := sha256.Sum256(data)
+		if err := r.store.Put(ctx, r.keys.Segment(sh, merged.First, merged.Count), data); err != nil {
+			return err
+		}
+		ref := segmentRef{First: merged.First, Count: merged.Count, SHA256: hex.EncodeToString(sum[:])}
+		newRefs = append(newRefs, ref)
+		keepKeys[r.segmentKeyFor(ref.First, ref.Count)] = true
 	}
-	data := encodeSegment(merged)
-	sum := sha256.Sum256(data)
-	key := r.keys.Segment(sh, first, merged.Count)
-	if err := r.store.Put(ctx, key, data); err != nil {
-		return err
-	}
-	ref := segmentRef{First: first, Count: merged.Count, SHA256: hex.EncodeToString(sum[:])}
-	if err := r.writeSegmentIndexCAS(ctx, sh, []segmentRef{ref}, etag, existed); err != nil {
+	if err := r.writeSegmentIndexCAS(ctx, sh, newRefs, etag, existed); err != nil {
 		return err
 	}
 	old := make([]string, 0, len(refs))
 	for _, ref := range refs {
-		old = append(old, r.segmentKeyFor(ref.First, ref.Count))
+		if k := r.segmentKeyFor(ref.First, ref.Count); !keepKeys[k] {
+			old = append(old, k)
+		}
+	}
+	if len(old) == 0 {
+		return nil
 	}
 	go func() {
 		time.Sleep(60 * time.Second)

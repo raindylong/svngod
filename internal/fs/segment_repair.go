@@ -5,12 +5,16 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"svngod/internal/fs/store"
 )
 
 // Segment indexes can be lost or lose one entry: the index is a mutable object
@@ -254,4 +258,64 @@ func sameSegmentRefs(a, b []segmentRef) bool {
 		}
 	}
 	return true
+}
+
+// RepairRevPropsOverrides drops override-list entries whose object is gone.
+// Reads refuse to serve the committed value for a listed-but-missing override
+// (silently reverting an edit), so the list must be reconciled: either the
+// object is restored from a replica first, or the dead entry is removed. This
+// is the explicit operator action for the latter.
+func (r *Repo) RepairRevPropsOverrides(ctx context.Context) (int, error) {
+	if !r.segments {
+		return 0, nil
+	}
+	head, err := r.HeadFresh()
+	if err != nil {
+		return 0, err
+	}
+	dropped := 0
+	for sh := uint64(0); sh <= r.shard(head); sh++ {
+		listKey := r.keys.SegRevPropsIndex(sh)
+		for attempt := 0; attempt < 8; attempt++ {
+			b, gerr := r.store.Get(ctx, listKey, nil)
+			if gerr != nil {
+				if errors.Is(gerr, store.ErrNotFound) {
+					break
+				}
+				return dropped, gerr
+			}
+			var revs []uint64
+			if len(b) > 0 {
+				if uerr := json.Unmarshal(b, &revs); uerr != nil {
+					return dropped, fmt.Errorf("shard %d override list: %w", sh, uerr)
+				}
+			}
+			kept := revs[:0]
+			for _, rev := range revs {
+				if _, ok, oerr := r.loadSegRevPropsRaw(ctx, sh, rev); oerr != nil {
+					return dropped, oerr
+				} else if ok {
+					kept = append(kept, rev)
+					continue
+				}
+				dropped++
+			}
+			if len(kept) == len(revs) {
+				break
+			}
+			data, merr := json.Marshal(kept)
+			if merr != nil {
+				return dropped, merr
+			}
+			if _, cerr := r.store.CAS(ctx, listKey, store.ContentETag(b), data); cerr != nil {
+				if errors.Is(cerr, store.ErrPreconditionFailed) {
+					continue
+				}
+				return dropped, cerr
+			}
+			r.invalidateSegOverrides(sh)
+			break
+		}
+	}
+	return dropped, nil
 }

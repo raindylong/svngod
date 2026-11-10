@@ -221,3 +221,57 @@ func TestReplicaDigest(t *testing.T) {
 		t.Fatal("digest unchanged after deleting an index")
 	}
 }
+
+// TestCompactionHonoursSegmentTarget: merging a shard must produce segments of
+// at most SEGMENT_TARGET revisions, not one segment per shard.
+func TestCompactionHonoursSegmentTarget(t *testing.T) {
+	st := store.NewMemoryStore()
+	if _, err := CreateRepoSegments(st, "repos/tgt", 64, 64, cdc.DefaultParams(), false, 8); err != nil {
+		t.Fatal(err)
+	}
+	r, err := OpenRepo(st, "repos/tgt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitBatches(t, r, 32, 1) // 32 revisions, one segment each
+	if _, err := r.CompactSegments(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	refs, err := r.loadSegmentIndex(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 4 {
+		t.Fatalf("refs=%d, want 4 (32 revisions at target 8): %+v", len(refs), refs)
+	}
+	var next uint64 = 1
+	for _, ref := range refs {
+		if ref.Count > 8 {
+			t.Fatalf("segment %d+%d exceeds target 8", ref.First, ref.Count)
+		}
+		if ref.First != next {
+			t.Fatalf("gap: %d+%d, want first %d", ref.First, ref.Count, next)
+		}
+		next += ref.Count
+	}
+	if next != 33 {
+		t.Fatalf("coverage ends at %d, want 33", next)
+	}
+	for rev := uint64(1); rev <= 32; rev++ {
+		if _, err := r.readBlock(rev); err != nil {
+			t.Fatalf("read %d: %v", rev, err)
+		}
+	}
+	issues, err := r.VerifyRange(1, 32, false)
+	if err != nil || len(issues) != 0 {
+		t.Fatalf("verify: issues=%v err=%v", issues, err)
+	}
+	// Compacting again must be a no-op.
+	if _, err := r.CompactSegments(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	again, _ := r.loadSegmentIndex(0)
+	if len(again) != 4 {
+		t.Fatalf("second compaction changed the index: %+v", again)
+	}
+}

@@ -460,12 +460,22 @@ func TestExpiredSessionReapedOnLoad(t *testing.T) {
 	resp = doRequest(t, "OPTIONS", ts2.URL+"/svn/reap", "", "", "", nil)
 	resp.Body.Close()
 
-	objs, _, err = st.ListPrefix(context.Background(), activityChangesPrefix(repo, "u-old"), "", 100)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(objs) != 0 {
-		t.Fatalf("fragments survived: %d objects", len(objs))
+	// Fragment cleanup runs in the background (deleting one object per staged
+	// file on the commit path was too slow), so wait for it instead of assuming
+	// it finished with the request.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		objs, _, err = st.ListPrefix(context.Background(), activityChangesPrefix(repo, "u-old"), "", 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(objs) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("fragments survived: %d objects", len(objs))
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if _, ok, _ := st.Head(context.Background(), activityStateKey(repo, "u-old")); ok {
 		t.Fatal("manifest survived")

@@ -40,30 +40,32 @@ const (
 )
 
 type options struct {
-	endpoint      string
-	accessKey     string
-	secretKey     string
-	bucket        string
-	prefix        string
-	useSSL        bool
-	mirrorFile    string
-	allRevs       bool
-	texts         bool
-	fromRev       uint64
-	toRev         uint64
-	journalLimit  int
-	verifyWorkers int
-	rebuildIndex  bool
-	verifyMembers bool
-	repairMembers bool
-	keepJournal   uint64
-	gcGrace       int
-	gcTexts       bool
-	gcCompact     bool
-	chunkAvg      uint64
-	dirBuckets    bool
-	segments      bool
-	segmentTarget uint64
+	endpoint        string
+	accessKey       string
+	secretKey       string
+	bucket          string
+	prefix          string
+	useSSL          bool
+	mirrorFile      string
+	allRevs         bool
+	texts           bool
+	fromRev         uint64
+	toRev           uint64
+	journalLimit    int
+	verifyWorkers   int
+	rebuildIndex    bool
+	verifyMembers   bool
+	repairVerify    bool
+	repairMembers   bool
+	replicaTextfile string
+	keepJournal     uint64
+	gcGrace         int
+	gcTexts         bool
+	gcCompact       bool
+	chunkAvg        uint64
+	dirBuckets      bool
+	segments        bool
+	segmentTarget   uint64
 
 	deleteWorkers int
 	deleteDryRun  bool
@@ -215,6 +217,7 @@ func main() {
 	if cmd == "replicas" {
 		fs.BoolVar(&o.verifyMembers, "verify", false, "also walk every revision on each member")
 		fs.BoolVar(&o.repairMembers, "repair", false, "run the mirror repair pass before comparing")
+		fs.StringVar(&o.replicaTextfile, "textfile", "", "also write these metrics as a Prometheus textfile")
 	}
 	if cmd == "verify" {
 		fs.BoolVar(&o.allRevs, "all-revs", false, "verify every historical revision, not just HEAD")
@@ -222,6 +225,7 @@ func main() {
 		fs.Uint64Var(&o.fromRev, "from", 1, "first revision for --all-revs")
 		fs.Uint64Var(&o.toRev, "to", 0, "last revision for --all-revs (0 = HEAD)")
 		fs.IntVar(&o.verifyWorkers, "workers", 1, "parallel workers for --all-revs")
+		fs.BoolVar(&o.rebuildIndex, "repair-index", false, "with --all-revs: rebuild shard indexes from segments before checking")
 	}
 	if cmd == "journal" {
 		fs.IntVar(&o.journalLimit, "n", 20, "number of records to show")
@@ -326,6 +330,16 @@ func memberStore(e mirrorEntry) (store.Store, error) {
 	return store.NewFileStore(e.Root)
 }
 
+// memberStat is one mirror member's reported state.
+type memberStat struct {
+	index  int
+	label  string
+	head   uint64
+	digest string
+	issues int
+	ok     bool
+}
+
 // doReplicas reports each mirror member's HEAD, UUID and shard-index digest.
 // Any difference means a replica is behind or damaged; -verify additionally
 // walks every revision on each member.
@@ -350,6 +364,7 @@ func doReplicas(o *options, repoName string, verify, repair bool) {
 	var firstHead uint64
 	var firstDigest, firstUUID string
 	drift := false
+	var stats []memberStat
 	for i, e := range entries {
 		st, serr := memberStore(e)
 		if serr != nil {
@@ -374,6 +389,7 @@ func doReplicas(o *options, repoName string, verify, repair bool) {
 			continue
 		}
 		fmt.Printf("member[%d] %s head=%d uuid=%s index=%s\n", i, e.Endpoint+e.Root, head, uuid, short(digest))
+		stats = append(stats, memberStat{index: i, label: e.Endpoint + e.Root, head: head, digest: digest, ok: true})
 		if i == 0 {
 			firstHead, firstDigest, firstUUID = head, digest, uuid
 		} else if head != firstHead || digest != firstDigest || uuid != firstUUID {
@@ -382,6 +398,10 @@ func doReplicas(o *options, repoName string, verify, repair bool) {
 		if verify {
 			issues, verr := r.VerifyRangeWith(1, head, false, 4)
 			if verr != nil || len(issues) > 0 {
+				stats[len(stats)-1].issues = len(issues)
+				if verr != nil {
+					stats[len(stats)-1].issues = -1
+				}
 				fmt.Printf("member[%d] verify: %d issue(s) err=%v\n", i, len(issues), verr)
 				for _, is := range issues {
 					fmt.Printf("  rev=%d %v\n", is.Rev, is.Err)
@@ -393,11 +413,51 @@ func doReplicas(o *options, repoName string, verify, repair bool) {
 		}
 		closeStore(st)
 	}
+	if o.replicaTextfile != "" {
+		writeReplicaMetrics(o.replicaTextfile, repoName, stats, drift)
+	}
 	if drift {
 		fmt.Println("replicas: DRIFT")
 		os.Exit(1)
 	}
 	fmt.Println("replicas: consistent")
+}
+
+// writeReplicaMetrics writes a Prometheus textfile (node_exporter textfile
+// collector layout) so replica drift can alert without parsing logs.
+func writeReplicaMetrics(path, repoName string, stats []memberStat, drift bool) {
+	var b strings.Builder
+	b.WriteString("# HELP svngod_replica_head HEAD reported by one mirror member.\n")
+	b.WriteString("# TYPE svngod_replica_head gauge\n")
+	for _, st := range stats {
+		if !st.ok {
+			continue
+		}
+		fmt.Fprintf(&b, "svngod_replica_head{repo=%q,member=%q} %d\n", repoName, st.label, st.head)
+	}
+	b.WriteString("# HELP svngod_replica_verify_issues Integrity issues found on one member (-1 = verify failed).\n")
+	b.WriteString("# TYPE svngod_replica_verify_issues gauge\n")
+	for _, st := range stats {
+		if !st.ok {
+			continue
+		}
+		fmt.Fprintf(&b, "svngod_replica_verify_issues{repo=%q,member=%q} %d\n", repoName, st.label, st.issues)
+	}
+	b.WriteString("# HELP svngod_replica_consistent 1 when every member reports the same HEAD/UUID/index digest.\n")
+	b.WriteString("# TYPE svngod_replica_consistent gauge\n")
+	consistent := 0
+	if !drift {
+		consistent = 1
+	}
+	fmt.Fprintf(&b, "svngod_replica_consistent{repo=%q} %d\n", repoName, consistent)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(b.String()), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "replicas: write %s: %v\n", tmp, err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		fmt.Fprintf(os.Stderr, "replicas: rename %s: %v\n", path, err)
+	}
 }
 
 func closeStore(st store.Store) {
@@ -420,7 +480,7 @@ usage:
   svnadmin create [--segments] [s3 flags | --mirror-file FILE] <repo>
   svnadmin dump   [--output FILE] [s3 flags] <repo>
   svnadmin load   [--input FILE] [s3 flags] <repo>
-  svnadmin verify [--all-revs [--workers N] [--texts]] [s3 flags] <repo>  # integrity walk
+  svnadmin verify [--all-revs [--workers N] [--texts] [--repair-index]] [s3 flags] <repo>  # integrity walk
   svnadmin repair [--mirror-file FILE] [--rebuild-index] <repo>  # reconcile mirrors / rebuild segment indexes
   svnadmin delete-repo -force [s3 flags | --mirror-file FILE] <repo>  # delete every object of a repository
   svnadmin journal [-n N] [s3 flags | --mirror-file FILE] <repo>  # show WAL records
@@ -493,6 +553,13 @@ func doRepair(o *options, repoName string) {
 			fatal(rerr)
 		}
 		fmt.Printf("repair: rebuilt %d segment shard index(es) from segment objects\n", n)
+		d, derr := r.RepairRevPropsOverrides(context.Background())
+		if derr != nil {
+			fatal(derr)
+		}
+		if d > 0 {
+			fmt.Printf("repair: dropped %d dead revision-property override(s)\n", d)
+		}
 	}
 	if rp, ok := st.(interface{ RepairNow() }); ok {
 		rp.RepairNow()
@@ -698,6 +765,8 @@ func doInfo(o *options, repoName string) {
 		repoName, f.Version, f.ShardSize, f.MaxDeltaChain)
 	fmt.Printf("chunk-min: %d\nchunk-max: %d\nchunk-mask: %d\ndir-buckets: %v\nhead: %d\nuuid: %s\n",
 		f.ChunkMin, f.ChunkMax, f.ChunkMask, f.DirBuckets, head, uuid)
+	fmt.Printf("segments: %v\nsegment-from: %d\nsegment-target: %d\n",
+		f.Segments, f.SegmentFrom, f.SegmentTarget)
 }
 
 // doMigrate changes opt-in format switches. Every replica must be restarted
@@ -868,6 +937,17 @@ func doVerify(o *options, repoName string) {
 	head, err := repo.Head()
 	if err != nil {
 		fatal(err)
+	}
+	if o.rebuildIndex && o.allRevs {
+		// Rebuild shard indexes from the immutable segments first: a lost index
+		// entry makes revisions unreadable, and verify would otherwise only
+		// report it. A rebuild that cannot cover HEAD reports why instead of
+		// writing a shorter index.
+		if n, rerr := repo.RepairSegmentIndexes(context.Background()); rerr != nil {
+			fmt.Printf("verify: index rebuild: %v\n", rerr)
+		} else if n > 0 {
+			fmt.Printf("verify: rebuilt %d shard index(es) before checking\n", n)
+		}
 	}
 	var issues []fs.VerifyIssue
 	if o.allRevs {

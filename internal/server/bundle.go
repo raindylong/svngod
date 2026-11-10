@@ -457,6 +457,7 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(cerr, store.ErrReplicaLagging) || errors.Is(cerr, store.ErrQuorumUnmet) ||
 			errors.Is(cerr, fs.ErrCommitBusy) || errors.Is(cerr, fs.ErrLeaseLost) ||
+			errors.Is(cerr, fs.ErrSegmentIndexConflict) ||
 			errors.Is(cerr, fs.ErrLeaseUnverified) {
 			writeBundleError(w, http.StatusServiceUnavailable, "unavailable", cerr.Error())
 			return

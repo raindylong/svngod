@@ -1535,7 +1535,7 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 		}
 		if errors.Is(err, store.ErrQuorumUnmet) || errors.Is(err, store.ErrReplicaLagging) ||
 			errors.Is(err, fs.ErrCommitBusy) || errors.Is(err, fs.ErrLeaseLost) ||
-			errors.Is(err, fs.ErrLeaseUnverified) {
+			errors.Is(err, fs.ErrLeaseUnverified) || errors.Is(err, fs.ErrSegmentIndexConflict) {
 			// The standby has not caught up with the last acknowledged HEAD.
 			// Both are transient: a 503 tells the client to retry instead of
 			// reporting a bogus out-of-date conflict. Quorum means too few

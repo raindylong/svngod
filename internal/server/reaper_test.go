@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -65,5 +66,48 @@ func TestReapExpiredActivities(t *testing.T) {
 	}
 	if _, ok, _ := repo.Store().Head(ctx, activityStateKey(repo, live.id)); !ok {
 		t.Fatal("live activity state was dropped")
+	}
+}
+
+// TestReapPersistedSessions: a session created by another replica exists only
+// in the store, so the in-memory pass cannot see it. The periodic reaper must
+// still drop it once it is older than sessionTTL.
+func TestReapPersistedSessions(t *testing.T) {
+	repo := buildRepo(t)
+	srv := New(Config{
+		BasePath: "/svn",
+		OpenRepo: func(name string) (*fs.Repo, error) {
+			if name == "demo" {
+				return repo, nil
+			}
+			return nil, fs.ErrRepoNotFound
+		},
+	})
+	// Registered as open so the persisted pass scans it, without putting the
+	// activity in memory.
+	srv.repoMapMu.Lock()
+	srv.repoCache["demo"] = repo
+	srv.repoMapMu.Unlock()
+
+	ctx := context.Background()
+	key := activityStateKey(repo, "foreign-dead")
+	body, _ := json.Marshal(persistedActivity{
+		ID: "foreign-dead", Created: time.Now().Add(-2 * sessionTTL).Unix(),
+	})
+	if err := repo.Store().Put(ctx, key, body); err != nil {
+		t.Fatal(err)
+	}
+	// A young foreign session must survive.
+	youngKey := activityStateKey(repo, "foreign-live")
+	young, _ := json.Marshal(persistedActivity{ID: "foreign-live", Created: time.Now().Unix()})
+	if err := repo.Store().Put(ctx, youngKey, young); err != nil {
+		t.Fatal(err)
+	}
+	srv.reapExpiredActivities()
+	if _, ok, _ := repo.Store().Head(ctx, key); ok {
+		t.Fatal("expired persisted session survived")
+	}
+	if _, ok, _ := repo.Store().Head(ctx, youngKey); !ok {
+		t.Fatal("young persisted session was reaped")
 	}
 }

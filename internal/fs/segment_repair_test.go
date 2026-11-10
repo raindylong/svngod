@@ -175,3 +175,49 @@ func TestRepairRefusesShortIndex(t *testing.T) {
 		t.Fatalf("index was narrowed to %+v", got)
 	}
 }
+
+// TestRepairDropsDeadOverride recovers the "listed but missing" state: reads
+// refuse to silently revert the edit, so repair removes the dead list entry and
+// the committed value is served again.
+func TestRepairDropsDeadOverride(t *testing.T) {
+	st := store.NewMemoryStore()
+	r, err := CreateRepoSegments(st, "repos/deadov", 8, 64, cdc.DefaultParams(), false, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitBatches(t, r, 1, 2)
+	committed, err := r.GetRevPropsFresh(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.UpdateRevProps(1, map[string]string{"svn:log": "edited"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Delete(context.Background(), []string{r.keys.SegRevPropsOverride(0, 1)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.GetRevPropsFresh(1); err == nil {
+		t.Fatal("missing override did not error before repair")
+	}
+	n, err := r.RepairRevPropsOverrides(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("dropped=%d, want 1", n)
+	}
+	rp, err := r.GetRevPropsFresh(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rp.Props["svn:log"] != committed.Props["svn:log"] {
+		t.Fatalf("after repair log=%q, want committed %q", rp.Props["svn:log"], committed.Props["svn:log"])
+	}
+	if n, _ := r.RepairRevPropsOverrides(context.Background()); n != 0 {
+		t.Fatalf("second repair dropped %d", n)
+	}
+	issues, err := r.VerifyRange(1, 2, false)
+	if err != nil || len(issues) != 0 {
+		t.Fatalf("verify: issues=%v err=%v", issues, err)
+	}
+}
