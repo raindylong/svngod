@@ -53,6 +53,7 @@ type options struct {
 	toRev           uint64
 	journalLimit    int
 	verifyWorkers   int
+	textWorkers     int
 	rebuildIndex    bool
 	verifyMembers   bool
 	repairVerify    bool
@@ -226,6 +227,7 @@ func main() {
 		fs.Uint64Var(&o.toRev, "to", 0, "last revision for --all-revs (0 = HEAD)")
 		fs.IntVar(&o.verifyWorkers, "workers", 1, "parallel workers for --all-revs")
 		fs.BoolVar(&o.rebuildIndex, "repair-index", false, "with --all-revs: rebuild shard indexes from segments before checking")
+		fs.IntVar(&o.textWorkers, "text-workers", 4, "concurrent text checks inside one revision with --texts")
 	}
 	if cmd == "journal" {
 		fs.IntVar(&o.journalLimit, "n", 20, "number of records to show")
@@ -983,6 +985,7 @@ func doVerify(o *options, repoName string) {
 		if to == 0 || to > head {
 			to = head
 		}
+		fs.SetVerifyTextWorkers(o.textWorkers)
 		issues, err = repo.VerifyRangeWith(from, to, o.texts, o.verifyWorkers)
 		scope := fmt.Sprintf("revs %d..%d (texts=%v, workers=%d)", from, to, o.texts, o.verifyWorkers)
 		if err != nil {

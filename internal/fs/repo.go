@@ -1648,7 +1648,24 @@ func (r *Repo) verifyNode(rev uint64, nid NodeID, texts bool) []VerifyIssue {
 // with texts enabled each is an object read; doing them serially made that
 // revision the slowest part of `verify --texts`.
 const verifyParallelNodes = 8
-const verifyNodeWorkers = 4
+
+// verifyTextWorkers bounds concurrent node checks inside one revision. It is a
+// variable so operators can tune it for their backend (more for a fast object
+// store, fewer for a weak link or a memory-constrained host).
+var verifyTextWorkers atomic.Int64
+
+func init() { verifyTextWorkers.Store(4) }
+
+// SetVerifyTextWorkers changes the per-revision text-check concurrency.
+func SetVerifyTextWorkers(n int) {
+	if n < 1 {
+		n = 1
+	}
+	if n > 32 {
+		n = 32
+	}
+	verifyTextWorkers.Store(int64(n))
+}
 
 func (r *Repo) verifyNodesParallel(rev uint64, rb *RevBlock, seen map[NodeID]bool, issues *[]VerifyIssue) {
 	var batch []NodeID
@@ -1660,7 +1677,7 @@ func (r *Repo) verifyNodesParallel(rev uint64, rb *RevBlock, seen map[NodeID]boo
 		seen[nid] = true
 		batch = append(batch, nid)
 	}
-	sem := make(chan struct{}, verifyNodeWorkers)
+	sem := make(chan struct{}, int(verifyTextWorkers.Load()))
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	for _, nid := range batch {

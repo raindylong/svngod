@@ -181,12 +181,17 @@ func Load(repo *fs.Repo, r io.Reader) error {
 		if !inRevision {
 			return fmt.Errorf("dump: node before any revision")
 		}
+		if skipping {
+			// Consume the node without materialising its text: a skipped 1 GiB
+			// file used to allocate 1 GiB just to throw it away.
+			if err := skipNodeContent(br, hdrs); err != nil {
+				return err
+			}
+			continue
+		}
 		cs, _, err := buildChange(repo, br, hdrs)
 		if err != nil {
 			return err
-		}
-		if skipping {
-			continue
 		}
 		changes = append(changes, cs...)
 	}
@@ -285,4 +290,22 @@ func buildChange(repo *fs.Repo, br *bufio.Reader, hdrs map[string]string) ([]fs.
 	default:
 		return nil, 0, fmt.Errorf("dump: unknown node-action %q", action)
 	}
+}
+
+// skipNodeContent consumes a node record's property and text payload without
+// buffering it. Uses the same layout as buildChange (props then text).
+func skipNodeContent(br *bufio.Reader, hdrs map[string]string) error {
+	plen, _ := strconv.Atoi(hdrs["Prop-content-length"])
+	tlen := 0
+	if v, ok := hdrs["Text-content-length"]; ok {
+		tlen, _ = strconv.Atoi(v)
+	}
+	n := plen + tlen
+	if n <= 0 {
+		return nil
+	}
+	if _, err := io.CopyN(io.Discard, br, int64(n)); err != nil {
+		return fmt.Errorf("dump: skip node content: %w", err)
+	}
+	return nil
 }

@@ -303,3 +303,61 @@ func TestLoadResumesFromExistingHead(t *testing.T) {
 		t.Fatalf("replay head=%d, want 5", h)
 	}
 }
+
+// TestLoadReplaySkipsLargeText replays a dump whose middle revision carries a
+// multi-megabyte file. Every revision is skipped (the target already has them),
+// and the skip path must consume the text bytes without buffering them while
+// keeping the stream aligned.
+func TestLoadReplaySkipsLargeText(t *testing.T) {
+	st := store.NewMemoryStore()
+	src, err := fs.CreateRepo(st, "repos/bigsrc", 8, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := src.CommitTxn(0, []fs.Change{{Path: "/small.txt", Action: fs.ActionAdd, Kind: fs.KindFile, Data: []byte("s")}},
+		map[string]string{"svn:log": "r1", "svn:author": "a", "svn:date": "2026-11-10T00:00:01Z"}); err != nil {
+		t.Fatal(err)
+	}
+	big := make([]byte, 4<<20)
+	for i := range big {
+		big[i] = byte(i * 17)
+	}
+	if _, err := src.CommitTxn(1, []fs.Change{{Path: "/big.bin", Action: fs.ActionAdd, Kind: fs.KindFile, Data: big}},
+		map[string]string{"svn:log": "r2", "svn:author": "a", "svn:date": "2026-11-10T00:00:02Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := src.CommitTxn(2, []fs.Change{{Path: "/after.txt", Action: fs.ActionAdd, Kind: fs.KindFile, Data: []byte("a")}},
+		map[string]string{"svn:log": "r3", "svn:author": "a", "svn:date": "2026-11-10T00:00:03Z"}); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := Dump(src, &buf); err != nil {
+		t.Fatal(err)
+	}
+	dst, err := fs.CreateRepo(store.NewMemoryStore(), "repos/bigdst", 8, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Load(dst, bytes.NewReader(buf.Bytes())); err != nil {
+		t.Fatal(err)
+	}
+	// Replay: all three revisions are skipped, including the 4 MiB text.
+	if err := Load(dst, bytes.NewReader(buf.Bytes())); err != nil {
+		t.Fatalf("replay with skipped large text: %v", err)
+	}
+	if h, _ := dst.Head(); h != 3 {
+		t.Fatalf("head=%d after replay", h)
+	}
+	nr, err := dst.Resolve(3, "/big.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := dst.GetText(nr.Node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, big) {
+		t.Fatal("large text differs after replay")
+	}
+	assertSameTree(t, src, dst)
+}
