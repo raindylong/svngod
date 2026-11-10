@@ -1513,7 +1513,6 @@ func (r *Repo) VerifyRangeWith(from, to uint64, texts bool, workers int) ([]Veri
 func (r *Repo) verifyRangeSeq(from, to uint64, texts bool) ([]VerifyIssue, error) {
 	var issues []VerifyIssue
 	seen := make(map[NodeID]bool)
-	ctx := context.Background()
 	for rev := from; rev <= to; rev++ {
 		rb, berr := r.readBlock(rev)
 		if berr != nil {
@@ -1521,121 +1520,165 @@ func (r *Repo) verifyRangeSeq(from, to uint64, texts bool) ([]VerifyIssue, error
 			continue
 		}
 		issues = append(issues, r.verifyRevisionSemantics(rev, rb)...)
-		for _, e := range rb.nodeTbl {
-			nid := NodeID{Rev: rb.Rev, ID: e.ID}
-			if seen[nid] {
-				continue
-			}
-			seen[nid] = true
-			nr, nerr := r.GetNodeRev(nid)
-			if nerr != nil {
-				issues = append(issues, VerifyIssue{Rev: rev, Err: nerr})
-				continue
-			}
-			if nr.Kind == KindDir {
-				if nr.TextRep != TextRepExternal || nr.TextRef == "" {
+		if texts && len(rb.nodeTbl) >= verifyParallelNodes {
+			r.verifyNodesParallel(rev, rb, seen, &issues)
+		} else {
+			for _, e := range rb.nodeTbl {
+				nid := NodeID{Rev: rb.Rev, ID: e.ID}
+				if seen[nid] {
 					continue
 				}
-				table, terr := r.dirTableOf(nr)
-				if terr != nil {
-					issues = append(issues, VerifyIssue{Rev: rev, Err: terr})
-					continue
-				}
-				refs := append([]string{nr.TextRef}, table.Refs[:]...)
-				for _, ref := range refs {
-					if ref == "" {
-						continue
-					}
-					key := r.keys.Dir(ref)
-					ok, eerr := r.store.Exists(ctx, key)
-					if eerr != nil || !ok {
-						issues = append(issues, VerifyIssue{Rev: rev, Err: fmt.Errorf("dir object %s missing", ref)})
-						continue
-					}
-					if texts {
-						b, gerr := r.store.Get(ctx, key, nil)
-						if gerr != nil {
-							issues = append(issues, VerifyIssue{Rev: rev, Err: gerr})
-							continue
-						}
-						sum := sha256.Sum256(b)
-						if hex.EncodeToString(sum[:]) != ref {
-							issues = append(issues, VerifyIssue{Rev: rev, Err: fmt.Errorf("dir object %s checksum mismatch", ref)})
-						}
-					}
-				}
-				continue
-			}
-			if nr.Kind != KindFile {
-				continue
-			}
-			if nr.TextRep == TextRepChunked {
-				refs, perr := cdc.Parse(nr.Text)
-				if perr != nil {
-					issues = append(issues, VerifyIssue{Rev: rev, Err: perr})
-					continue
-				}
-				var sum uint64
-				bad := false
-				for _, ref := range refs {
-					sum += uint64(ref.Size)
-					key := r.keys.Chunk(cdc.HashHex(ref))
-					ok, eerr := r.store.Exists(ctx, key)
-					if eerr != nil || !ok {
-						issues = append(issues, VerifyIssue{Rev: rev, Err: fmt.Errorf("chunk %s missing", cdc.HashHex(ref))})
-						bad = true
-						continue
-					}
-					if !texts {
-						continue
-					}
-					b, gerr := r.store.Get(ctx, key, nil)
-					if gerr != nil {
-						issues = append(issues, VerifyIssue{Rev: rev, Err: gerr})
-						bad = true
-						continue
-					}
-					if uint32(len(b)) != ref.Size || sha256.Sum256(b) != ref.Hash {
-						issues = append(issues, VerifyIssue{Rev: rev, Err: fmt.Errorf("chunk %s checksum mismatch", cdc.HashHex(ref))})
-						bad = true
-					}
-				}
-				if !bad && nr.TotalSize > 0 && sum != nr.TotalSize {
-					issues = append(issues, VerifyIssue{Rev: rev, Err: fmt.Errorf("chunked text size %d, want %d", sum, nr.TotalSize)})
-				}
-				continue
-			}
-			if nr.TextRep == TextRepExternal {
-				ok, eerr := r.store.Exists(ctx, r.keys.Text(nr.TextRef))
-				if eerr != nil || !ok {
-					issues = append(issues, VerifyIssue{Rev: rev, Err: fmt.Errorf("text object %s missing", nr.TextRef)})
-					continue
-				}
-			}
-			if !texts {
-				continue
-			}
-			data, gerr := r.GetText(nr.Node)
-			if gerr != nil {
-				issues = append(issues, VerifyIssue{
-					Rev: rev, Err: gerr,
-					Rebuildable: nr.TextRep == TextRepDelta && nr.Base != nil,
-				})
-				continue
-			}
-			if nr.TotalSize > 0 && uint64(len(data)) != nr.TotalSize {
-				issues = append(issues, VerifyIssue{Rev: rev, Err: fmt.Errorf("text size %d, want %d", len(data), nr.TotalSize)})
-				continue
-			}
-			if nr.TextMD5 != ([16]byte{}) {
-				sum := md5.Sum(data)
-				if sum != nr.TextMD5 {
-					issues = append(issues, VerifyIssue{Rev: rev, Err: fmt.Errorf("text md5 mismatch")})
-				}
+				seen[nid] = true
+				issues = append(issues, r.verifyNode(rev, nid, texts)...)
 			}
 		}
 	}
 	return issues, nil
+}
+
+// verifyNode checks one node-rev: external texts/chunks/dir buckets exist (and,
+// with texts, hash correctly) and the file text reconstructs to the recorded
+// size and md5.
+func (r *Repo) verifyNode(rev uint64, nid NodeID, texts bool) []VerifyIssue {
+	ctx := context.Background()
+	var out []VerifyIssue
+	nr, nerr := r.GetNodeRev(nid)
+	if nerr != nil {
+		return append(out, VerifyIssue{Rev: rev, Err: nerr})
+	}
+	if nr.Kind == KindDir {
+		if nr.TextRep != TextRepExternal || nr.TextRef == "" {
+			return out
+		}
+		table, terr := r.dirTableOf(nr)
+		if terr != nil {
+			return append(out, VerifyIssue{Rev: rev, Err: terr})
+		}
+		refs := append([]string{nr.TextRef}, table.Refs[:]...)
+		for _, ref := range refs {
+			if ref == "" {
+				continue
+			}
+			key := r.keys.Dir(ref)
+			ok, eerr := r.store.Exists(ctx, key)
+			if eerr != nil || !ok {
+				out = append(out, VerifyIssue{Rev: rev, Err: fmt.Errorf("dir object %s missing", ref)})
+				continue
+			}
+			if texts {
+				b, gerr := r.store.Get(ctx, key, nil)
+				if gerr != nil {
+					out = append(out, VerifyIssue{Rev: rev, Err: gerr})
+					continue
+				}
+				sum := sha256.Sum256(b)
+				if hex.EncodeToString(sum[:]) != ref {
+					out = append(out, VerifyIssue{Rev: rev, Err: fmt.Errorf("dir object %s checksum mismatch", ref)})
+				}
+			}
+		}
+		return out
+	}
+	if nr.Kind != KindFile {
+		return out
+	}
+	if nr.TextRep == TextRepChunked {
+		refs, perr := cdc.Parse(nr.Text)
+		if perr != nil {
+			return append(out, VerifyIssue{Rev: rev, Err: perr})
+		}
+		var sum uint64
+		bad := false
+		for _, ref := range refs {
+			sum += uint64(ref.Size)
+			key := r.keys.Chunk(cdc.HashHex(ref))
+			ok, eerr := r.store.Exists(ctx, key)
+			if eerr != nil || !ok {
+				out = append(out, VerifyIssue{Rev: rev, Err: fmt.Errorf("chunk %s missing", cdc.HashHex(ref))})
+				bad = true
+				continue
+			}
+			if !texts {
+				continue
+			}
+			b, gerr := r.store.Get(ctx, key, nil)
+			if gerr != nil {
+				out = append(out, VerifyIssue{Rev: rev, Err: gerr})
+				bad = true
+				continue
+			}
+			if uint32(len(b)) != ref.Size || sha256.Sum256(b) != ref.Hash {
+				out = append(out, VerifyIssue{Rev: rev, Err: fmt.Errorf("chunk %s checksum mismatch", cdc.HashHex(ref))})
+				bad = true
+			}
+		}
+		if !bad && nr.TotalSize > 0 && sum != nr.TotalSize {
+			out = append(out, VerifyIssue{Rev: rev, Err: fmt.Errorf("chunked text size %d, want %d", sum, nr.TotalSize)})
+		}
+		return out
+	}
+	if nr.TextRep == TextRepExternal {
+		ok, eerr := r.store.Exists(ctx, r.keys.Text(nr.TextRef))
+		if eerr != nil || !ok {
+			return append(out, VerifyIssue{Rev: rev, Err: fmt.Errorf("text object %s missing", nr.TextRef)})
+		}
+	}
+	if !texts {
+		return out
+	}
+	data, gerr := r.GetText(nr.Node)
+	if gerr != nil {
+		return append(out, VerifyIssue{Rev: rev, Err: gerr,
+			Rebuildable: nr.TextRep == TextRepDelta && nr.Base != nil})
+	}
+	if nr.TotalSize > 0 && uint64(len(data)) != nr.TotalSize {
+		return append(out, VerifyIssue{Rev: rev, Err: fmt.Errorf("text size %d, want %d", len(data), nr.TotalSize)})
+	}
+	if nr.TextMD5 != ([16]byte{}) {
+		sum := md5.Sum(data)
+		if sum != nr.TextMD5 {
+			out = append(out, VerifyIssue{Rev: rev, Err: fmt.Errorf("text md5 mismatch")})
+		}
+	}
+	return out
+}
+
+// verifyNodesParallel verifies the nodes of one revision with a small worker
+// pool. A revision created by a large import carries thousands of files, and
+// with texts enabled each is an object read; doing them serially made that
+// revision the slowest part of `verify --texts`.
+const verifyParallelNodes = 8
+const verifyNodeWorkers = 4
+
+func (r *Repo) verifyNodesParallel(rev uint64, rb *RevBlock, seen map[NodeID]bool, issues *[]VerifyIssue) {
+	var batch []NodeID
+	for _, e := range rb.nodeTbl {
+		nid := NodeID{Rev: rb.Rev, ID: e.ID}
+		if seen[nid] {
+			continue
+		}
+		seen[nid] = true
+		batch = append(batch, nid)
+	}
+	sem := make(chan struct{}, verifyNodeWorkers)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	for _, nid := range batch {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(nid NodeID) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			res := r.verifyNode(rev, nid, true)
+			if len(res) == 0 {
+				return
+			}
+			mu.Lock()
+			*issues = append(*issues, res...)
+			mu.Unlock()
+		}(nid)
+	}
+	wg.Wait()
 }
 
 // verifyRevisionSemantics checks the invariants that survive byte-level

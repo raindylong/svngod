@@ -78,9 +78,17 @@ func Load(repo *fs.Repo, r io.Reader) error {
 	var lastRev uint64
 	startHead, _ := repo.Head()
 	dumpUUID := ""
+	// Resume support: a dump can be replayed after an interrupted load. Every
+	// revision the target already has (number <= HEAD) is parsed but discarded,
+	// and the remaining ones are appended on top of the existing HEAD. Loading
+	// is per-revision atomic, so re-running the same dump continues where it
+	// stopped instead of duplicating history.
+	lastRev = startHead
+	skipping := false
 
 	flush := func() error {
-		if !inRevision || len(changes) == 0 {
+		if !inRevision || skipping || len(changes) == 0 {
+			changes = nil
 			return nil
 		}
 		// Incremental import: each revision commit builds on the previous one so
@@ -115,9 +123,14 @@ func Load(repo *fs.Repo, r io.Reader) error {
 			return err
 		}
 
-		if _, ok := hdrs["Revision-number"]; ok {
+		if rn, ok := hdrs["Revision-number"]; ok {
 			if err := flush(); err != nil {
 				return err
+			}
+			if n, perr := strconv.ParseUint(strings.TrimSpace(rn), 10, 64); perr == nil && n <= startHead {
+				skipping = true
+			} else {
+				skipping = false
 			}
 			contentLen, err := strconv.Atoi(hdrs["Content-length"])
 			if err != nil {
@@ -171,6 +184,9 @@ func Load(repo *fs.Repo, r io.Reader) error {
 		cs, _, err := buildChange(repo, br, hdrs)
 		if err != nil {
 			return err
+		}
+		if skipping {
+			continue
 		}
 		changes = append(changes, cs...)
 	}

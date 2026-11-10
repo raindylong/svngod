@@ -351,6 +351,7 @@ func doReplicas(o *options, repoName string, verify, repair bool) {
 	if err != nil {
 		fatal(err)
 	}
+	keyPrefix := strings.Trim(repoPrefix, "/") + "/" + repoName
 	if repair {
 		if ms, _, merr := o.mirrorStore(repoName); merr == nil {
 			if rp, ok := ms.(interface{ RepairNow() }); ok {
@@ -359,8 +360,32 @@ func doReplicas(o *options, repoName string, verify, repair bool) {
 			}
 			closeStore(ms)
 		}
+		// Divergent (present but different) shard indexes are converged by
+		// rebuilding each member's index from *its own* immutable segments.
+		// Copying one member's index onto another could propagate a stale
+		// mapping after a failover; a rebuild can only produce what the
+		// member's own objects say, and equal objects yield equal digests.
+		for i, e := range entries {
+			st, serr := memberStore(e)
+			if serr != nil {
+				continue
+			}
+			r, oerr := fs.OpenRepo(st, keyPrefix)
+			if oerr == nil {
+				if n, rerr := r.RepairSegmentIndexes(context.Background()); rerr != nil {
+					fmt.Printf("replicas: member[%d] index rebuild: %v\n", i, rerr)
+				} else if n > 0 {
+					fmt.Printf("replicas: member[%d] rebuilt %d shard index(es)\n", i, n)
+				}
+				if d, derr := r.RepairRevPropsOverrides(context.Background()); derr != nil {
+					fmt.Printf("replicas: member[%d] revprop repair: %v\n", i, derr)
+				} else if d > 0 {
+					fmt.Printf("replicas: member[%d] dropped %d dead revprop override(s)\n", i, d)
+				}
+			}
+			closeStore(st)
+		}
 	}
-	keyPrefix := strings.Trim(repoPrefix, "/") + "/" + repoName
 	var firstHead uint64
 	var firstDigest, firstUUID string
 	drift := false

@@ -3,6 +3,7 @@ package dump
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"testing"
 
 	"svngod/internal/cdc"
@@ -231,5 +232,74 @@ func TestDumpLoadRoundTripSegmentsWithOverrides(t *testing.T) {
 	// needed to serve them.
 	if ok, _ := dst.Store().Exists(context.Background(), dst.Keys().SegRevPropsIndex(0)); ok {
 		t.Fatal("loaded repository stores properties as an override")
+	}
+}
+
+// buildPrefixRepo commits n revisions adding one file each, so a prefix of its
+// history can be replayed into another repository.
+func buildPrefixRepo(t *testing.T, prefix, name string, n int) *fs.Repo {
+	t.Helper()
+	st := store.NewMemoryStore()
+	r, err := fs.CreateRepo(st, name, 8, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= n; i++ {
+		rev, cerr := r.CommitTxn(uint64(i-1), []fs.Change{{
+			Path: fmt.Sprintf("/f%d.txt", i), Action: fs.ActionAdd, Kind: fs.KindFile,
+			Data: []byte(fmt.Sprintf("content %d", i)),
+		}}, map[string]string{"svn:log": fmt.Sprintf("r%d", i), "svn:author": "alice",
+			"svn:date": fmt.Sprintf("2026-11-10T00:00:%02dZ", i)})
+		if cerr != nil {
+			t.Fatalf("commit %d: %v", i, cerr)
+		}
+		if rev != uint64(i) {
+			t.Fatalf("rev=%d, want %d", rev, i)
+		}
+	}
+	_ = prefix
+	return r
+}
+
+// TestLoadResumesFromExistingHead: replaying a dump into a repository that
+// already holds a prefix of it must skip those revisions instead of duplicating
+// history, which makes an interrupted `svnadmin load` resumable.
+func TestLoadResumesFromExistingHead(t *testing.T) {
+	src := buildPrefixRepo(t, "", "repos/src5", 5)
+	var full bytes.Buffer
+	if err := Dump(src, &full); err != nil {
+		t.Fatal(err)
+	}
+
+	// Target already at revision 3 (an interrupted load).
+	partial := buildPrefixRepo(t, "", "repos/pre3", 3)
+	var partDump bytes.Buffer
+	if err := Dump(partial, &partDump); err != nil {
+		t.Fatal(err)
+	}
+	dst, err := fs.CreateRepo(store.NewMemoryStore(), "repos/dst", 8, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Load(dst, bytes.NewReader(partDump.Bytes())); err != nil {
+		t.Fatalf("prefix load: %v", err)
+	}
+	if h, _ := dst.Head(); h != 3 {
+		t.Fatalf("prefix head=%d", h)
+	}
+	if err := Load(dst, bytes.NewReader(full.Bytes())); err != nil {
+		t.Fatalf("resume load: %v", err)
+	}
+	if h, _ := dst.Head(); h != 5 {
+		t.Fatalf("resumed head=%d, want 5 (no duplicates)", h)
+	}
+	assertSameTree(t, src, dst)
+
+	// Replaying the whole dump again is a no-op.
+	if err := Load(dst, bytes.NewReader(full.Bytes())); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if h, _ := dst.Head(); h != 5 {
+		t.Fatalf("replay head=%d, want 5", h)
 	}
 }
