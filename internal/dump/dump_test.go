@@ -392,3 +392,36 @@ func TestLoadRangeSplitsImport(t *testing.T) {
 		t.Fatal("--from past HEAD+1 was accepted")
 	}
 }
+
+// TestLoadProgressCallback: the callback fires once per *applied* revision and
+// not for skipped ones.
+func TestLoadProgressCallback(t *testing.T) {
+	src := buildPrefixRepo(t, "", "repos/lsrc", 5)
+	var buf bytes.Buffer
+	if err := Dump(src, &buf); err != nil {
+		t.Fatal(err)
+	}
+	dst, err := fs.CreateRepo(store.NewMemoryStore(), "repos/ldst", 8, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var applied []uint64
+	if err := LoadRangeProgress(dst, bytes.NewReader(buf.Bytes()), 0, 0, func(rev uint64) {
+		applied = append(applied, rev)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(applied) != 5 || applied[0] != 1 || applied[4] != 5 {
+		t.Fatalf("applied=%v, want 1..5", applied)
+	}
+	// Replaying skips every revision: no callbacks.
+	applied = nil
+	if err := LoadRangeProgress(dst, bytes.NewReader(buf.Bytes()), 0, 0, func(rev uint64) {
+		applied = append(applied, rev)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(applied) != 0 {
+		t.Fatalf("skipped replay reported %v", applied)
+	}
+}

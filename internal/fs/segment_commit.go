@@ -187,7 +187,7 @@ func (r *Repo) publishSegmentPlans(ctx context.Context, lease *commitLease, cur 
 		}
 		// The active shard's index would otherwise grow with every commit and be
 		// rewritten in full each time; merge it when it reaches the threshold.
-		if n := refCounts[i]; n > 0 && n%segmentCompactionThreshold == 0 {
+		if th := r.compactionThreshold(); refCounts[i] > 0 && refCounts[i]%th == 0 {
 			r.enqueueCompaction(g.shard, true)
 		}
 	}
@@ -222,7 +222,20 @@ type compactJob struct {
 // shard. Without it a busy repository that never reaches the next shard
 // boundary accumulates one index entry per commit and rewrites the whole index
 // on every commit (write amplification quadratic in the number of commits).
-const segmentCompactionThreshold = 64
+//
+// It scales with the segment target: a merge rewrites the current tail, and a
+// larger target means a larger tail, so a 4 MiB target triggers at 256 entries
+// (fewer, larger rewrites) instead of every 64 commits.
+func (r *Repo) compactionThreshold() int {
+	t := 64
+	if r.segmentTarget > 0 && int(r.segmentTarget/16) > t {
+		t = int(r.segmentTarget / 16)
+	}
+	if t > 1024 {
+		t = 1024
+	}
+	return t
+}
 
 // enqueueCompaction schedules a shard. A full queue drops the job (compaction is
 // an optimisation, never required for correctness); the next trigger or GC

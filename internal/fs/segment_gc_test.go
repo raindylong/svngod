@@ -304,13 +304,13 @@ func TestActiveShardCompactionBoundsIndex(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(refs) < segmentCompactionThreshold || time.Now().After(deadline) {
+		if len(refs) < r.compactionThreshold() || time.Now().After(deadline) {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if len(refs) >= segmentCompactionThreshold {
-		t.Fatalf("active shard index still has %d entries (threshold %d)", len(refs), segmentCompactionThreshold)
+	if th := r.compactionThreshold(); len(refs) >= th {
+		t.Fatalf("active shard index still has %d entries (threshold %d)", len(refs), th)
 	}
 	for rev := uint64(1); rev <= 140; rev++ {
 		if _, err := r.readBlock(rev); err != nil {

@@ -68,6 +68,12 @@ func Load(repo *fs.Repo, r io.Reader) error {
 // interrupted import; `from` must not exceed the target's HEAD+1, otherwise the
 // result would silently miss history.
 func LoadRange(repo *fs.Repo, r io.Reader, from, to uint64) error {
+	return LoadRangeProgress(repo, r, from, to, nil)
+}
+
+// LoadRangeProgress is LoadRange with a callback after each applied revision
+// (skipped revisions do not call it).
+func LoadRangeProgress(repo *fs.Repo, r io.Reader, from, to uint64, progress func(rev uint64)) error {
 	// (uuid handling below: adopt the dump's UUID when loading into an empty
 	// repository)
 	br := bufio.NewReader(r)
@@ -109,6 +115,9 @@ func LoadRange(repo *fs.Repo, r io.Reader, from, to uint64) error {
 			return err
 		}
 		lastRev = rev
+		if progress != nil {
+			progress(rev)
+		}
 		changes = nil
 		return nil
 	}

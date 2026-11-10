@@ -57,12 +57,16 @@ type options struct {
 	journalLimit    int
 	verifyWorkers   int
 	textWorkers     int
+	progress        bool
 	loadFrom        uint64
 	loadTo          uint64
 	rebuildIndex    bool
 	verifyMembers   bool
 	repairVerify    bool
 	repairMembers   bool
+	repairMirror    bool
+	repairIndexOnly bool
+	repairProps     bool
 	replicaTextfile string
 	keepJournal     uint64
 	gcGrace         int
@@ -222,7 +226,10 @@ func main() {
 	}
 	if cmd == "replicas" {
 		fs.BoolVar(&o.verifyMembers, "verify", false, "also walk every revision on each member")
-		fs.BoolVar(&o.repairMembers, "repair", false, "run the mirror repair pass before comparing")
+		fs.BoolVar(&o.repairMembers, "repair", false, "run every repair action before comparing")
+		fs.BoolVar(&o.repairMirror, "repair-mirror", false, "only copy missing objects between members")
+		fs.BoolVar(&o.repairIndexOnly, "repair-index", false, "only rebuild each member's shard indexes")
+		fs.BoolVar(&o.repairProps, "repair-revprops", false, "only drop dead revision-property overrides")
 		fs.StringVar(&o.replicaTextfile, "textfile", "", "also write these metrics as a Prometheus textfile")
 	}
 	if cmd == "verify" {
@@ -233,6 +240,7 @@ func main() {
 		fs.IntVar(&o.verifyWorkers, "workers", 1, "parallel workers for --all-revs")
 		fs.BoolVar(&o.rebuildIndex, "repair-index", false, "with --all-revs: rebuild shard indexes from segments before checking")
 		fs.IntVar(&o.textWorkers, "text-workers", 4, "concurrent text checks inside one revision with --texts")
+		fs.BoolVar(&o.progress, "progress", false, "print progress to stderr every 5s")
 	}
 	if cmd == "journal" {
 		fs.IntVar(&o.journalLimit, "n", 20, "number of records to show")
@@ -255,6 +263,7 @@ func main() {
 		fs.StringVar(&output, "output", "", "write dump to file (default stdout)")
 	}
 	if cmd == "load" {
+		fs.BoolVar(&o.progress, "progress", false, "print progress to stderr every 5s")
 		fs.StringVar(&input, "input", "", "read dump from file (default stdin)")
 		fs.Uint64Var(&o.loadFrom, "from", 0, "first revision number to apply (earlier ones must already exist)")
 		fs.Uint64Var(&o.loadTo, "to", 0, "last revision number to apply (0 = all)")
@@ -361,7 +370,15 @@ func doReplicas(o *options, repoName string, verify, repair bool) {
 		fatal(err)
 	}
 	keyPrefix := strings.Trim(repoPrefix, "/") + "/" + repoName
-	if repair {
+	repairMirror, repairIndex, repairProps := false, false, false
+	switch {
+	case o.repairMirror || o.repairIndexOnly || o.repairProps:
+		// Specific actions were requested: run exactly those.
+		repairMirror, repairIndex, repairProps = o.repairMirror, o.repairIndexOnly, o.repairProps
+	case repair:
+		repairMirror, repairIndex, repairProps = true, true, true
+	}
+	if repairMirror {
 		if ms, _, merr := o.mirrorStore(repoName); merr == nil {
 			if rp, ok := ms.(interface{ RepairNow() }); ok {
 				fmt.Println("replicas: running mirror repair before the comparison")
@@ -369,6 +386,8 @@ func doReplicas(o *options, repoName string, verify, repair bool) {
 			}
 			closeStore(ms)
 		}
+	}
+	if repairIndex || repairProps {
 		// Divergent (present but different) shard indexes are converged by
 		// rebuilding each member's index from *its own* immutable segments.
 		// Copying one member's index onto another could propagate a stale
@@ -381,15 +400,19 @@ func doReplicas(o *options, repoName string, verify, repair bool) {
 			}
 			r, oerr := fs.OpenRepo(st, keyPrefix)
 			if oerr == nil {
-				if n, rerr := r.RepairSegmentIndexes(context.Background()); rerr != nil {
-					fmt.Printf("replicas: member[%d] index rebuild: %v\n", i, rerr)
-				} else if n > 0 {
-					fmt.Printf("replicas: member[%d] rebuilt %d shard index(es)\n", i, n)
+				if repairIndex {
+					if n, rerr := r.RepairSegmentIndexes(context.Background()); rerr != nil {
+						fmt.Printf("replicas: member[%d] index rebuild: %v\n", i, rerr)
+					} else if n > 0 {
+						fmt.Printf("replicas: member[%d] rebuilt %d shard index(es)\n", i, n)
+					}
 				}
-				if d, derr := r.RepairRevPropsOverrides(context.Background()); derr != nil {
-					fmt.Printf("replicas: member[%d] revprop repair: %v\n", i, derr)
-				} else if d > 0 {
-					fmt.Printf("replicas: member[%d] dropped %d dead revprop override(s)\n", i, d)
+				if repairProps {
+					if d, derr := r.RepairRevPropsOverrides(context.Background()); derr != nil {
+						fmt.Printf("replicas: member[%d] revprop repair: %v\n", i, derr)
+					} else if d > 0 {
+						fmt.Printf("replicas: member[%d] dropped %d dead revprop override(s)\n", i, d)
+					}
 				}
 			}
 			closeStore(st)
@@ -520,7 +543,7 @@ usage:
   svnadmin repair [--mirror-file FILE] [--rebuild-index] <repo>  # reconcile mirrors / rebuild segment indexes
   svnadmin delete-repo -force [s3 flags | --mirror-file FILE] <repo>  # delete every object of a repository
   svnadmin journal [-n N] [s3 flags | --mirror-file FILE] <repo>  # show WAL records
-  svnadmin replicas [-verify] [-repair] --mirror-file FILE <repo>  # per-member drift (HEAD/UUID/index/revprops)
+  svnadmin replicas [-verify] [-repair | -repair-mirror|-repair-index|-repair-revprops] --mirror-file FILE <repo>
   svnadmin gc [-texts] [s3 flags] <repo>  # loose objects, txn bodies, segment compaction (-texts: unreferenced texts, slow)
 
 s3 flags: --endpoint H:PORT --access-key K --secret-key S --bucket B [--prefix P] [--ssl]
@@ -995,7 +1018,22 @@ func doVerify(o *options, repoName string) {
 			to = head
 		}
 		fs.SetVerifyTextWorkers(o.textWorkers)
-		issues, err = repo.VerifyRangeWith(from, to, o.texts, o.verifyWorkers)
+		var progress func(uint64)
+		if o.progress {
+			total := to - from + 1
+			last := time.Now()
+			var mu sync.Mutex
+			progress = func(done uint64) {
+				mu.Lock()
+				defer mu.Unlock()
+				if time.Since(last) < 5*time.Second || done == 0 {
+					return
+				}
+				last = time.Now()
+				fmt.Fprintf(os.Stderr, "verify: %d/%d revisions (%.0f%%)\n", done, total, float64(done)*100/float64(total))
+			}
+		}
+		issues, err = repo.VerifyRangeWithProgress(from, to, o.texts, o.verifyWorkers, progress)
 		scope := fmt.Sprintf("revs %d..%d (texts=%v, workers=%d)", from, to, o.texts, o.verifyWorkers)
 		if err != nil {
 			fatal(err)
@@ -1072,7 +1110,22 @@ func doLoad(o *options, repoName, input string) {
 		defer f.Close()
 		r = f
 	}
-	if err := dump.LoadRange(repo, r, o.loadFrom, o.loadTo); err != nil {
+	var loadProgress func(uint64)
+	if o.progress {
+		start := time.Now()
+		last := time.Now()
+		var mu sync.Mutex
+		loadProgress = func(rev uint64) {
+			mu.Lock()
+			defer mu.Unlock()
+			if time.Since(last) < 5*time.Second {
+				return
+			}
+			last = time.Now()
+			fmt.Fprintf(os.Stderr, "load: revision %d applied (%s)\n", rev, time.Since(start).Round(time.Second))
+		}
+	}
+	if err := dump.LoadRangeProgress(repo, r, o.loadFrom, o.loadTo, loadProgress); err != nil {
 		fatal(err)
 	}
 	head, _ := repo.Head()

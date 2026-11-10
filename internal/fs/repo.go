@@ -1438,6 +1438,14 @@ func (r *Repo) VerifyRange(from, to uint64, texts bool) ([]VerifyIssue, error) {
 // dropped index entry would make whole revision ranges unreadable while every
 // remaining object still verifies.
 func (r *Repo) VerifyRangeWith(from, to uint64, texts bool, workers int) ([]VerifyIssue, error) {
+	return r.VerifyRangeWithProgress(from, to, texts, workers, nil)
+}
+
+// VerifyRangeWithProgress is VerifyRangeWith plus a callback invoked after each
+// revision. Long walks (10M revisions) need progress reporting; the callback is
+// called from worker goroutines, so it must be cheap and concurrency-safe.
+func (r *Repo) VerifyRangeWithProgress(from, to uint64, texts bool, workers int,
+	progress func(done uint64)) ([]VerifyIssue, error) {
 	if from == 0 {
 		from = 1
 	}
@@ -1455,6 +1463,11 @@ func (r *Repo) VerifyRangeWith(from, to uint64, texts bool, workers int) ([]Veri
 	// verify must confirm the index SHA-256 of every segment object.
 	r.fullReads.Store(true)
 	defer r.fullReads.Store(false)
+	var done atomic.Uint64
+	tick := func() {}
+	if progress != nil {
+		tick = func() { progress(done.Add(1)) }
+	}
 
 	var issues []VerifyIssue
 	if r.segments {
@@ -1465,7 +1478,7 @@ func (r *Repo) VerifyRangeWith(from, to uint64, texts bool, workers int) ([]Veri
 		issues = append(issues, idxIssues...)
 	}
 	if workers <= 1 || to-from < 8 {
-		more, err := r.verifyRangeSeq(from, to, texts)
+		more, err := r.verifyRangeSeq(from, to, texts, tick)
 		if err != nil {
 			return nil, err
 		}
@@ -1492,7 +1505,7 @@ func (r *Repo) VerifyRangeWith(from, to uint64, texts bool, workers int) ([]Veri
 		wg.Add(1)
 		go func(i int, lo, hi uint64) {
 			defer wg.Done()
-			results[i], errs[i] = r.verifyRangeSeq(lo, hi, texts)
+			results[i], errs[i] = r.verifyRangeSeq(lo, hi, texts, tick)
 		}(i, lo, hi)
 	}
 	wg.Wait()
@@ -1510,10 +1523,13 @@ func (r *Repo) VerifyRangeWith(from, to uint64, texts bool, workers int) ([]Veri
 
 // verifyRangeSeq walks [from,to] single-threaded. Callers own the fullReads
 // mode and any index-level checks.
-func (r *Repo) verifyRangeSeq(from, to uint64, texts bool) ([]VerifyIssue, error) {
+func (r *Repo) verifyRangeSeq(from, to uint64, texts bool, tick func()) ([]VerifyIssue, error) {
 	var issues []VerifyIssue
 	seen := make(map[NodeID]bool)
 	for rev := from; rev <= to; rev++ {
+		if tick != nil {
+			tick()
+		}
 		rb, berr := r.readBlock(rev)
 		if berr != nil {
 			issues = append(issues, VerifyIssue{Rev: rev, Err: berr})

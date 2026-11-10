@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"fmt"
 	"math/rand"
+	"sync/atomic"
 	"testing"
 
 	"svngod/internal/cdc"
@@ -68,5 +69,20 @@ func TestVerifyTextsParallelRevision(t *testing.T) {
 	}
 	if len(issues) > 2 {
 		t.Fatalf("duplicate reports for one corrupt chunk: %v", issues)
+	}
+}
+
+// TestVerifyProgressCallback: the callback fires once per verified revision,
+// including on the parallel path.
+func TestVerifyProgressCallback(t *testing.T) {
+	r := segRepo(t, "repos/vprog")
+	commitBatches(t, r, 1, 4)
+	var calls atomic.Int64
+	issues, err := r.VerifyRangeWithProgress(1, 4, false, 1, func(uint64) { calls.Add(1) })
+	if err != nil || len(issues) != 0 {
+		t.Fatalf("issues=%v err=%v", issues, err)
+	}
+	if calls.Load() != 4 {
+		t.Fatalf("progress calls=%d, want 4", calls.Load())
 	}
 }
