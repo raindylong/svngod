@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -120,6 +121,12 @@ func (r *Repo) publishSegmentPlans(ctx context.Context, lease *commitLease, cur 
 			errs[p.idx] = err
 		}
 		return revs, errs, err
+	}
+	// Chaos hook (test-only): exit after the WAL batch record but before the
+	// HEAD CAS, so a live quorum store exercises roll-forward of a whole batch.
+	if os.Getenv("SVNGOD_CHAOS_AFTER_WAL") == "1" {
+		log.Printf("chaos: exiting after WAL batch %d..%d before current CAS", batchFirst, batchFirst+batchCount-1)
+		os.Exit(9)
 	}
 	last := plans[len(plans)-1].rev
 	nc := &Current{Head: last, Created: created}
