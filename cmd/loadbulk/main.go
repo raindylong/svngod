@@ -82,7 +82,7 @@ func main() {
 				// Each chunk lands in its own subdir bulk/cN so the root dir
 				// stays shallow (30 entries); a flat root of 30000 files makes
 				// every commit rewrite the root's full child list => O(n^2).
-				Path: fmt.Sprintf("/c%02d/%s", chunk, n),
+				Path:   fmt.Sprintf("/c%02d/%s", chunk, n),
 				Action: fs.ActionAdd, Kind: fs.KindFile, Data: data,
 			})
 		}

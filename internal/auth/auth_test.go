@@ -111,9 +111,9 @@ func (f *fakeLdapConn) Close() error { return nil }
 
 func TestLDAPSearchBind(t *testing.T) {
 	a := NewLDAP(LDAPConfig{
-		URL:         "ldap://localhost:1389",
-		BaseDN:      "ou=people,dc=example",
-		Filter:      "(uid={{username}})",
+		URL:           "ldap://localhost:1389",
+		BaseDN:        "ou=people,dc=example",
+		Filter:        "(uid={{username}})",
 		ServiceBindDN: "cn=admin,dc=example",
 	})
 	fake := &fakeLdapConn{

@@ -257,4 +257,3 @@ func (r *Repo) verifySegmentFull(ref segmentRef) (*segmentData, error) {
 	}
 	return decodeSegment(b)
 }
-

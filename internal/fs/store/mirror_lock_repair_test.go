@@ -77,6 +77,7 @@ func TestRepairLeavesLockStateAloneWithoutArbiter(t *testing.T) {
 		t.Fatal("lock state changed while the arbiter was unreachable")
 	}
 }
+
 // TestDeletePrimaryOnlyTouchesArbiter: loose-object cleanup must not mirror
 // its deletes; a standby's leftover copies are harmless, while mirrored
 // thousand-key deletes used to take a live standby out of service.
