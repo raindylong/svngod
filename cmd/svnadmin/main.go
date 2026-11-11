@@ -67,6 +67,7 @@ type options struct {
 	repairMirror    bool
 	repairIndexOnly bool
 	repairProps     bool
+	replicaQuiet    bool
 	replicaTextfile string
 	keepJournal     uint64
 	gcGrace         int
@@ -231,6 +232,7 @@ func main() {
 		fs.BoolVar(&o.repairMirror, "repair-mirror", false, "only copy missing objects between members")
 		fs.BoolVar(&o.repairIndexOnly, "repair-index", false, "only rebuild each member's shard indexes")
 		fs.BoolVar(&o.repairProps, "repair-revprops", false, "only drop dead revision-property overrides")
+		fs.BoolVar(&o.replicaQuiet, "quiet", false, "only print differences and the final verdict")
 		fs.StringVar(&o.replicaTextfile, "textfile", "", "also write these metrics as a Prometheus textfile")
 	}
 	if cmd == "verify" {
@@ -364,6 +366,7 @@ type memberStat struct {
 // Any difference means a replica is behind or damaged; -verify additionally
 // walks every revision on each member.
 func doReplicas(o *options, repoName string, verify, repair bool) {
+	quiet := o.replicaQuiet
 	if o.mirrorFile == "" {
 		fatal(errors.New("replicas requires --mirror-file"))
 	}
@@ -383,7 +386,9 @@ func doReplicas(o *options, repoName string, verify, repair bool) {
 	if repairMirror {
 		if ms, _, merr := o.mirrorStore(repoName); merr == nil {
 			if rp, ok := ms.(interface{ RepairNow() }); ok {
-				fmt.Println("replicas: running mirror repair before the comparison")
+				if !quiet {
+					fmt.Println("replicas: running mirror repair before the comparison")
+				}
 				rp.RepairNow()
 			}
 			closeStore(ms)
@@ -405,14 +410,14 @@ func doReplicas(o *options, repoName string, verify, repair bool) {
 				if repairIndex {
 					if n, rerr := r.RepairSegmentIndexes(context.Background()); rerr != nil {
 						fmt.Printf("replicas: member[%d] index rebuild: %v\n", i, rerr)
-					} else if n > 0 {
+					} else if n > 0 && !quiet {
 						fmt.Printf("replicas: member[%d] rebuilt %d shard index(es)\n", i, n)
 					}
 				}
 				if repairProps {
 					if d, derr := r.RepairRevPropsOverrides(context.Background()); derr != nil {
 						fmt.Printf("replicas: member[%d] revprop repair: %v\n", i, derr)
-					} else if d > 0 {
+					} else if d > 0 && !quiet {
 						fmt.Printf("replicas: member[%d] dropped %d dead revprop override(s)\n", i, d)
 					}
 				}
@@ -447,7 +452,9 @@ func doReplicas(o *options, repoName string, verify, repair bool) {
 			closeStore(st)
 			continue
 		}
-		fmt.Printf("member[%d] %s head=%d uuid=%s index=%s\n", i, e.Endpoint+e.Root, head, uuid, short(digest))
+		if !quiet {
+			fmt.Printf("member[%d] %s head=%d uuid=%s index=%s\n", i, e.Endpoint+e.Root, head, uuid, short(digest))
+		}
 		stats = append(stats, memberStat{index: i, label: e.Endpoint + e.Root, head: head, digest: digest, ok: true})
 		if i == 0 {
 			firstHead, firstDigest, firstUUID = head, digest, uuid
@@ -466,7 +473,7 @@ func doReplicas(o *options, repoName string, verify, repair bool) {
 					fmt.Printf("  rev=%d %v\n", is.Rev, is.Err)
 				}
 				drift = true
-			} else {
+			} else if !quiet {
 				fmt.Printf("member[%d] verify: no issues\n", i)
 			}
 		}
@@ -1084,6 +1091,9 @@ func doVerify(o *options, repoName string) {
 	for _, is := range issues {
 		fmt.Printf("  rev=%d path=%s err=%v rebuildable=%v\n", is.Rev, is.Path, is.Err, is.Rebuildable)
 	}
+	// A verifier's job is to fail: monitoring and cron must be able to act on
+	// the exit status instead of parsing log lines.
+	os.Exit(1)
 }
 
 func doDump(o *options, repoName, output string) {
