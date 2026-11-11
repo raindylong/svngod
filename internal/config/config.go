@@ -72,16 +72,20 @@ type Repo struct {
 
 // Store describes a storage backend (or a mirror of backends).
 type Store struct {
-	Type      string  `json:"type"` // "file" | "s3" | "mirror"
-	Root      string  `json:"root"`
-	Endpoint  string  `json:"endpoint"`
-	AccessKey string  `json:"access-key"`
-	SecretKey string  `json:"secret-key"`
-	Bucket    string  `json:"bucket"`
-	Prefix    string  `json:"prefix"`
-	SSL       bool    `json:"ssl"`
-	Mirrors   []Store `json:"mirrors"`
-	Quorum    int     `json:"quorum"`
+	Type      string `json:"type"` // "file" | "s3" | "mirror"
+	Root      string `json:"root"`
+	Endpoint  string `json:"endpoint"`
+	AccessKey string `json:"access-key"`
+	SecretKey string `json:"secret-key"`
+	// SecretKeyFile names a file holding the S3 secret key, mirroring
+	// admin-token-file: it keeps credentials out of the JSON document. The
+	// file is read when the store is built, so hot reloads pick up rotation.
+	SecretKeyFile string  `json:"secret-key-file,omitempty"`
+	Bucket        string  `json:"bucket"`
+	Prefix        string  `json:"prefix"`
+	SSL           bool    `json:"ssl"`
+	Mirrors       []Store `json:"mirrors"`
+	Quorum        int     `json:"quorum"`
 }
 
 // Auth is one authentication backend.
@@ -185,13 +189,35 @@ func (r *Repo) MakeStore() (store.Store, error) {
 	return r.Storage.makeStore(r.Prefix())
 }
 
+// resolveSecret returns the S3 secret key, reading SecretKeyFile when set.
+// Exactly one of secret-key / secret-key-file may be provided. The file is
+// read at store-build time so a hot reload picks up rotation without editing
+// the JSON document (mirrors admin-token-file).
+func (s *Store) resolveSecret() (string, error) {
+	if s.SecretKeyFile == "" {
+		return s.SecretKey, nil
+	}
+	if s.SecretKey != "" {
+		return "", fmt.Errorf("s3 storage: set either secret-key or secret-key-file, not both")
+	}
+	b, err := os.ReadFile(s.SecretKeyFile)
+	if err != nil {
+		return "", fmt.Errorf("s3 secret-key-file: %w", err)
+	}
+	return strings.TrimSpace(string(b)), nil
+}
+
 func (s *Store) makeStore(prefix string) (store.Store, error) {
 	switch s.Type {
 	case "s3":
+		secret, serr := s.resolveSecret()
+		if serr != nil {
+			return nil, serr
+		}
 		return store.NewS3Store(store.S3Config{
 			Endpoint:  s.Endpoint,
 			AccessKey: s.AccessKey,
-			SecretKey: s.SecretKey,
+			SecretKey: secret,
 			Bucket:    s.Bucket,
 			Region:    "us-east-1",
 			UseSSL:    s.SSL,
