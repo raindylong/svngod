@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -240,5 +241,50 @@ func TestCASAcrossInstances(t *testing.T) {
 		if o.Key == casLockName {
 			t.Fatalf("lock file %q appeared as a stored object", casLockName)
 		}
+	}
+}
+
+// TestStoreOpMetrics: backend operations are counted with latency, and a
+// missing object is not counted as an error. The registry is process-wide, so
+// the test compares deltas rather than absolute values.
+func TestStoreOpMetrics(t *testing.T) {
+	snap := func() map[string]OpSnapshot {
+		out := map[string]OpSnapshot{}
+		for _, s := range SnapshotOps() {
+			out[s.Backend+"."+s.Op] = s
+		}
+		return out
+	}
+	before := snap()
+	dir := t.TempDir()
+	st, err := NewFileStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := st.Put(ctx, "k1", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Get(ctx, "k1", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Get(ctx, "missing", nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing get err=%v", err)
+	}
+	if err := st.Delete(ctx, []string{"k1"}); err != nil {
+		t.Fatal(err)
+	}
+	after := snap()
+	for _, op := range []string{"file.put", "file.get", "file.delete"} {
+		b, a := before[op], after[op]
+		if a.Count <= b.Count {
+			t.Fatalf("%s counter did not advance: %+v -> %+v", op, b, a)
+		}
+		if a.Duration <= b.Duration {
+			t.Fatalf("%s duration did not advance", op)
+		}
+	}
+	if before["file.get"].Errors != after["file.get"].Errors {
+		t.Fatalf("NotFound counted as error: %+v -> %+v", before["file.get"], after["file.get"])
 	}
 }

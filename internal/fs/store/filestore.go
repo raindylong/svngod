@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -124,7 +125,9 @@ func (s *FileStore) ensureDirLocked(dir string) error {
 	return nil
 }
 
-func (s *FileStore) Put(ctx context.Context, key string, data []byte) error {
+func (s *FileStore) Put(ctx context.Context, key string, data []byte) (err error) {
+	start := time.Now()
+	defer func() { observeOp("file", "put", start, err) }()
 	return s.put(ctx, key, data, s.syncWrites)
 }
 
@@ -180,6 +183,13 @@ func (s *FileStore) put(_ context.Context, key string, data []byte, durable bool
 }
 
 func (s *FileStore) Get(_ context.Context, key string, rng *Range) ([]byte, error) {
+	start := time.Now()
+	b, err := s.get(key, rng)
+	observeOp("file", "get", start, err)
+	return b, err
+}
+
+func (s *FileStore) get(key string, rng *Range) ([]byte, error) {
 	p, err := s.objPath(key)
 	if err != nil {
 		return nil, err
@@ -278,7 +288,9 @@ func (s *FileStore) PutFile(_ context.Context, key, src string) error {
 
 // PutFrom streams into a temp file and renames it into place, so readers never
 // observe a partially written object.
-func (s *FileStore) PutFrom(ctx context.Context, key string, r io.Reader, size int64) error {
+func (s *FileStore) PutFrom(ctx context.Context, key string, r io.Reader, size int64) (err error) {
+	start := time.Now()
+	defer func() { observeOp("file", "put_from", start, err) }()
 	return s.putFrom(ctx, key, r, size, s.syncWrites)
 }
 
@@ -607,7 +619,9 @@ func (s *FileStore) DeleteIfMatch(_ context.Context, key, etag string) error {
 	return s.syncDir(filepath.Dir(p))
 }
 
-func (s *FileStore) Delete(_ context.Context, keys []string) error {
+func (s *FileStore) Delete(_ context.Context, keys []string) (err error) {
+	start := time.Now()
+	defer func() { observeOp("file", "delete", start, err) }()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, k := range keys {

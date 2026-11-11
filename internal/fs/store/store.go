@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -441,5 +442,67 @@ func (m *MemoryStore) Keys() []string {
 		out = append(out, k)
 	}
 	sort.Strings(out)
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// Backend operation metrics
+
+// opStat is one backend operation's cumulative counters.
+type opStat struct {
+	count    atomic.Uint64
+	errors   atomic.Uint64
+	durNanos atomic.Uint64
+}
+
+// opStats is keyed "<backend>.<op>" (e.g. "s3.get"). It is a package-level
+// registry because the store implementations are created in several places
+// (server, svnadmin, mirrors) and a per-instance hook would need plumbing
+// through every wrapper.
+var opStats sync.Map
+
+// OpSnapshot is one operation's cumulative counters.
+type OpSnapshot struct {
+	Backend  string
+	Op       string
+	Count    uint64
+	Errors   uint64
+	Duration time.Duration
+}
+
+func observeOp(backend, op string, start time.Time, err error) {
+	v, _ := opStats.LoadOrStore(backend+"."+op, &opStat{})
+	s := v.(*opStat)
+	s.count.Add(1)
+	s.durNanos.Add(uint64(time.Since(start)))
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		s.errors.Add(1)
+	}
+}
+
+// SnapshotOps returns the cumulative backend operation counters, sorted by
+// backend and op so the exposition is stable.
+func SnapshotOps() []OpSnapshot {
+	var out []OpSnapshot
+	opStats.Range(func(k, v any) bool {
+		key, _ := k.(string)
+		s, _ := v.(*opStat)
+		backend, op, ok := strings.Cut(key, ".")
+		if !ok || s == nil {
+			return true
+		}
+		out = append(out, OpSnapshot{
+			Backend: backend, Op: op,
+			Count: s.count.Load(), Errors: s.errors.Load(),
+			Duration: time.Duration(s.durNanos.Load()),
+		})
+		return true
+	})
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Backend != out[j].Backend {
+			return out[i].Backend < out[j].Backend
+		}
+		return out[i].Op < out[j].Op
+	})
 	return out
 }

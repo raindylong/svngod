@@ -191,16 +191,20 @@ func seekableReader(r io.Reader) io.ReadSeeker {
 // only added round trips (and required the gateway to implement it).
 var singlePut = minio.PutObjectOptions{ContentType: "application/octet-stream", PartSize: 5 << 30}
 
-func (s *S3Store) Put(ctx context.Context, key string, data []byte) error {
+func (s *S3Store) Put(ctx context.Context, key string, data []byte) (err error) {
+	start := time.Now()
+	defer func() { observeOp("s3", "put", start, err) }()
 	return retry(ctx, func() error {
 		_, err := s.client.PutObject(ctx, s.bucket, s.key(key), bytes.NewReader(data), int64(len(data)), singlePut)
 		return err
 	})
 }
 
-func (s *S3Store) Get(ctx context.Context, key string, rng *Range) ([]byte, error) {
+func (s *S3Store) Get(ctx context.Context, key string, rng *Range) (out []byte, err error) {
+	start := time.Now()
+	defer func() { observeOp("s3", "get", start, err) }()
 	var buf []byte
-	err := retry(ctx, func() error {
+	err = retry(ctx, func() error {
 		var gerr error
 		buf, gerr = s.getOnce(ctx, key, rng)
 		return gerr
@@ -237,7 +241,9 @@ func (s *S3Store) getOnce(ctx context.Context, key string, rng *Range) ([]byte, 
 	return buf, nil
 }
 
-func (s *S3Store) PutFrom(ctx context.Context, key string, r io.Reader, size int64) error {
+func (s *S3Store) PutFrom(ctx context.Context, key string, r io.Reader, size int64) (err error) {
+	start := time.Now()
+	defer func() { observeOp("s3", "put_from", start, err) }()
 	sr := seekableReader(r)
 	return retry(ctx, func() error {
 		if sr != nil {
@@ -506,7 +512,9 @@ func (s *S3Store) DeleteIfMatch(ctx context.Context, key, etag string) error {
 	return s.Delete(ctx, []string{key})
 }
 
-func (s *S3Store) Delete(ctx context.Context, keys []string) error {
+func (s *S3Store) Delete(ctx context.Context, keys []string) (err error) {
+	start := time.Now()
+	defer func() { observeOp("s3", "delete", start, err) }()
 	if len(keys) == 0 {
 		return nil
 	}

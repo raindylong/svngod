@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"svngod/internal/fs"
+	"svngod/internal/fs/store"
 )
 
 // metrics is the server's aggregate observability state. Labels are limited
@@ -188,6 +189,25 @@ func (s *Server) serveMetrics(w http.ResponseWriter) {
 	b.WriteString("# TYPE svngod_commit_errors_total counter\n")
 	for _, reason := range reasons {
 		fmt.Fprintf(&b, "svngod_commit_errors_total{reason=%q} %d\n", escapeLabel(reason), errs[reason])
+	}
+
+	// Backend operation counters (per store implementation). They answer "was
+	// the commit slow in our code or in the object store", which the HTTP
+	// histogram cannot.
+	ops := store.SnapshotOps()
+	if len(ops) > 0 {
+		b.WriteString("# HELP svngod_store_ops_total Object-store operations by backend and operation.\n")
+		b.WriteString("# TYPE svngod_store_ops_total counter\n")
+		b.WriteString("# HELP svngod_store_op_errors_total Failed object-store operations (NotFound excluded).\n")
+		b.WriteString("# TYPE svngod_store_op_errors_total counter\n")
+		b.WriteString("# HELP svngod_store_op_duration_seconds Cumulative time per operation.\n")
+		b.WriteString("# TYPE svngod_store_op_duration_seconds summary\n")
+	}
+	for _, o := range ops {
+		fmt.Fprintf(&b, "svngod_store_ops_total{store=%q,op=%q} %d\n", escapeLabel(o.Backend), escapeLabel(o.Op), o.Count)
+		fmt.Fprintf(&b, "svngod_store_op_errors_total{store=%q,op=%q} %d\n", escapeLabel(o.Backend), escapeLabel(o.Op), o.Errors)
+		fmt.Fprintf(&b, "svngod_store_op_duration_seconds_sum{store=%q,op=%q} %.6f\n", escapeLabel(o.Backend), escapeLabel(o.Op), o.Duration.Seconds())
+		fmt.Fprintf(&b, "svngod_store_op_duration_seconds_count{store=%q,op=%q} %d\n", escapeLabel(o.Backend), escapeLabel(o.Op), o.Count)
 	}
 
 	// Mirror replication health/lag, for repositories backed by a mirror.
