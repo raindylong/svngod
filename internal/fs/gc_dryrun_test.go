@@ -108,12 +108,12 @@ func TestGCCompactionDryRun(t *testing.T) {
 	}
 }
 
-// TestCollectLooseDryRunEstimatesBytes: on a packed format-v1 repository the dry
-// run counts and sizes the loose leftovers it would delete, without touching
-// them.
-func TestCollectLooseDryRunEstimatesBytes(t *testing.T) {
+// TestCountLooseShard: the dry-run's loose counter lists the packed shard's
+// remaining loose objects and sizes them. (Auto-packing collects them in the
+// background, so the test calls the counter directly rather than racing it.)
+func TestCountLooseShard(t *testing.T) {
 	st := store.NewMemoryStore()
-	r, err := CreateRepo(st, "repos/ldry", 2, 64) // two revisions per shard
+	r, err := CreateRepo(st, "repos/lcnt", 2, 64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,40 +125,23 @@ func TestCollectLooseDryRunEstimatesBytes(t *testing.T) {
 			t.Fatalf("commit %d: %v", i, cerr)
 		}
 	}
-	// Committing a full shard packs it; the loose copies remain for GC.
-	var havePacked bool
-	for sh := uint64(0); sh <= r.shard(4); sh++ {
-		if packed, _ := r.isPacked(sh); packed {
-			havePacked = true
-		}
+	if err := r.PackShard(0); err != nil {
+		t.Fatal(err)
 	}
-	if !havePacked {
-		t.Fatal("test setup: no packed shard")
+	// Plant loose leftovers with known sizes.
+	rev := r.keys.LooseRev(0, 900)
+	props := r.keys.LooseRevProps(0, 900)
+	if err := st.Put(context.Background(), rev, []byte("0123456789")); err != nil {
+		t.Fatal(err)
 	}
-	var bytes int64
-	n, err := r.CollectLooseProgress(context.Background(), true, func(phase string, done, total int, b int64) {
-		bytes = b
-	})
+	if err := st.Put(context.Background(), props, []byte("abcde")); err != nil {
+		t.Fatal(err)
+	}
+	n, bytes, err := r.countLooseShard(context.Background(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n == 0 || bytes == 0 {
-		t.Fatalf("dry loose count=%d bytes=%d, want both > 0", n, bytes)
-	}
-	// A real pass removes them; the next dry run then reports nothing. (The real
-	// pass counts issued deletes, an upper bound, so only the dry-run counts are
-	// compared.)
-	if _, err := r.CollectLooseProgress(context.Background(), false, nil); err != nil {
-		t.Fatal(err)
-	}
-	var after int64
-	n2, err := r.CollectLooseProgress(context.Background(), true, func(phase string, done, total int, b int64) {
-		after = b
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n2 != 0 || after != 0 {
-		t.Fatalf("dry run after real gc: count=%d bytes=%d, want 0", n2, after)
+	if n < 2 || bytes < 15 {
+		t.Fatalf("countLooseShard=%d objects %d bytes, want >=2 and >=15", n, bytes)
 	}
 }

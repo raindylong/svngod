@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"log"
 	"os"
@@ -1631,6 +1632,13 @@ func (r *Repo) verifyNode(rev uint64, nid NodeID, texts bool) []VerifyIssue {
 		}
 		var sum uint64
 		bad := false
+		// Hash the whole text while reading each chunk once; materialising a
+		// multi-gigabyte file just to compute its md5 was the last verify path
+		// that could exhaust memory.
+		var whole hash.Hash
+		if texts {
+			whole = md5.New()
+		}
 		for _, ref := range refs {
 			sum += uint64(ref.Size)
 			key := r.keys.Chunk(cdc.HashHex(ref))
@@ -1652,10 +1660,19 @@ func (r *Repo) verifyNode(rev uint64, nid NodeID, texts bool) []VerifyIssue {
 			if uint32(len(b)) != ref.Size || sha256.Sum256(b) != ref.Hash {
 				out = append(out, VerifyIssue{Rev: rev, Err: fmt.Errorf("chunk %s checksum mismatch", cdc.HashHex(ref))})
 				bad = true
+				continue
 			}
+			whole.Write(b)
 		}
 		if !bad && nr.TotalSize > 0 && sum != nr.TotalSize {
 			out = append(out, VerifyIssue{Rev: rev, Err: fmt.Errorf("chunked text size %d, want %d", sum, nr.TotalSize)})
+		}
+		if !bad && texts && nr.TextMD5 != ([16]byte{}) {
+			var got [16]byte
+			copy(got[:], whole.Sum(nil))
+			if got != nr.TextMD5 {
+				out = append(out, VerifyIssue{Rev: rev, Err: fmt.Errorf("text md5 mismatch")})
+			}
 		}
 		return out
 	}
@@ -1664,6 +1681,26 @@ func (r *Repo) verifyNode(rev uint64, nid NodeID, texts bool) []VerifyIssue {
 		if eerr != nil || !ok {
 			return append(out, VerifyIssue{Rev: rev, Err: fmt.Errorf("text object %s missing", nr.TextRef)})
 		}
+		if !texts {
+			return out
+		}
+		// Stream the object into the hash: a single huge file costs O(1) memory.
+		h := md5.New()
+		n, gerr := r.store.GetTo(ctx, r.keys.Text(nr.TextRef), h)
+		if gerr != nil {
+			return append(out, VerifyIssue{Rev: rev, Err: gerr})
+		}
+		if nr.TotalSize > 0 && uint64(n) != nr.TotalSize {
+			return append(out, VerifyIssue{Rev: rev, Err: fmt.Errorf("text size %d, want %d", n, nr.TotalSize)})
+		}
+		if nr.TextMD5 != ([16]byte{}) {
+			var got [16]byte
+			copy(got[:], h.Sum(nil))
+			if got != nr.TextMD5 {
+				out = append(out, VerifyIssue{Rev: rev, Err: fmt.Errorf("text md5 mismatch")})
+			}
+		}
+		return out
 	}
 	if !texts {
 		return out

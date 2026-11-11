@@ -396,10 +396,10 @@ func runMultiRepo(configPath string, commitBatch, commitWindowMs int, adminAddr,
 	if len(buildFailures) > 0 {
 		go retryFailedRepos(cfg, buildFailures, srv, logger)
 	}
-	startAdmin(configPath, cfg, cfgs, srv, adminAddr, adminToken, adminAllowCIDR, logger)
-	log.Printf("svngod listening on %s (base %s, %d repos)", addr, cfg.BasePath, len(repos))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	startAdmin(configPath, cfg, cfgs, srv, adminAddr, adminToken, adminAllowCIDR, logger, ctx)
+	log.Printf("svngod listening on %s (base %s, %d repos)", addr, cfg.BasePath, len(repos))
 	// The session reaper used to run only in single-repository mode; without it
 	// a long-lived multi-repository process never reaped abandoned commits.
 	go srv.RunMaintenance(ctx, 10*time.Minute)
@@ -415,7 +415,7 @@ func runMultiRepo(configPath string, commitBatch, commitWindowMs int, adminAddr,
 // startAdmin runs the management API on its own listener. It is disabled
 // unless an address is configured; running it without a token is refused.
 func startAdmin(configPath string, cfg *config.Config, cfgs map[string]*server.RepoConfig,
-	srv *server.Server, addr, token, allowCIDR string, logger *log.Logger) {
+	srv *server.Server, addr, token, allowCIDR string, logger *log.Logger, ctx context.Context) {
 	if addr == "" {
 		addr = cfg.AdminAddr
 	}
@@ -455,6 +455,14 @@ func startAdmin(configPath string, cfg *config.Config, cfgs map[string]*server.R
 		if err := hs.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Printf("admin API stopped: %v", err)
 		}
+	}()
+	// Drain the management listener with the main server, so a config-changing
+	// request in flight is not cut off by the process exiting.
+	go func() {
+		<-ctx.Done()
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = hs.Shutdown(sctx)
 	}()
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
