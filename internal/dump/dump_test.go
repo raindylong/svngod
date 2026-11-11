@@ -3,7 +3,10 @@ package dump
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"svngod/internal/cdc"
@@ -423,5 +426,117 @@ func TestLoadProgressCallback(t *testing.T) {
 	}
 	if len(applied) != 0 {
 		t.Fatalf("skipped replay reported %v", applied)
+	}
+}
+
+// TestLoadSpoolsLargeText: a node body above the spool threshold is written to
+// a temp file, loaded correctly, and the temp file is removed afterwards.
+func TestLoadSpoolsLargeText(t *testing.T) {
+	old := loadSpoolThreshold
+	loadSpoolThreshold = 1 << 20
+	defer func() { loadSpoolThreshold = old }()
+
+	st := store.NewMemoryStore()
+	src, err := fs.CreateRepo(st, "repos/spoolsrc", 8, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	big := make([]byte, 2<<20)
+	for i := range big {
+		big[i] = byte(i * 31)
+	}
+	if _, err := src.CommitTxn(0, []fs.Change{{Path: "/big.bin", Action: fs.ActionAdd, Kind: fs.KindFile, Data: big}},
+		map[string]string{"svn:log": "r1", "svn:author": "a", "svn:date": "2026-11-11T00:00:01Z"}); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := Dump(src, &buf); err != nil {
+		t.Fatal(err)
+	}
+	before := spoolFiles(t)
+	dst, err := fs.CreateRepo(store.NewMemoryStore(), "repos/spooldst", 8, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Load(dst, bytes.NewReader(buf.Bytes())); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if after := spoolFiles(t); len(after) > len(before) {
+		t.Fatalf("spooled temp files left behind: before=%v after=%v", before, after)
+	}
+	nr, err := dst.Resolve(1, "/big.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := dst.GetText(nr.Node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, big) {
+		t.Fatal("large text differs after load")
+	}
+}
+
+// spoolFiles lists this process's spooled load bodies.
+func spoolFiles(t *testing.T) []string {
+	t.Helper()
+	pat := fmt.Sprintf("svngod-txn-%d-*", os.Getpid())
+	m, err := filepath.Glob(filepath.Join(os.TempDir(), pat))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+// TestDumpStreamsChunkedText: a node stored as content-defined chunks dumps and
+// loads back byte-identically through the streaming path.
+func TestDumpStreamsChunkedText(t *testing.T) {
+	st := store.NewMemoryStore()
+	src, err := fs.CreateRepo(st, "repos/dchunk", 8, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := make([]byte, 3<<20)
+	for i := range data {
+		data[i] = byte(i * 7)
+	}
+	manifest, total, err := src.StoreChunkedReader(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := md5.Sum(data)
+	if _, err := src.CommitTxn(0, []fs.Change{{
+		Path: "/big.bin", Action: fs.ActionAdd, Kind: fs.KindFile,
+		ChunkManifest: manifest, ChunkTotal: uint64(total),
+		DataMD5: sum, HasMD5: true,
+	}}, map[string]string{"svn:log": "r1", "svn:author": "a", "svn:date": "2026-11-11T00:00:01Z"}); err != nil {
+		t.Fatal(err)
+	}
+	// Precondition: the node is chunked and carries an md5, which is what the
+	// streaming path requires.
+	nr, err := src.Resolve(1, "/big.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nr.TextRep != fs.TextRepChunked || nr.TextMD5 == ([16]byte{}) {
+		t.Fatalf("precondition: rep=%v md5zero=%v", nr.TextRep, nr.TextMD5 == ([16]byte{}))
+	}
+	var buf bytes.Buffer
+	if err := Dump(src, &buf); err != nil {
+		t.Fatal(err)
+	}
+	dst, err := fs.CreateRepo(store.NewMemoryStore(), "repos/dchunkdst", 8, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Load(dst, bytes.NewReader(buf.Bytes())); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	got, err := dst.GetText(mustResolve(t, dst, 1, "/big.bin").Node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("chunked text differs after dump/load")
 	}
 }

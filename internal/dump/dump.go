@@ -168,10 +168,24 @@ func writeNode(w io.Writer, repo *fs.Repo, rev uint64, path string, action chang
 	}
 	propText := encodeProps(nr.Props)
 	var content []byte
+	// Stream chunked/external texts: a 2 GiB file in the repository must not
+	// need 2 GiB of RAM to dump. Inline and delta texts are decoded in memory.
+	streamText := false
+	var textSize uint64
+	var textMD5 [16]byte
 	if nr.Kind == fs.KindFile {
-		content, err = repo.GetText(nr.Node)
-		if err != nil {
-			return 0, err
+		if (nr.TextRep == fs.TextRepExternal || nr.TextRep == fs.TextRepChunked) &&
+			nr.TotalSize > 0 && nr.TextMD5 != ([16]byte{}) {
+			streamText = true
+			textSize = nr.TotalSize
+			textMD5 = nr.TextMD5
+		} else {
+			content, err = repo.GetText(nr.Node)
+			if err != nil {
+				return 0, err
+			}
+			textSize = uint64(len(content))
+			textMD5 = md5.Sum(content)
 		}
 	}
 
@@ -192,22 +206,29 @@ func writeNode(w io.Writer, repo *fs.Repo, rev uint64, path string, action chang
 	}
 	fmt.Fprintf(w, "Prop-content-length: %d\n", len(propText))
 	if nr.Kind == fs.KindFile {
-		fmt.Fprintf(w, "Text-content-length: %d\n", len(content))
-		sum := md5.Sum(content)
-		fmt.Fprintf(w, "Text-content-md5: %x\n", sum)
+		fmt.Fprintf(w, "Text-content-length: %d\n", textSize)
+		fmt.Fprintf(w, "Text-content-md5: %x\n", textMD5)
 	}
-	fmt.Fprintf(w, "Content-length: %d\n\n", len(propText)+len(content))
+	fmt.Fprintf(w, "Content-length: %d\n\n", len(propText)+int(textSize))
 	if _, err := w.Write(propText); err != nil {
 		return 0, err
 	}
-	if _, err := w.Write(content); err != nil {
+	if streamText {
+		n, serr := repo.WriteTextTo(nr.Node, w)
+		if serr != nil {
+			return 0, serr
+		}
+		if uint64(n) != textSize {
+			return 0, fmt.Errorf("dump: streamed %d bytes of %s, want %d", n, path, textSize)
+		}
+	} else if _, err := w.Write(content); err != nil {
 		return 0, err
 	}
 	// blank line terminates the node block (not counted in Content-length)
 	if _, err := io.WriteString(w, "\n"); err != nil {
 		return 0, err
 	}
-	return len(propText) + len(content), nil
+	return len(propText) + int(textSize), nil
 }
 
 // diffRev returns the set of paths changed between rev-1 and rev.
@@ -275,12 +296,11 @@ func diffRev(repo *fs.Repo, rev uint64) (map[string]changeKind, error) {
 				}
 			}
 		} else {
-			ct, err1 := repo.GetText(cur.Node)
-			pt, err2 := repo.GetText(prev.Node)
-			if err1 != nil || err2 != nil {
-				return fmt.Errorf("diff text: %v %v", err1, err2)
-			}
-			if !bytes.Equal(ct, pt) || !sameProps(cur.Props, prev.Props) {
+			// Compare the stored representation, not the materialised bytes:
+			// reading both sides of every file made a dump of a repository with
+			// large binaries read (and hold) gigabytes just to decide what
+			// changed. Uncertainty is resolved conservatively (report modified).
+			if !sameText(cur, prev) || !sameProps(cur.Props, prev.Props) {
 				out[path] = chModified
 			}
 		}
@@ -292,7 +312,28 @@ func diffRev(repo *fs.Repo, rev uint64) (map[string]changeKind, error) {
 	return out, nil
 }
 
-func bytesEqual(a, b []byte) bool { return bytes.Equal(a, b) }
+// sameText reports whether two node-revs provably carry identical file text,
+// using only their stored representation.
+func sameText(a, b *fs.NodeRev) bool {
+	if a.TotalSize > 0 && a.TotalSize == b.TotalSize &&
+		a.TextMD5 != ([16]byte{}) && a.TextMD5 == b.TextMD5 {
+		return true
+	}
+	if a.TextRep != b.TextRep {
+		return false
+	}
+	switch a.TextRep {
+	case fs.TextRepExternal:
+		return a.TextRef != "" && a.TextRef == b.TextRef
+	case fs.TextRepChunked:
+		return len(a.Text) > 0 && bytes.Equal(a.Text, b.Text)
+	case fs.TextRepFull:
+		return bytes.Equal(a.Text, b.Text)
+	case fs.TextRepDelta:
+		return a.Base != nil && b.Base != nil && *a.Base == *b.Base && bytes.Equal(a.Text, b.Text)
+	}
+	return false
+}
 
 func sameProps(a, b map[string]string) bool {
 	if len(a) != len(b) {

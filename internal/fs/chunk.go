@@ -205,3 +205,43 @@ func (c *chunkStream) Read(p []byte) (int, error) {
 	}
 	return c.buf.Read(p)
 }
+
+// WriteTextTo streams a file node's text to w without materialising it when the
+// node stores it as content-defined chunks or an external object. Inline and
+// delta texts are decoded in memory (delta chains are bounded by MAX_DELTA).
+// It returns the number of bytes written.
+func (r *Repo) WriteTextTo(nid NodeID, w io.Writer) (int64, error) {
+	ctx := context.Background()
+	nr, err := r.GetNodeRev(nid)
+	if err != nil {
+		return 0, err
+	}
+	switch nr.TextRep {
+	case TextRepExternal:
+		if nr.TextRef == "" {
+			return 0, errors.New("fs: external text without a reference")
+		}
+		return r.store.GetTo(ctx, r.keys.Text(nr.TextRef), w)
+	case TextRepChunked:
+		refs, perr := cdc.Parse(nr.Text)
+		if perr != nil {
+			return 0, perr
+		}
+		var total int64
+		for _, ref := range refs {
+			n, gerr := r.store.GetTo(ctx, r.keys.Chunk(cdc.HashHex(ref)), w)
+			if gerr != nil {
+				return total, gerr
+			}
+			total += n
+		}
+		return total, nil
+	default:
+		data, gerr := r.GetText(nid)
+		if gerr != nil {
+			return 0, gerr
+		}
+		n, werr := w.Write(data)
+		return int64(n), werr
+	}
+}

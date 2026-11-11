@@ -3,8 +3,11 @@ package dump
 import (
 	"bufio"
 	"bytes"
+	"crypto/md5"
+	"crypto/sha1"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 
@@ -87,6 +90,14 @@ func LoadRangeProgress(repo *fs.Repo, r io.Reader, from, to uint64, progress fun
 	}
 
 	var changes []fs.Change
+	// A dump that fails mid-way must not leave spooled bodies behind.
+	defer func() {
+		for _, ch := range changes {
+			if ch.DataFile != "" {
+				os.Remove(ch.DataFile)
+			}
+		}
+	}()
 	var props map[string]string
 	inRevision := false
 	var lastRev uint64
@@ -111,6 +122,12 @@ func LoadRangeProgress(repo *fs.Repo, r io.Reader, from, to uint64, progress fun
 		// Incremental import: each revision commit builds on the previous one so
 		// earlier revisions' tree content is preserved across shard boundaries.
 		rev, err := repo.CommitTxn(lastRev, changes, props)
+		// Spooled bodies are consumed by the commit (or dropped with it).
+		for _, ch := range changes {
+			if ch.DataFile != "" {
+				os.Remove(ch.DataFile)
+			}
+		}
 		if err != nil {
 			return err
 		}
@@ -241,6 +258,11 @@ func readHeaders(br *bufio.Reader) (map[string]string, error) {
 // buildChange reads a node's props + text and turns it into fs.Change(s).
 // A "replace" expands to delete-then-add so the commit preserves the new
 // content instead of a bare delete.
+// loadSpoolThreshold is the node text size above which the body is spooled to a
+// temp file instead of being buffered. A variable so tests can exercise the
+// spooling path with small files.
+var loadSpoolThreshold = int64(8 << 20)
+
 func buildChange(repo *fs.Repo, br *bufio.Reader, hdrs map[string]string) ([]fs.Change, int, error) {
 	// Dump node paths are repository-relative ("trunk/a.txt"); fs.Change
 	// wants absolute svn paths ("/trunk/a.txt"). Older svngod dumps wrote a
@@ -260,17 +282,56 @@ func buildChange(repo *fs.Repo, br *bufio.Reader, hdrs map[string]string) ([]fs.
 			return nil, 0, err
 		}
 	}
-	content := make([]byte, tlen)
+	var content []byte
+	var spooled string
+	var md5sum [16]byte
+	var sha1sum [20]byte
+	hashed := false
 	if tlen > 0 {
-		if _, err := io.ReadFull(br, content); err != nil {
-			return nil, 0, err
+		if int64(tlen) > loadSpoolThreshold {
+			// Large node bodies are spooled: a dump carrying a 2 GiB file must
+			// not require 2 GiB of RAM to load. The name matches the server's
+			// temp-file convention so a crash leaves a cleanable file.
+			tmp, terr := os.CreateTemp("", fmt.Sprintf("svngod-txn-%d-*", os.Getpid()))
+			if terr != nil {
+				return nil, 0, terr
+			}
+			h := md5.New()
+			hs := sha1.New()
+			n, cerr := io.CopyN(io.MultiWriter(tmp, h, hs), br, int64(tlen))
+			tmp.Close()
+			if cerr != nil || n != int64(tlen) {
+				os.Remove(tmp.Name())
+				if cerr == nil {
+					cerr = fmt.Errorf("dump: short text (%d of %d bytes)", n, tlen)
+				}
+				return nil, 0, cerr
+			}
+			spooled = tmp.Name()
+			copy(md5sum[:], h.Sum(nil))
+			copy(sha1sum[:], hs.Sum(nil))
+			hashed = true
+		} else {
+			content = make([]byte, tlen)
+			if _, err := io.ReadFull(br, content); err != nil {
+				return nil, 0, err
+			}
 		}
 	}
 
-	c := fs.Change{Path: path, Data: content}
+	c := fs.Change{Path: path, Data: content, DataFile: spooled}
+	if hashed {
+		c.DataMD5 = md5sum
+		c.HasMD5 = true
+		c.DataSHA1 = sha1sum
+		c.HasSHA1 = true
+	}
 	if plen > 0 {
 		p, err := decodeProps(propText)
 		if err != nil {
+			if spooled != "" {
+				os.Remove(spooled)
+			}
 			return nil, 0, err
 		}
 		c.Props = p
@@ -311,6 +372,9 @@ func buildChange(repo *fs.Repo, br *bufio.Reader, hdrs map[string]string) ([]fs.
 		}
 		return []fs.Change{del, c}, consumed, nil
 	default:
+		if spooled != "" {
+			os.Remove(spooled)
+		}
 		return nil, 0, fmt.Errorf("dump: unknown node-action %q", action)
 	}
 }
