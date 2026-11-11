@@ -290,6 +290,29 @@ func New(cfg Config) *Server {
 	for k, v := range cfg.RepoReadyError {
 		s.repoReadyErr[k] = v
 	}
+	// Authentication alone does not gate access: without authz rules every
+	// request (including anonymous writes) is allowed. Say so loudly at boot,
+	// because an operator who configures LDAP/passwd usually expects that to
+	// lock the repository.
+	warn := func(repo string) {
+		msg := "config: authentication is configured but no authz rules are: anonymous requests (read AND write) are accepted"
+		if repo != "" {
+			msg = fmt.Sprintf("config: repository %q authenticates users but has no authz rules: anonymous requests (read AND write) are accepted", repo)
+		}
+		if s.cfg.Logger != nil {
+			s.cfg.Logger.Print(msg)
+			return
+		}
+		log.Print(msg)
+	}
+	if cfg.Authenticate != nil && cfg.Authorize == nil {
+		warn("")
+	}
+	for _, rc := range cfg.Repos {
+		if rc.Authenticate != nil && rc.Authorize == nil {
+			warn(rc.Name)
+		}
+	}
 	return s
 }
 

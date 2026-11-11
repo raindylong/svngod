@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 
+	"svngod/internal/auth"
 	"svngod/internal/fs"
 	"svngod/internal/fs/store"
 )
@@ -127,5 +128,21 @@ func TestAuditQuotesUserControlledFields(t *testing.T) {
 	}
 	if !strings.Contains(out, `user="evil\nadmin"`) {
 		t.Fatalf("audit did not quote the username: %q", out)
+	}
+}
+
+func TestWarnsWhenAuthHasNoAuthz(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "passwd")
+	if err := os.WriteFile(p, []byte("alice:x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var buf syncBuffer
+	New(Config{
+		Authenticate: auth.NewChain(auth.NewLocalPasswordFile(p)),
+		Logger:       log.New(&buf, "", 0),
+	})
+	if out := buf.String(); !strings.Contains(out, "anonymous") || !strings.Contains(out, "no authz") {
+		t.Fatalf("missing anonymous-access warning: %q", out)
 	}
 }

@@ -70,6 +70,7 @@ type options struct {
 	repairProps     bool
 	replicaQuiet    bool
 	replicaTextfile string
+	replicaCounts   bool
 	keepJournal     uint64
 	gcGrace         int
 	gcTexts         bool
@@ -235,6 +236,7 @@ func main() {
 		fs.BoolVar(&o.repairProps, "repair-revprops", false, "only drop dead revision-property overrides")
 		fs.BoolVar(&o.replicaQuiet, "quiet", false, "only print differences and the final verdict")
 		fs.StringVar(&o.replicaTextfile, "textfile", "", "also write these metrics as a Prometheus textfile")
+		fs.BoolVar(&o.replicaCounts, "counts", false, "also count content objects per member (slow on large repositories)")
 	}
 	if cmd == "verify" {
 		fs.BoolVar(&o.allRevs, "all-revs", false, "verify every historical revision, not just HEAD")
@@ -362,6 +364,14 @@ type memberStat struct {
 	digest string
 	issues int
 	ok     bool
+	// counts is populated only with -counts; nil means "not measured".
+	counts map[string]contentCount
+}
+
+// contentCount is how many objects of one kind a member holds, and their size.
+type contentCount struct {
+	objects int64
+	bytes   int64
 }
 
 // doReplicas reports each mirror member's HEAD, UUID and shard-index digest.
@@ -454,10 +464,26 @@ func doReplicas(o *options, repoName string, verify, repair bool) {
 			closeStore(st)
 			continue
 		}
+		var counts map[string]contentCount
+		if o.replicaCounts {
+			c, cerr := countContentObjects(context.Background(), st, keyPrefix)
+			counts = c
+			if cerr != nil {
+				// A failed listing is reported but not treated as drift: S3
+				// throttling or a transient network error must not page anyone.
+				fmt.Printf("member[%d] counts: %v\n", i, cerr)
+			}
+		}
 		if !quiet {
 			fmt.Printf("member[%d] %s head=%d uuid=%s index=%s\n", i, e.Endpoint+e.Root, head, uuid, short(digest))
+			if counts != nil {
+				fmt.Printf("member[%d] content texts=%d/%s chunks=%d/%s dirs=%d/%s\n", i,
+					counts["texts"].objects, mib(counts["texts"].bytes),
+					counts["chunks"].objects, mib(counts["chunks"].bytes),
+					counts["dirs"].objects, mib(counts["dirs"].bytes))
+			}
 		}
-		stats = append(stats, memberStat{index: i, label: e.Endpoint + e.Root, head: head, digest: digest, ok: true})
+		stats = append(stats, memberStat{index: i, label: e.Endpoint + e.Root, head: head, digest: digest, ok: true, counts: counts})
 		if i == 0 {
 			firstHead, firstDigest, firstUUID = head, digest, uuid
 		} else if head != firstHead || digest != firstDigest || uuid != firstUUID {
@@ -481,8 +507,11 @@ func doReplicas(o *options, repoName string, verify, repair bool) {
 		}
 		closeStore(st)
 	}
+	if o.replicaCounts {
+		reportContentCountDiffs(stats)
+	}
 	if o.replicaTextfile != "" {
-		writeReplicaMetrics(o.replicaTextfile, repoName, stats, drift)
+		writeReplicaMetrics(o.replicaTextfile, repoName, stats, drift, o.replicaCounts)
 	}
 	if drift {
 		fmt.Println("replicas: differences:")
@@ -493,9 +522,90 @@ func doReplicas(o *options, repoName string, verify, repair bool) {
 	fmt.Println("replicas: consistent")
 }
 
+// contentKinds are the content-addressed object families whose coverage can
+// differ between members even when HEAD and segment digests agree: a
+// commit-quorum write can leave one standby without a text/chunk blob.
+var contentKinds = []string{"texts", "chunks", "dirs"}
+
+// countContentObjects lists the content-addressed object families of one
+// member. It is O(objects) in backend requests, hence opt-in via -counts.
+func countContentObjects(ctx context.Context, st store.Store, prefix string) (map[string]contentCount, error) {
+	out := make(map[string]contentCount, len(contentKinds))
+	for _, kind := range contentKinds {
+		p := strings.TrimPrefix(prefix, "/")
+		if p != "" {
+			p += "/"
+		}
+		p += kind + "/"
+		var c contentCount
+		next := ""
+		for {
+			objs, cont, err := st.ListPrefix(ctx, p, next, 1000)
+			if err != nil {
+				return out, fmt.Errorf("%s: %w", kind, err)
+			}
+			for _, o := range objs {
+				c.objects++
+				c.bytes += o.Size
+			}
+			if cont == "" || cont == next {
+				break
+			}
+			next = cont
+		}
+		out[kind] = c
+	}
+	return out, nil
+}
+
+// reportContentCountDiffs prints members whose content object counts differ.
+// A differing count is a warning, not drift: a standby that was down during a
+// delete or a failed best-effort mirror write legitimately leaves unreferenced
+// orphans on the other member. Missing *referenced* data is what -verify
+// proves; equal counts alone never prove absence of that.
+func reportContentCountDiffs(stats []memberStat) {
+	var differ []string
+	for _, kind := range contentKinds {
+		first, ok := -1, false
+		same := true
+		for i := range stats {
+			c, measured := stats[i].counts[kind]
+			if !measured {
+				continue
+			}
+			if !ok {
+				first, ok = i, true
+				continue
+			}
+			if c != stats[first].counts[kind] {
+				same = false
+			}
+		}
+		if ok && !same {
+			var parts []string
+			for i := range stats {
+				if c, measured := stats[i].counts[kind]; measured {
+					parts = append(parts, fmt.Sprintf("member[%d]=%d/%s", stats[i].index, c.objects, mib(c.bytes)))
+				}
+			}
+			differ = append(differ, "  "+kind+": "+strings.Join(parts, " "))
+		}
+	}
+	if len(differ) > 0 {
+		fmt.Println("replicas: content counts differ (unreferenced orphans are harmless; run -verify to rule out missing data):")
+		for _, line := range differ {
+			fmt.Println(line)
+		}
+	}
+}
+
+func mib(n int64) string {
+	return fmt.Sprintf("%.1fMiB", float64(n)/(1<<20))
+}
+
 // writeReplicaMetrics writes a Prometheus textfile (node_exporter textfile
 // collector layout) so replica drift can alert without parsing logs.
-func writeReplicaMetrics(path, repoName string, stats []memberStat, drift bool) {
+func writeReplicaMetrics(path, repoName string, stats []memberStat, drift, counts bool) {
 	var b strings.Builder
 	b.WriteString("# HELP svngod_replica_head HEAD reported by one mirror member.\n")
 	b.WriteString("# TYPE svngod_replica_head gauge\n")
@@ -520,6 +630,30 @@ func writeReplicaMetrics(path, repoName string, stats []memberStat, drift bool) 
 		consistent = 1
 	}
 	fmt.Fprintf(&b, "svngod_replica_consistent{repo=%q} %d\n", repoName, consistent)
+	if counts {
+		b.WriteString("# HELP svngod_replica_content_objects Content-addressed objects held by one member.\n")
+		b.WriteString("# TYPE svngod_replica_content_objects gauge\n")
+		for _, st := range stats {
+			if !st.ok || st.counts == nil {
+				continue
+			}
+			for _, kind := range contentKinds {
+				fmt.Fprintf(&b, "svngod_replica_content_objects{repo=%q,member=%q,kind=%q} %d\n",
+					repoName, st.label, kind, st.counts[kind].objects)
+			}
+		}
+		b.WriteString("# HELP svngod_replica_content_bytes Bytes held by one member, per content family.\n")
+		b.WriteString("# TYPE svngod_replica_content_bytes gauge\n")
+		for _, st := range stats {
+			if !st.ok || st.counts == nil {
+				continue
+			}
+			for _, kind := range contentKinds {
+				fmt.Fprintf(&b, "svngod_replica_content_bytes{repo=%q,member=%q,kind=%q} %d\n",
+					repoName, st.label, kind, st.counts[kind].bytes)
+			}
+		}
+	}
 	b.WriteString("# HELP svngod_replica_last_run_timestamp Unix time of the last replica check.\n")
 	b.WriteString("# TYPE svngod_replica_last_run_timestamp gauge\n")
 	fmt.Fprintf(&b, "svngod_replica_last_run_timestamp{repo=%q} %d\n", repoName, time.Now().Unix())
@@ -559,7 +693,7 @@ usage:
   svnadmin repair [--mirror-file FILE] [--rebuild-index] <repo>  # reconcile mirrors / rebuild segment indexes
   svnadmin delete-repo -force [s3 flags | --mirror-file FILE] <repo>  # delete every object of a repository
   svnadmin journal [-n N] [s3 flags | --mirror-file FILE] <repo>  # show WAL records
-  svnadmin replicas [-verify] [-repair | -repair-mirror|-repair-index|-repair-revprops] --mirror-file FILE <repo>
+  svnadmin replicas [-verify] [-counts] [-repair | -repair-mirror|-repair-index|-repair-revprops] --mirror-file FILE <repo>
   svnadmin gc [-texts] [s3 flags] <repo>  # loose objects, txn bodies, segment compaction (-texts: unreferenced texts, slow)
 
 s3 flags: --endpoint H:PORT --access-key K --secret-key S --bucket B [--prefix P] [--ssl]
