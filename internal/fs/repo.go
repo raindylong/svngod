@@ -2085,7 +2085,7 @@ func (r *Repo) packShardLocked(shard uint64) error {
 	// standby's leftover loose copies are harmless (repair lists only the
 	// active shard).
 	go func() {
-		if _, err := r.collectLooseShard(context.Background(), shard); err != nil {
+		if _, err := r.collectLooseShard(context.Background(), shard, false); err != nil {
 			log.Printf("pack: loose cleanup shard %d: %v", shard, err)
 		}
 	}()
@@ -2127,11 +2127,12 @@ type GCProgress func(phase string, done, total int)
 // known from HEAD, so this deletes exact keys instead of listing a prefix that
 // may hold tens of thousands of objects.
 func (r *Repo) CollectLoose(ctx context.Context) (int, error) {
-	return r.CollectLooseProgress(ctx, nil)
+	return r.CollectLooseProgress(ctx, false, nil)
 }
 
-// CollectLooseProgress is CollectLoose with phase progress.
-func (r *Repo) CollectLooseProgress(ctx context.Context, progress GCProgress) (int, error) {
+// CollectLooseProgress is CollectLoose with phase progress. dryRun counts what
+// would be removed without touching the store.
+func (r *Repo) CollectLooseProgress(ctx context.Context, dryRun bool, progress GCProgress) (int, error) {
 	if r.segments {
 		// Segment repositories have no per-revision loose objects (revision 0
 		// stays loose but is tiny); compaction reclaims old segments instead.
@@ -2147,7 +2148,7 @@ func (r *Repo) CollectLooseProgress(ctx context.Context, progress GCProgress) (i
 		if err != nil || !packed {
 			continue
 		}
-		n, err := r.collectLooseShard(ctx, shard)
+		n, err := r.collectLooseShard(ctx, shard, dryRun)
 		deleted += n
 		if progress != nil {
 			progress("loose", deleted, 0)
@@ -2181,7 +2182,7 @@ func (r *Repo) deleteLoose(ctx context.Context, keys []string) error {
 	return r.deletePrimaryOrAll(ctx, keys)
 }
 
-func (r *Repo) collectLooseShard(ctx context.Context, shard uint64) (int, error) {
+func (r *Repo) collectLooseShard(ctx context.Context, shard uint64, dryRun bool) (int, error) {
 	first := shard * r.shardSz
 	last := first + r.shardSz - 1
 	var batches [][]string
@@ -2207,6 +2208,12 @@ func (r *Repo) collectLooseShard(ctx context.Context, shard uint64) (int, error)
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
+			if dryRun {
+				mu.Lock()
+				deleted += len(b)
+				mu.Unlock()
+				return
+			}
 			if err := r.deleteLoose(ctx, b); err != nil {
 				mu.Lock()
 				if firstErr == nil {
@@ -2234,6 +2241,16 @@ func (r *Repo) CollectTxnData(ctx context.Context) (int, error) {
 // body is written before the manifest that references it is updated, so a GC
 // pass racing a native commit could otherwise delete a live body.
 func (r *Repo) CollectTxnDataGrace(ctx context.Context, grace time.Duration) (int, error) {
+	return r.collectTxnDataGrace(ctx, grace, false)
+}
+
+// CollectTxnDataDry reports how many objects the transaction sweep would remove
+// without deleting them.
+func (r *Repo) CollectTxnDataDry(ctx context.Context, grace time.Duration) (int, error) {
+	return r.collectTxnDataGrace(ctx, grace, true)
+}
+
+func (r *Repo) collectTxnDataGrace(ctx context.Context, grace time.Duration, dryRun bool) (int, error) {
 	prefix := r.keys.ListingPrefix("dav-txns")
 	refRe := regexp.MustCompile(`"dataRef":"([0-9a-f]+)"`)
 	referenced := map[string]bool{}
@@ -2300,8 +2317,10 @@ func (r *Repo) CollectTxnDataGrace(ctx context.Context, grace time.Duration) (in
 	if len(victims) == 0 {
 		return 0, nil
 	}
-	if err := r.store.Delete(ctx, victims); err != nil {
-		return 0, err
+	if !dryRun {
+		if err := r.store.Delete(ctx, victims); err != nil {
+			return 0, err
+		}
 	}
 	return len(victims), nil
 }
@@ -2377,11 +2396,12 @@ func (r *Repo) CollectTexts(ctx context.Context) (int, error) {
 // GC pass racing an upload would otherwise delete live data. Objects younger
 // than grace are left for the next pass.
 func (r *Repo) CollectTextsGrace(ctx context.Context, grace time.Duration) (int, error) {
-	return r.CollectTextsGraceProgress(ctx, grace, nil)
+	return r.CollectTextsGraceProgress(ctx, grace, false, nil)
 }
 
-// CollectTextsGraceProgress is CollectTextsGrace with phase progress.
-func (r *Repo) CollectTextsGraceProgress(ctx context.Context, grace time.Duration, progress GCProgress) (int, error) {
+// CollectTextsGraceProgress is CollectTextsGrace with phase progress. dryRun
+// reports what would be removed without deleting.
+func (r *Repo) CollectTextsGraceProgress(ctx context.Context, grace time.Duration, dryRun bool, progress GCProgress) (int, error) {
 	head, err := r.Head()
 	if err != nil {
 		return 0, err
@@ -2507,8 +2527,13 @@ func (r *Repo) CollectTextsGraceProgress(ctx context.Context, grace time.Duratio
 	if len(victims) == 0 {
 		return 0, nil
 	}
-	if err := r.store.Delete(ctx, victims); err != nil {
-		return 0, err
+	if !dryRun {
+		if err := r.store.Delete(ctx, victims); err != nil {
+			return 0, err
+		}
+	}
+	if progress != nil {
+		progress("texts", len(victims), len(victims))
 	}
 	return len(victims), nil
 }

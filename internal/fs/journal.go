@@ -388,6 +388,15 @@ func (r *Repo) JournalTail(n int) ([]*CommitRecord, error) {
 // Records are small, but an unbounded log is still undesirable; GC calls this
 // after reclaiming loose objects.
 func (r *Repo) TrimJournal(keep uint64) (int, error) {
+	return r.trimJournal(keep, false)
+}
+
+// TrimJournalDry reports how many WAL records trim would drop without deleting.
+func (r *Repo) TrimJournalDry(keep uint64) (int, error) {
+	return r.trimJournal(keep, true)
+}
+
+func (r *Repo) trimJournal(keep uint64, dryRun bool) (int, error) {
 	head, err := r.HeadFresh()
 	if err != nil {
 		return 0, err
@@ -410,6 +419,17 @@ func (r *Repo) TrimJournal(keep uint64) (int, error) {
 				if ref.First+ref.Count-1 <= cutoff {
 					keys = append(keys, r.keys.Journal(ref.First))
 				}
+			}
+			if dryRun {
+				// Only count records that still exist: trimming is idempotent,
+				// but a dry run must not report records an earlier pass already
+				// removed as reclaimable.
+				for _, k := range keys {
+					if ok, _ := r.store.Exists(context.Background(), k); ok {
+						deleted++
+					}
+				}
+				continue
 			}
 			for start := 0; start < len(keys); start += 1000 {
 				end := start + 1000
@@ -437,6 +457,10 @@ func (r *Repo) TrimJournal(keep uint64) (int, error) {
 	var batch []string
 	flush := func(b []string) {
 		if len(b) == 0 {
+			return
+		}
+		if dryRun {
+			deleted += len(b)
 			return
 		}
 		wg.Add(1)

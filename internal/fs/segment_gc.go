@@ -24,11 +24,12 @@ const segmentOrphanAge = time.Minute
 // under the commit lease, so a concurrent commit can neither be lost nor
 // observe a half-written index.
 func (r *Repo) CompactSegments(ctx context.Context) (int, error) {
-	return r.CompactSegmentsProgress(ctx, nil)
+	return r.CompactSegmentsProgress(ctx, false, nil)
 }
 
-// CompactSegmentsProgress is CompactSegments with per-shard progress.
-func (r *Repo) CompactSegmentsProgress(ctx context.Context, progress GCProgress) (int, error) {
+// CompactSegmentsProgress is CompactSegments with per-shard progress. dryRun
+// counts the shards that would be merged without writing.
+func (r *Repo) CompactSegmentsProgress(ctx context.Context, dryRun bool, progress GCProgress) (int, error) {
 	if !r.segments {
 		return 0, nil
 	}
@@ -43,6 +44,13 @@ func (r *Repo) CompactSegmentsProgress(ctx context.Context, progress GCProgress)
 			return merged, err
 		}
 		if len(refs) <= 1 {
+			continue
+		}
+		if dryRun {
+			merged++
+			if progress != nil {
+				progress("segments", int(sh)+1, int(r.shard(head))+1)
+			}
 			continue
 		}
 		lease, err := r.acquireCommitLease(ctx)
@@ -71,11 +79,12 @@ func (r *Repo) CompactSegmentsProgress(ctx context.Context, progress GCProgress)
 // index. Indexes are read fresh: the sweep must never delete a segment a live
 // compaction is about to publish.
 func (r *Repo) CollectOrphanSegments(ctx context.Context, grace time.Duration) (int, error) {
-	return r.CollectOrphanSegmentsProgress(ctx, grace, nil)
+	return r.CollectOrphanSegmentsProgress(ctx, grace, false, nil)
 }
 
-// CollectOrphanSegmentsProgress is CollectOrphanSegments with progress.
-func (r *Repo) CollectOrphanSegmentsProgress(ctx context.Context, grace time.Duration, progress GCProgress) (int, error) {
+// CollectOrphanSegmentsProgress is CollectOrphanSegments with progress. dryRun
+// counts candidates without acquiring the lease or deleting.
+func (r *Repo) CollectOrphanSegmentsProgress(ctx context.Context, grace time.Duration, dryRun bool, progress GCProgress) (int, error) {
 	if !r.segments {
 		return 0, nil
 	}
@@ -113,6 +122,26 @@ func (r *Repo) CollectOrphanSegmentsProgress(ctx context.Context, grace time.Dur
 	if len(candidates) == 0 {
 		return 0, nil
 	}
+	if dryRun {
+		// Count what a real pass would delete, without the lease: an object is
+		// an orphan only when no shard index references it. (A concurrent
+		// compaction can still publish one of these between this read and a real
+		// sweep, so the number is a close upper bound.)
+		keep, kerr := r.segmentKeepSet(head)
+		if kerr != nil {
+			return 0, kerr
+		}
+		n := 0
+		for _, k := range candidates {
+			if !keep[normalizeListKey(k)] {
+				n++
+			}
+		}
+		if progress != nil {
+			progress("orphans", n, len(candidates))
+		}
+		return n, nil
+	}
 	// Deletion must not race a live compaction: it writes the merged object
 	// before swapping the index, so an object can be unreferenced yet about to
 	// become the published copy. Holding the commit lease excludes exactly that
@@ -123,15 +152,9 @@ func (r *Repo) CollectOrphanSegmentsProgress(ctx context.Context, grace time.Dur
 		return 0, nil
 	}
 	defer lease.Release(r.store)
-	keep := map[string]bool{}
-	for sh := uint64(0); sh <= r.shard(head); sh++ {
-		refs, err := r.loadSegmentIndex(sh)
-		if err != nil {
-			return 0, err
-		}
-		for _, ref := range refs {
-			keep[normalizeListKey(r.segmentKeyFor(ref.First, ref.Count))] = true
-		}
+	keep, err := r.segmentKeepSet(head)
+	if err != nil {
+		return 0, err
 	}
 	deleted := 0
 	for start := 0; start < len(candidates); start += 500 {
@@ -258,4 +281,19 @@ func (r *Repo) ReplicaDigest() (string, error) {
 		h.Write([]byte("\n"))
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// segmentKeepSet is the set of segment objects referenced by any shard index.
+func (r *Repo) segmentKeepSet(head uint64) (map[string]bool, error) {
+	keep := map[string]bool{}
+	for sh := uint64(0); sh <= r.shard(head); sh++ {
+		refs, err := r.loadSegmentIndex(sh)
+		if err != nil {
+			return nil, err
+		}
+		for _, ref := range refs {
+			keep[normalizeListKey(r.segmentKeyFor(ref.First, ref.Count))] = true
+		}
+	}
+	return keep, nil
 }

@@ -72,6 +72,7 @@ type options struct {
 	gcGrace         int
 	gcTexts         bool
 	gcCompact       bool
+	gcDryRun        bool
 	chunkAvg        uint64
 	dirBuckets      bool
 	segments        bool
@@ -250,6 +251,7 @@ func main() {
 		fs.IntVar(&o.gcGrace, "gc-grace", 3600, "seconds an unreferenced text/chunk must be old before collection (0 disables)")
 		fs.BoolVar(&o.gcTexts, "texts", false, "scan every revision to collect unreferenced texts (slow: O(all revisions))")
 		fs.BoolVar(&o.gcCompact, "compact", true, "merge segment shards whose index has more than one entry")
+		fs.BoolVar(&o.gcDryRun, "dry-run", false, "only report what would be removed")
 	}
 	shardSize := uint64(defaultShardSize)
 	maxDelta := uint64(defaultMaxDelta)
@@ -936,24 +938,42 @@ func doGC(o *options, repoName string) {
 		fmt.Printf("gc: %-9s %8d  %s\n", name, n, time.Since(t).Round(time.Millisecond))
 		return n
 	}
-	n := phase("loose", func() (int, error) { return repo.CollectLooseProgress(ctx, progress) })
-	tn := phase("txn-data", func() (int, error) { return repo.CollectTxnDataGrace(ctx, grace) })
+	dry := o.gcDryRun
+	n := phase("loose", func() (int, error) { return repo.CollectLooseProgress(ctx, dry, progress) })
+	tn := phase("txn-data", func() (int, error) {
+		if dry {
+			return repo.CollectTxnDataDry(ctx, grace)
+		}
+		return repo.CollectTxnDataGrace(ctx, grace)
+	})
 	// Collecting unreferenced texts walks every revision, which costs minutes
 	// per 100k revisions on object storage. It is a leak-reclamation pass, never
 	// needed for correctness, so routine GC skips it and ops opt in with -texts.
 	tx := 0
 	if o.gcTexts {
-		tx = phase("texts", func() (int, error) { return repo.CollectTextsGraceProgress(ctx, grace, progress) })
+		tx = phase("texts", func() (int, error) { return repo.CollectTextsGraceProgress(ctx, grace, dry, progress) })
 	}
-	jn := phase("journal", func() (int, error) { return repo.TrimJournal(o.keepJournal) })
+	jn := phase("journal", func() (int, error) {
+		if dry {
+			return repo.TrimJournalDry(o.keepJournal)
+		}
+		return repo.TrimJournal(o.keepJournal)
+	})
 	merged := 0
 	if o.gcCompact {
-		merged = phase("segments", func() (int, error) { return repo.CompactSegmentsProgress(ctx, progress) })
+		merged = phase("segments", func() (int, error) { return repo.CompactSegmentsProgress(ctx, dry, progress) })
 	}
 	// The segment sweep takes the commit lease while it deletes, so a short age
 	// filter is safe and lets one gc run clear the superseded segments that its
 	// own compaction just left behind.
-	orphans := phase("orphans", func() (int, error) { return repo.CollectOrphanSegmentsProgress(ctx, time.Minute, progress) })
+	orphans := phase("orphans", func() (int, error) {
+		return repo.CollectOrphanSegmentsProgress(ctx, time.Minute, dry, progress)
+	})
+	if dry {
+		fmt.Printf("gc: %q dry-run (would remove loose=%d txn=%d texts=%d, merge %d shard(s), drop orphans=%d, journal=%d; nothing was deleted)\n",
+			repoName, n, tn, tx, merged, orphans, jn)
+		return
+	}
 	fmt.Printf("gc: %q done (loose=%d txn=%d texts=%d merged=%d orphans=%d journal=%d)\n",
 		repoName, n, tn, tx, merged, orphans, jn)
 }
