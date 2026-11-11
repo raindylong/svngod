@@ -17,6 +17,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -244,13 +245,42 @@ func main() {
 	hs := newHTTPServer(o.addr, srv.Handler())
 	if o.tlsCert != "" && o.tlsKey != "" {
 		log.Printf("serving HTTPS (cert %s)", o.tlsCert)
-		if err := hs.ListenAndServeTLS(o.tlsCert, o.tlsKey); err != nil {
-			log.Fatal(err)
-		}
-		return
 	}
-	if err := hs.ListenAndServe(); err != nil {
+	if err := serveWithShutdown(ctx, hs, o.tlsCert, o.tlsKey); err != nil {
 		log.Fatal(err)
+	}
+}
+
+// serveWithShutdown runs the HTTP server and, on SIGINT/SIGTERM, stops
+// accepting new requests and waits for in-flight handlers (a commit in the
+// publish phase, a large upload) to finish before returning. Without it a
+// systemd/Kubernetes stop either ignored the signal or killed a commit in
+// flight (the WAL could roll it forward, but the client saw an error).
+func serveWithShutdown(ctx context.Context, hs *http.Server, cert, key string) error {
+	errCh := make(chan error, 1)
+	go func() {
+		if cert != "" && key != "" {
+			errCh <- hs.ListenAndServeTLS(cert, key)
+			return
+		}
+		errCh <- hs.ListenAndServe()
+	}()
+	select {
+	case err := <-errCh:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		log.Printf("shutdown: draining in-flight requests (up to %s)", 30*time.Second)
+		sctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := hs.Shutdown(sctx); err != nil {
+			log.Printf("shutdown: %v", err)
+		}
+		<-errCh
+		log.Printf("shutdown: complete")
+		return nil
 	}
 }
 
@@ -368,15 +398,16 @@ func runMultiRepo(configPath string, commitBatch, commitWindowMs int, adminAddr,
 	}
 	startAdmin(configPath, cfg, cfgs, srv, adminAddr, adminToken, adminAllowCIDR, logger)
 	log.Printf("svngod listening on %s (base %s, %d repos)", addr, cfg.BasePath, len(repos))
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	// The session reaper used to run only in single-repository mode; without it
+	// a long-lived multi-repository process never reaped abandoned commits.
+	go srv.RunMaintenance(ctx, 10*time.Minute)
 	hs := newHTTPServer(addr, srv.Handler())
 	if cfg.TLSCert != "" && cfg.TLSKey != "" {
 		log.Printf("serving HTTPS (cert %s)", cfg.TLSCert)
-		if err := hs.ListenAndServeTLS(cfg.TLSCert, cfg.TLSKey); err != nil {
-			log.Fatal(err)
-		}
-		return
 	}
-	if err := hs.ListenAndServe(); err != nil {
+	if err := serveWithShutdown(ctx, hs, cfg.TLSCert, cfg.TLSKey); err != nil {
 		log.Fatal(err)
 	}
 }

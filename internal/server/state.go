@@ -765,6 +765,7 @@ func (s *Server) RunMaintenance(ctx context.Context, every time.Duration) {
 	if every <= 0 {
 		every = 10 * time.Minute
 	}
+	log.Printf("maintenance: reaping abandoned commit sessions every %s", every)
 	t := time.NewTicker(every)
 	defer t.Stop()
 	for {
