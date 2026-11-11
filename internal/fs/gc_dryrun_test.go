@@ -41,13 +41,22 @@ func TestGCDryRunReportsWithoutDeleting(t *testing.T) {
 		}
 	}
 
-	segN, err := r.CollectOrphanSegmentsProgress(ctx, 0, true, nil)
+	var segBytes, textBytes int64
+	segProgress := func(phase string, done, total int, b int64) { segBytes = b }
+	segN, err := r.CollectOrphanSegmentsProgress(ctx, 0, true, segProgress)
 	if err != nil || segN != 1 {
 		t.Fatalf("dry segments=%d err=%v, want 1", segN, err)
 	}
-	textN, err := r.CollectTextsGraceProgress(ctx, 0, true, nil)
+	if segBytes != int64(len("orphan")) {
+		t.Fatalf("dry segment bytes=%d, want %d", segBytes, len("orphan"))
+	}
+	textProgress := func(phase string, done, total int, b int64) { textBytes = b }
+	textN, err := r.CollectTextsGraceProgress(ctx, 0, true, textProgress)
 	if err != nil || textN != 1 {
 		t.Fatalf("dry texts=%d err=%v, want 1", textN, err)
+	}
+	if textBytes != int64(len("orphan text")) {
+		t.Fatalf("dry text bytes=%d, want %d", textBytes, len("orphan text"))
 	}
 	for _, key := range []string{orphanSeg, orphanText} {
 		if ok, _ := st.Exists(ctx, key); !ok {

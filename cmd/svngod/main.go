@@ -190,8 +190,37 @@ func main() {
 		}
 	}
 
+	// Startup self-check for the single-repo (local directory) mode: enumerate
+	// the repositories under the root and read each HEAD once, so a broken
+	// directory shows up at boot and in /_metrics.
+	ready := map[string]bool{}
+	if o.endpoint == "" {
+		if entries, derr := os.ReadDir(filepath.Join(o.repoRoot, "repos")); derr == nil {
+			for _, e := range entries {
+				if !e.IsDir() {
+					continue
+				}
+				r, oerr := fs.OpenRepo(st, o.repoPrefix(e.Name()))
+				if oerr != nil {
+					log.Printf("self-check: repository %q NOT READY: %v", e.Name(), oerr)
+					ready[e.Name()] = false
+					continue
+				}
+				if _, herr := r.HeadFresh(); herr != nil {
+					log.Printf("self-check: repository %q head unreadable: %v", e.Name(), herr)
+					ready[e.Name()] = false
+					continue
+				}
+				ready[e.Name()] = true
+			}
+			if len(ready) > 0 {
+				log.Printf("self-check: %d repositories checked", len(ready))
+			}
+		}
+	}
 	srv := server.New(server.Config{
 		BasePath:     o.basePath,
+		RepoReady:    ready,
 		Authenticate: chain,
 		Authorize:    az,
 		OpenRepo: func(name string) (*fs.Repo, error) {
@@ -267,7 +296,9 @@ func runMultiRepo(configPath string, commitBatch, commitWindowMs int, adminAddr,
 	// a bad endpoint, bucket or permission is visible in the boot log instead of
 	// on the first client request. strictStart turns those failures fatal.
 	bad := 0
+	ready := make(map[string]bool, len(repos))
 	for _, rc := range repos {
+		ready[rc.Name] = false
 		if rc.OpenRepo == nil {
 			continue
 		}
@@ -284,6 +315,7 @@ func runMultiRepo(configPath string, commitBatch, commitWindowMs int, adminAddr,
 			continue
 		}
 		uuid, _ := r.UUID()
+		ready[rc.Name] = true
 		logger.Printf("self-check: repository %q ready (head=%d uuid=%s segments=%v)", rc.Name, head, uuid, r.SegmentsEnabled())
 	}
 	if strictStart && bad > 0 {
@@ -292,6 +324,7 @@ func runMultiRepo(configPath string, commitBatch, commitWindowMs int, adminAddr,
 	srv := server.New(server.Config{
 		BasePath:             cfg.BasePath,
 		Repos:                repos,
+		RepoReady:            ready,
 		HooksDir:             cfg.Hooks,
 		MaxConcurrentUploads: maxUploads,
 		MaxUserUploads:       maxUserUploads,

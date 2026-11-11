@@ -41,6 +41,11 @@ type Config struct {
 	// global defaults.
 	Repos []*RepoConfig
 
+	// RepoReady is the result of the startup self-check: repo name -> readable.
+	// It is exposed as svngod_repo_ready so a misconfigured backend is visible
+	// in the metrics too, not only in the boot log.
+	RepoReady map[string]bool
+
 	// HooksDir holds optional pre-commit / post-commit executables. They run
 	// with SVN_USER/SVN_REPO/SVN_TXN (and SVN_REV for post-commit) in the
 	// environment; a non-zero pre-commit exit rejects the commit.

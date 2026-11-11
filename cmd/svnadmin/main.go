@@ -520,6 +520,9 @@ func writeReplicaMetrics(path, repoName string, stats []memberStat, drift bool) 
 		consistent = 1
 	}
 	fmt.Fprintf(&b, "svngod_replica_consistent{repo=%q} %d\n", repoName, consistent)
+	b.WriteString("# HELP svngod_replica_last_run_timestamp Unix time of the last replica check.\n")
+	b.WriteString("# TYPE svngod_replica_last_run_timestamp gauge\n")
+	fmt.Fprintf(&b, "svngod_replica_last_run_timestamp{repo=%q} %d\n", repoName, time.Now().Unix())
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, []byte(b.String()), 0o644); err != nil {
 		fmt.Fprintf(os.Stderr, "replicas: write %s: %v\n", tmp, err)
@@ -925,13 +928,18 @@ func doGC(o *options, repoName string) {
 	// large repository can run for hours.
 	var mu sync.Mutex
 	last := time.Now()
-	progress := fs.GCProgress(func(phase string, done, total int) {
+	phaseBytes := map[string]int64{}
+	progress := fs.GCProgress(func(phase string, done, total int, bytes int64) {
 		mu.Lock()
-		defer mu.Unlock()
+		if bytes > 0 {
+			phaseBytes[phase] = bytes
+		}
 		if time.Since(last) < 5*time.Second {
+			mu.Unlock()
 			return
 		}
 		last = time.Now()
+		mu.Unlock()
 		if total > 0 {
 			fmt.Fprintf(os.Stderr, "gc: %s %d/%d\n", phase, done, total)
 		} else {
@@ -979,8 +987,14 @@ func doGC(o *options, repoName string) {
 		return repo.CollectOrphanSegmentsProgress(ctx, time.Minute, dry, progress)
 	})
 	if dry {
-		fmt.Printf("gc: %q dry-run (would remove loose=%d txn=%d texts=%d, merge %d shard(s), drop orphans=%d, journal=%d; nothing was deleted)\n",
-			repoName, n, tn, tx, merged, orphans, jn)
+		var bytes int64
+		mu.Lock()
+		for _, v := range phaseBytes {
+			bytes += v
+		}
+		mu.Unlock()
+		fmt.Printf("gc: %q dry-run (would remove loose=%d txn=%d texts=%d, merge %d shard(s), drop orphans=%d, journal=%d, reclaim ~%s; nothing was deleted)\n",
+			repoName, n, tn, tx, merged, orphans, jn, humanBytes(bytes))
 		return
 	}
 	fmt.Printf("gc: %q done (loose=%d txn=%d texts=%d merged=%d orphans=%d journal=%d)\n",
@@ -1316,4 +1330,18 @@ func reportDriftDiffs(entries []mirrorEntry, keyPrefix string) {
 			break
 		}
 	}
+}
+
+// humanBytes formats a byte count for operator-facing output.
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for v := n / unit; v >= unit; v /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }

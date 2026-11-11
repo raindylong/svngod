@@ -2144,7 +2144,7 @@ func cachePut(c *cache.LRU, k cache.Key, b []byte) {
 // ("loose", "texts-scan", "texts", "segments", "orphans"); done/total are item
 // counts, with total 0 when the size is unknown. Callbacks may run from worker
 // goroutines and must be cheap.
-type GCProgress func(phase string, done, total int)
+type GCProgress func(phase string, done, total int, bytes int64)
 
 // CollectLoose deletes loose revision and revprops objects that belong to
 // shards already packed. PackShard leaves them behind (readers switch to the
@@ -2177,7 +2177,7 @@ func (r *Repo) CollectLooseProgress(ctx context.Context, dryRun bool, progress G
 		n, err := r.collectLooseShard(ctx, shard, dryRun)
 		deleted += n
 		if progress != nil {
-			progress("loose", deleted, 0)
+			progress("loose", deleted, 0, 0)
 		}
 		if err != nil {
 			return deleted, err
@@ -2321,6 +2321,7 @@ func (r *Repo) collectTxnDataGrace(ctx context.Context, grace time.Duration, dry
 		next = n
 	}
 	var victims []string
+	var victimBytes int64
 	for _, k := range dataKeys {
 		ref := strings.TrimPrefix(k.Key, prefix+"data/")
 		if !referenced[ref] {
@@ -2339,6 +2340,7 @@ func (r *Repo) collectTxnDataGrace(ctx context.Context, grace time.Duration, dry
 			continue
 		}
 		victims = append(victims, cf.obj.Key)
+		victimBytes += cf.obj.Size
 	}
 	if len(victims) == 0 {
 		return 0, nil
@@ -2482,11 +2484,12 @@ func (r *Repo) CollectTextsGraceProgress(ctx context.Context, grace time.Duratio
 		}
 	}
 	if progress != nil {
-		progress("texts-scan", int(head+1), int(head+1))
+		progress("texts-scan", int(head+1), int(head+1), 0)
 	}
 	prefix := r.keys.ListingPrefix("texts")
 	next := ""
 	var victims []string
+	var victimBytes int64
 	for {
 		objs, n, err := r.store.ListPrefix(ctx, prefix, next, 500)
 		if err != nil {
@@ -2499,6 +2502,7 @@ func (r *Repo) CollectTextsGraceProgress(ctx context.Context, grace time.Duratio
 					continue
 				}
 				victims = append(victims, o.Key)
+				victimBytes += o.Size
 			}
 		}
 		if n == "" {
@@ -2520,6 +2524,7 @@ func (r *Repo) CollectTextsGraceProgress(ctx context.Context, grace time.Duratio
 					continue
 				}
 				victims = append(victims, o.Key)
+				victimBytes += o.Size
 			}
 		}
 		if n == "" {
@@ -2542,6 +2547,7 @@ func (r *Repo) CollectTextsGraceProgress(ctx context.Context, grace time.Duratio
 						continue
 					}
 					victims = append(victims, o.Key)
+					victimBytes += o.Size
 				}
 			}
 			if n == "" {
@@ -2559,7 +2565,7 @@ func (r *Repo) CollectTextsGraceProgress(ctx context.Context, grace time.Duratio
 		}
 	}
 	if progress != nil {
-		progress("texts", len(victims), len(victims))
+		progress("texts", len(victims), len(victims), victimBytes)
 	}
 	return len(victims), nil
 }

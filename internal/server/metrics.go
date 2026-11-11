@@ -222,6 +222,29 @@ func (s *Server) serveMetrics(w http.ResponseWriter) {
 		names = append(names, k)
 	}
 	sort.Strings(names)
+	if len(s.cfg.RepoReady) > 0 {
+		readyNames := make([]string, 0, len(s.cfg.RepoReady))
+		for name := range s.cfg.RepoReady {
+			readyNames = append(readyNames, name)
+		}
+		sort.Strings(readyNames)
+		b.WriteString("# HELP svngod_repo_ready Whether the repository was readable at startup.\n")
+		b.WriteString("# TYPE svngod_repo_ready gauge\n")
+		for _, name := range readyNames {
+			v := 0
+			if s.cfg.RepoReady[name] {
+				v = 1
+			}
+			fmt.Fprintf(&b, "svngod_repo_ready{repo=%q} %d\n", escapeLabel(name), v)
+		}
+	}
+	b.WriteString("# HELP svngod_repo_head HEAD of each repository this process has open.\n")
+	b.WriteString("# TYPE svngod_repo_head gauge\n")
+	for _, name := range names {
+		if head, err := repos[name].Head(); err == nil {
+			fmt.Fprintf(&b, "svngod_repo_head{repo=%q} %d\n", escapeLabel(name), head)
+		}
+	}
 	b.WriteString("# HELP svngod_block_cache_hits_total Revision-block cache hits.\n")
 	b.WriteString("# TYPE svngod_block_cache_hits_total counter\n")
 	b.WriteString("# HELP svngod_block_cache_misses_total Revision-block cache misses.\n")

@@ -49,7 +49,7 @@ func (r *Repo) CompactSegmentsProgress(ctx context.Context, dryRun bool, progres
 		if dryRun {
 			merged++
 			if progress != nil {
-				progress("segments", int(sh)+1, int(r.shard(head))+1)
+				progress("segments", int(sh)+1, int(r.shard(head))+1, 0)
 			}
 			continue
 		}
@@ -67,7 +67,7 @@ func (r *Repo) CompactSegmentsProgress(ctx context.Context, dryRun bool, progres
 		}
 		merged++
 		if progress != nil {
-			progress("segments", int(sh)+1, int(r.shard(head))+1)
+			progress("segments", int(sh)+1, int(r.shard(head))+1, 0)
 		}
 	}
 	return merged, nil
@@ -98,7 +98,11 @@ func (r *Repo) CollectOrphanSegmentsProgress(ctx context.Context, grace time.Dur
 	// List candidates without holding any lock: a listing can take a while on a
 	// large repository and must not block commits.
 	prefix := r.keys.ListingPrefix("segs")
-	var candidates []string
+	type orphanSeg struct {
+		key  string
+		size int64
+	}
+	var candidates []orphanSeg
 	next := ""
 	for {
 		objs, cont, err := r.store.ListPrefix(ctx, prefix, next, 1000)
@@ -112,7 +116,7 @@ func (r *Repo) CollectOrphanSegmentsProgress(ctx context.Context, grace time.Dur
 			if o.ModTime.IsZero() || time.Since(o.ModTime) < grace {
 				continue
 			}
-			candidates = append(candidates, normalizeListKey(o.Key))
+			candidates = append(candidates, orphanSeg{key: normalizeListKey(o.Key), size: o.Size})
 		}
 		if cont == "" || cont == next {
 			break
@@ -132,13 +136,15 @@ func (r *Repo) CollectOrphanSegmentsProgress(ctx context.Context, grace time.Dur
 			return 0, kerr
 		}
 		n := 0
-		for _, k := range candidates {
-			if !keep[normalizeListKey(k)] {
+		var bytes int64
+		for _, c := range candidates {
+			if !keep[c.key] {
 				n++
+				bytes += c.size
 			}
 		}
 		if progress != nil {
-			progress("orphans", n, len(candidates))
+			progress("orphans", n, len(candidates), bytes)
 		}
 		return n, nil
 	}
@@ -157,6 +163,7 @@ func (r *Repo) CollectOrphanSegmentsProgress(ctx context.Context, grace time.Dur
 		return 0, err
 	}
 	deleted := 0
+	var deletedBytes int64
 	for start := 0; start < len(candidates); start += 500 {
 		end := start + 500
 		if end > len(candidates) {
@@ -164,9 +171,11 @@ func (r *Repo) CollectOrphanSegmentsProgress(ctx context.Context, grace time.Dur
 		}
 		batch := candidates[start:end]
 		victims := make([]string, 0, len(batch))
-		for _, k := range batch {
-			if !keep[k] {
-				victims = append(victims, k)
+		var batchBytes int64
+		for _, c := range batch {
+			if !keep[c.key] {
+				victims = append(victims, c.key)
+				batchBytes += c.size
 			}
 		}
 		if len(victims) == 0 {
@@ -176,12 +185,13 @@ func (r *Repo) CollectOrphanSegmentsProgress(ctx context.Context, grace time.Dur
 			return deleted, err
 		}
 		deleted += len(victims)
+		deletedBytes += batchBytes
 		if progress != nil {
-			progress("orphans", deleted, len(candidates))
+			progress("orphans", deleted, len(candidates), deletedBytes)
 		}
 	}
 	if progress != nil {
-		progress("orphans", deleted, len(candidates))
+		progress("orphans", deleted, len(candidates), deletedBytes)
 	}
 	return deleted, nil
 }
