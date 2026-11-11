@@ -62,6 +62,7 @@ type options struct {
 	loadTo          uint64
 	rebuildIndex    bool
 	verifyMembers   bool
+	verifyTextfile  string
 	repairVerify    bool
 	repairMembers   bool
 	repairMirror    bool
@@ -244,6 +245,7 @@ func main() {
 		fs.BoolVar(&o.rebuildIndex, "repair-index", false, "with --all-revs: rebuild shard indexes from segments before checking")
 		fs.IntVar(&o.textWorkers, "text-workers", 4, "concurrent text checks inside one revision with --texts")
 		fs.BoolVar(&o.progress, "progress", false, "print progress to stderr every 5s")
+		fs.StringVar(&o.verifyTextfile, "textfile", "", "write the verify result as a Prometheus textfile")
 	}
 	if cmd == "journal" {
 		fs.IntVar(&o.journalLimit, "n", 20, "number of records to show")
@@ -1019,6 +1021,7 @@ func doJournal(o *options, repoName string) {
 }
 
 func doVerify(o *options, repoName string) {
+	begin := time.Now()
 	st, prefix, err := o.repoStore(repoName)
 	if err != nil {
 		fatal(err)
@@ -1043,6 +1046,7 @@ func doVerify(o *options, repoName string) {
 		}
 	}
 	var issues []fs.VerifyIssue
+	scope := fmt.Sprintf("at rev %d", head)
 	if o.allRevs {
 		from, to := o.fromRev, o.toRev
 		if from == 0 {
@@ -1068,32 +1072,61 @@ func doVerify(o *options, repoName string) {
 			}
 		}
 		issues, err = repo.VerifyRangeWithProgress(from, to, o.texts, o.verifyWorkers, progress)
-		scope := fmt.Sprintf("revs %d..%d (texts=%v, workers=%d)", from, to, o.texts, o.verifyWorkers)
 		if err != nil {
 			fatal(err)
 		}
-		if len(issues) == 0 {
-			fmt.Printf("verify: repository %q %s: no integrity issues\n", repoName, scope)
-			return
-		}
-		fmt.Printf("verify: repository %q %s: %d integrity issues\n", repoName, scope, len(issues))
+		scope = fmt.Sprintf("revs %d..%d (texts=%v, workers=%d)", from, to, o.texts, o.verifyWorkers)
 	} else {
 		issues, err = repo.Verify(head)
 		if err != nil {
 			fatal(err)
 		}
-		if len(issues) == 0 {
-			fmt.Printf("verify: repository %q at rev %d: no integrity issues\n", repoName, head)
-			return
-		}
-		fmt.Printf("verify: repository %q at rev %d: %d integrity issues\n", repoName, head, len(issues))
 	}
+	if o.verifyTextfile != "" {
+		writeVerifyMetrics(o.verifyTextfile, repoName, scope, len(issues), time.Since(begin))
+	}
+	if len(issues) == 0 {
+		fmt.Printf("verify: repository %q %s: no integrity issues\n", repoName, scope)
+		return
+	}
+	fmt.Printf("verify: repository %q %s: %d integrity issues\n", repoName, scope, len(issues))
 	for _, is := range issues {
 		fmt.Printf("  rev=%d path=%s err=%v rebuildable=%v\n", is.Rev, is.Path, is.Err, is.Rebuildable)
 	}
 	// A verifier's job is to fail: monitoring and cron must be able to act on
 	// the exit status instead of parsing log lines.
 	os.Exit(1)
+}
+
+// writeVerifyMetrics publishes the last verify result as a Prometheus textfile,
+// so a scheduled full check shows up on the alerting dashboard (the exit code
+// alone is invisible to Prometheus).
+func writeVerifyMetrics(path, repoName, scope string, issues int, dur time.Duration) {
+	var b strings.Builder
+	b.WriteString("# HELP svngod_verify_issues Integrity issues found by the last verify.\n")
+	b.WriteString("# TYPE svngod_verify_issues gauge\n")
+	fmt.Fprintf(&b, "svngod_verify_issues{repo=%q,scope=%q} %d\n", repoName, scope, issues)
+	b.WriteString("# HELP svngod_verify_ok 1 when the last verify found no issues.\n")
+	b.WriteString("# TYPE svngod_verify_ok gauge\n")
+	ok := 0
+	if issues == 0 {
+		ok = 1
+	}
+	fmt.Fprintf(&b, "svngod_verify_ok{repo=%q} %d\n", repoName, ok)
+	b.WriteString("# HELP svngod_verify_duration_seconds Duration of the last verify.\n")
+	b.WriteString("# TYPE svngod_verify_duration_seconds gauge\n")
+	fmt.Fprintf(&b, "svngod_verify_duration_seconds{repo=%q} %.3f\n", repoName, dur.Seconds())
+	b.WriteString("# HELP svngod_verify_last_run_timestamp Unix time of the last verify.\n")
+	b.WriteString("# TYPE svngod_verify_last_run_timestamp gauge\n")
+	fmt.Fprintf(&b, "svngod_verify_last_run_timestamp{repo=%q} %d\n", repoName, time.Now().Unix())
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(b.String()), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "verify: write %s: %v\n", tmp, err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		fmt.Fprintf(os.Stderr, "verify: rename %s: %v\n", path, err)
+	}
 }
 
 func doDump(o *options, repoName, output string) {

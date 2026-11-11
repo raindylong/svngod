@@ -74,6 +74,7 @@ type options struct {
 	maxUploads     int
 	maxUserUploads int
 	metrics        bool
+	strictStart    bool
 }
 
 func (o *options) makeStore() (store.Store, error) {
@@ -156,10 +157,11 @@ func main() {
 	fl.StringVar(&o.tlsKey, "tls-key", "", "TLS key file (serve HTTPS)")
 	var configPath string
 	fl.StringVar(&configPath, "config", "", "JSON config file (multi-repo; overrides flags)")
+	fl.BoolVar(&o.strictStart, "strict-start", false, "refuse to start when a configured repository is unreadable")
 	_ = fl.Parse(os.Args[1:])
 
 	if configPath != "" {
-		runMultiRepo(configPath, o.commitBatch, o.commitWindowMs, o.adminAddr, o.adminToken, o.adminAllowCIDR)
+		runMultiRepo(configPath, o.commitBatch, o.commitWindowMs, o.adminAddr, o.adminToken, o.adminAllowCIDR, o.strictStart)
 		return
 	}
 
@@ -238,7 +240,7 @@ func newHTTPServer(addr string, h http.Handler) *http.Server {
 
 // runMultiRepo starts a server configured from a JSON file with one or more
 // repositories, each with its own storage backend, authz file and auth chain.
-func runMultiRepo(configPath string, commitBatch, commitWindowMs int, adminAddr, adminToken, adminAllowCIDR string) {
+func runMultiRepo(configPath string, commitBatch, commitWindowMs int, adminAddr, adminToken, adminAllowCIDR string, strictStart bool) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		log.Fatalf("load config: %v", err)
@@ -261,6 +263,32 @@ func runMultiRepo(configPath string, commitBatch, commitWindowMs int, adminAddr,
 		maxUserUploads = 4
 	}
 	logger := log.New(os.Stderr, "svngod ", log.LstdFlags)
+	// Startup self-check: open every configured repository and read its HEAD so
+	// a bad endpoint, bucket or permission is visible in the boot log instead of
+	// on the first client request. strictStart turns those failures fatal.
+	bad := 0
+	for _, rc := range repos {
+		if rc.OpenRepo == nil {
+			continue
+		}
+		r, oerr := rc.OpenRepo(rc.Name)
+		if oerr != nil {
+			bad++
+			logger.Printf("self-check: repository %q NOT READY: %v", rc.Name, oerr)
+			continue
+		}
+		head, herr := r.HeadFresh()
+		if herr != nil {
+			bad++
+			logger.Printf("self-check: repository %q head unreadable: %v", rc.Name, herr)
+			continue
+		}
+		uuid, _ := r.UUID()
+		logger.Printf("self-check: repository %q ready (head=%d uuid=%s segments=%v)", rc.Name, head, uuid, r.SegmentsEnabled())
+	}
+	if strictStart && bad > 0 {
+		log.Fatalf("self-check: %d of %d repositories are not ready (strict-start)", bad, len(repos))
+	}
 	srv := server.New(server.Config{
 		BasePath:             cfg.BasePath,
 		Repos:                repos,
