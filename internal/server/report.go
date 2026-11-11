@@ -114,7 +114,7 @@ func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name s
 		http.Error(w, "bad update-report", http.StatusBadRequest)
 		return
 	}
-	head, err := repo.Head()
+	head, err := repo.HeadFresh()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -868,7 +868,7 @@ func (s *Server) reportLog(w http.ResponseWriter, repo *fs.Repo, reportPath stri
 		http.Error(w, "bad log-report", http.StatusBadRequest)
 		return
 	}
-	head, err := repo.Head()
+	head, err := repo.HeadFresh()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1348,7 +1348,7 @@ func (s *Server) reportList(w http.ResponseWriter, r *http.Request, repo *fs.Rep
 		http.Error(w, "bad list-report", http.StatusBadRequest)
 		return
 	}
-	head, err := repo.Head()
+	head, err := repo.HeadFresh()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
