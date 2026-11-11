@@ -64,6 +64,11 @@ func NewS3Store(cfg S3Config) (*S3Store, error) {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   5 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		// Cap the wait for response headers after the request is fully
+		// written. Without it a wedged gateway (accepts, never answers) hangs
+		// the call past the SDK retry layer; a slow large upload is unaffected
+		// because the clock starts when the body is done.
+		ResponseHeaderTimeout: 30 * time.Second,
 	}
 	// Two internal attempts are enough: our own retry layer handles transient
 	// S3 errors, and a dead node must fail over quickly instead of burning the

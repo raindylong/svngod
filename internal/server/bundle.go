@@ -248,7 +248,11 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 	committed := false
 	defer func() {
 		if !committed {
-			repo.Store().Delete(context.Background(), []string{claimKey, intentKey})
+			// Best-effort cleanup on the failure path: bound it so a wedged
+			// backend cannot keep the request goroutine alive forever.
+			cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			repo.Store().Delete(cctx, []string{claimKey, intentKey})
 		}
 	}()
 
