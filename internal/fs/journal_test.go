@@ -279,30 +279,35 @@ func TestJournalReplayAvailabilityMode(t *testing.T) {
 	}
 }
 
-// blockGoneStore makes Get fail for one configured key while every other
-// object stays readable - used to drop a rev-block below quorum without
+// blockGoneStore makes Get fail for any configured key while every other
+// object stays readable - used to drop one object below quorum without
 // taking a whole replica out of service.
 type blockGoneStore struct {
 	store.Store
-	mu  sync.Mutex
-	key string
+	mu   sync.Mutex
+	keys map[string]bool
 }
 
 func (s *blockGoneStore) dead(k string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.key != "" && s.key == k
+	return s.keys[k]
 }
 
-func (s *blockGoneStore) block(k string) {
+func (s *blockGoneStore) block(ks ...string) {
 	s.mu.Lock()
-	s.key = k
+	if s.keys == nil {
+		s.keys = map[string]bool{}
+	}
+	for _, k := range ks {
+		s.keys[k] = true
+	}
 	s.mu.Unlock()
 }
 
 func (s *blockGoneStore) unblock() {
 	s.mu.Lock()
-	s.key = ""
+	s.keys = nil
 	s.mu.Unlock()
 }
 
@@ -380,6 +385,70 @@ func TestJournalReplayStopsAtUnreadableRevBlock(t *testing.T) {
 	}
 	if nr, err := r2.Resolve(1, "/a"); err != nil || nr == nil {
 		t.Fatalf("rolled-forward revision unreadable: %v", err)
+	}
+}
+
+// TestJournalReplayStopsWhenPropsBelowQuorum: the revision block reached a
+// quorum and its SHA verifies, but the property set is below quorum. Rolling
+// forward anyway would publish a revision whose log/author data is missing on
+// a majority, so the read path fails after HEAD moved - a half state. Replay
+// must refuse to publish until the props recover too.
+func TestJournalReplayStopsWhenPropsBelowQuorum(t *testing.T) {
+	var stores []*blockGoneStore
+	var members []store.Store
+	for i := 0; i < 3; i++ {
+		b := &blockGoneStore{Store: store.NewMemoryStore()}
+		stores = append(stores, b)
+		members = append(members, b)
+	}
+	ms := store.NewMirror(members, store.WithWriteQuorum(2))
+	r, err := CreateRepo(ms, "pp", 4096, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.CommitTxn(0, []Change{{Path: "/a", Action: ActionAdd, Kind: KindFile, Data: []byte("1")}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := r.JournalRecord(1)
+	if err != nil || rec == nil {
+		t.Fatalf("journal record missing: %v", err)
+	}
+	ctx := context.Background()
+	cur, etag, err := r.readCurrent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ms.CAS(ctx, r.keys.Current(), etag, (&Current{Head: 0, Created: cur.Created}).Marshal()); err != nil {
+		t.Fatal(err)
+	}
+	// Only the rev-props are unavailable; the block is readable and verifies.
+	for _, s := range stores {
+		s.block(rec.PropsKey)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		r.reconcileJournal(true)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("replayJournal did not return when props were below quorum")
+	}
+	if c, _, err := r.readCurrent(); err != nil || c.Head != 0 {
+		t.Fatalf("head=%v with props below quorum (err %v), want 0: must not publish without the property set", c.Head, err)
+	}
+
+	for _, s := range stores {
+		s.unblock()
+	}
+	r2, err := OpenRepo(ms, "pp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h, _ := r2.HeadFresh(); h != 1 {
+		t.Fatalf("head=%d after props recovered, want 1", h)
 	}
 }
 

@@ -266,17 +266,13 @@ func (r *Repo) replayJournal() {
 					ref: segmentRef{First: g.First, Count: g.Count, SHA256: g.SegmentSHA}})
 			}
 			// All segments exist: make every shard index name its segment, then
-			// publish the batch with one CAS.
+			// publish the batch with one CAS. The index update is a compare-and-
+			// swap retry (not a load+Put): a concurrent live commit may append
+			// to the same shard's index while this process replays, and a plain
+			// Put would silently drop one of the two refs.
 			for _, pg := range pend {
-				refs, ierr := r.loadSegmentIndex(pg.shard)
-				if ierr != nil {
-					return
-				}
-				if segmentIndexHasRef(refs, pg.ref) {
-					continue
-				}
-				refs = appendSegmentRef(refs, pg.ref)
-				if perr := r.store.Put(ctx, r.keys.SegmentIndex(pg.shard), encodeSegmentIndex(refs)); perr != nil {
+				if _, aerr := r.appendSegmentIndexCAS(ctx, pg.ref); aerr != nil {
+					log.Printf("journal: replay paused at revision %d: shard %d index CAS: %v", rev, pg.shard, aerr)
 					return
 				}
 			}
@@ -314,6 +310,16 @@ func (r *Repo) replayJournal() {
 		sum := sha256.Sum256(rb)
 		if hex.EncodeToString(sum[:]) != rec.RevBlockSHA {
 			log.Printf("journal: replay paused at revision %d: rev-block SHA mismatch (possible corruption)", rev)
+			break
+		}
+		// The revision block and its property set were written together under
+		// one quorum; publishing without a quorum copy of the props would
+		// roll forward a revision whose log/author data is still missing on
+		// a majority (the read path would fail it after HEAD moved). Props
+		// are mutable after commit, so the record pins the block SHA only -
+		// presence at a quorum is the right invariant for them here.
+		if _, pCount, perr := read(rec.PropsKey); perr != nil || pCount < quorum {
+			log.Printf("journal: replay paused at revision %d: rev-props copies %d < quorum %d (err %v)", rev, pCount, quorum, perr)
 			break
 		}
 		cur, etag, cerr := r.readCurrent()

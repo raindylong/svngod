@@ -746,6 +746,36 @@ func (r *Repo) appendSegmentIndex(ctx context.Context, ref segmentRef) (int, err
 	return 0, fmt.Errorf("%w: shard %d", lastErr, sh)
 }
 
+// appendSegmentIndexCAS adds ref to one shard's index using a compare-and-swap
+// retry loop, WITHOUT calling HeadFresh or the self-heal rebuild path. WAL
+// replay uses it: appendSegmentIndex reaches HeadFresh -> reconcileJournal ->
+// journalMu, which is already held during replay, so a non-reentrant lock
+// would self-deadlock. The ref arrives from a verified contiguous record, so
+// only idempotent membership + ordering is needed here, not overlap repair.
+// It returns true when the index changed (a write happened).
+func (r *Repo) appendSegmentIndexCAS(ctx context.Context, ref segmentRef) (bool, error) {
+	sh := r.shard(ref.First)
+	for attempt := 0; attempt < 6; attempt++ {
+		refs, etag, existed, err := r.loadSegmentIndexETag(ctx, sh)
+		if err != nil {
+			return false, err
+		}
+		if segmentIndexHasRef(refs, ref) {
+			return false, nil // already present: our earlier attempt or a peer's
+		}
+		newRefs := appendSegmentRef(refs, ref)
+		if err := r.writeSegmentIndexCAS(ctx, sh, newRefs, etag, existed); err != nil {
+			if errors.Is(err, ErrSegmentIndexConflict) {
+				time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
+				continue
+			}
+			return false, err
+		}
+		return true, nil
+	}
+	return false, fmt.Errorf("%w: shard %d after %d replays", ErrSegmentIndexConflict, sh, 6)
+}
+
 // overlapSegment returns an entry whose range intersects ref.
 func overlapSegment(refs []segmentRef, ref segmentRef) (segmentRef, bool) {
 	end := ref.First + ref.Count
