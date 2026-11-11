@@ -237,6 +237,19 @@ func (s *Server) serveMetrics(w http.ResponseWriter) {
 			}
 			fmt.Fprintf(&b, "svngod_repo_ready{repo=%q} %d\n", escapeLabel(name), v)
 		}
+		if len(s.cfg.RepoReadyError) > 0 {
+			b.WriteString("# HELP svngod_repo_ready_error Repositories that failed the startup self-check, by reason.\n")
+			b.WriteString("# TYPE svngod_repo_ready_error gauge\n")
+			errNames := make([]string, 0, len(s.cfg.RepoReadyError))
+			for name := range s.cfg.RepoReadyError {
+				errNames = append(errNames, name)
+			}
+			sort.Strings(errNames)
+			for _, name := range errNames {
+				fmt.Fprintf(&b, "svngod_repo_ready_error{repo=%q,reason=%q} 1\n",
+					escapeLabel(name), escapeLabel(s.cfg.RepoReadyError[name]))
+			}
+		}
 	}
 	b.WriteString("# HELP svngod_repo_head HEAD of each repository this process has open.\n")
 	b.WriteString("# TYPE svngod_repo_head gauge\n")

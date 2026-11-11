@@ -45,6 +45,10 @@ type Config struct {
 	// It is exposed as svngod_repo_ready so a misconfigured backend is visible
 	// in the metrics too, not only in the boot log.
 	RepoReady map[string]bool
+	// RepoReadyError carries a *classified* reason for repositories that failed
+	// the self-check ("not_found", "auth_denied", "network", "corrupt",
+	// "other"). Classification keeps label cardinality bounded.
+	RepoReadyError map[string]string
 
 	// HooksDir holds optional pre-commit / post-commit executables. They run
 	// with SVN_USER/SVN_REPO/SVN_TXN (and SVN_REV for post-commit) in the

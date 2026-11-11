@@ -276,8 +276,32 @@ func runMultiRepo(configPath string, commitBatch, commitWindowMs int, adminAddr,
 	}
 	fs.ConfigureCommitBatch(commitBatch, commitWindowMs)
 	repos, cfgs, err := cfg.BuildRepos(nil, nil)
+	buildFailures := map[string]string{}
 	if err != nil {
-		log.Fatalf("build repos: %v", err)
+		// Fault containment: one broken repository must not stop the others from
+		// being served. -strict-start keeps the fail-fast behaviour for
+		// deployments that prefer it.
+		if strictStart {
+			log.Fatalf("build repos: %v", err)
+		}
+		log.Printf("build repos: %v; retrying per repository", err)
+		repos = nil
+		cfgs = map[string]*server.RepoConfig{}
+		for i := range cfg.Repos {
+			name := cfg.Repos[i].Name
+			one := *cfg
+			one.Repos = []config.Repo{cfg.Repos[i]}
+			r1, c1, e1 := one.BuildRepos(nil, nil)
+			if e1 != nil {
+				buildFailures[name] = classifyRepoError(e1)
+				log.Printf("self-check: repository %q disabled: %v", name, e1)
+				continue
+			}
+			repos = append(repos, r1...)
+			for k, v := range c1 {
+				cfgs[k] = v
+			}
+		}
 	}
 	addr := cfg.Addr
 	if addr == "" {
@@ -295,8 +319,13 @@ func runMultiRepo(configPath string, commitBatch, commitWindowMs int, adminAddr,
 	// Startup self-check: open every configured repository and read its HEAD so
 	// a bad endpoint, bucket or permission is visible in the boot log instead of
 	// on the first client request. strictStart turns those failures fatal.
-	bad := 0
-	ready := make(map[string]bool, len(repos))
+	bad := len(buildFailures)
+	ready := make(map[string]bool, len(repos)+len(buildFailures))
+	readyErr := make(map[string]string, len(buildFailures))
+	for name, reason := range buildFailures {
+		ready[name] = false
+		readyErr[name] = reason
+	}
 	for _, rc := range repos {
 		ready[rc.Name] = false
 		if rc.OpenRepo == nil {
@@ -305,12 +334,14 @@ func runMultiRepo(configPath string, commitBatch, commitWindowMs int, adminAddr,
 		r, oerr := rc.OpenRepo(rc.Name)
 		if oerr != nil {
 			bad++
+			readyErr[rc.Name] = classifyRepoError(oerr)
 			logger.Printf("self-check: repository %q NOT READY: %v", rc.Name, oerr)
 			continue
 		}
 		head, herr := r.HeadFresh()
 		if herr != nil {
 			bad++
+			readyErr[rc.Name] = classifyRepoError(herr)
 			logger.Printf("self-check: repository %q head unreadable: %v", rc.Name, herr)
 			continue
 		}
@@ -325,6 +356,7 @@ func runMultiRepo(configPath string, commitBatch, commitWindowMs int, adminAddr,
 		BasePath:             cfg.BasePath,
 		Repos:                repos,
 		RepoReady:            ready,
+		RepoReadyError:       readyErr,
 		HooksDir:             cfg.Hooks,
 		MaxConcurrentUploads: maxUploads,
 		MaxUserUploads:       maxUserUploads,
@@ -434,5 +466,31 @@ func cleanupStaleTempFilesIn(dir string, alive func(int) bool) {
 		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
 			log.Printf("cleanup temp %s: %v", e.Name(), err)
 		}
+	}
+}
+
+// classifyRepoError maps a self-check failure to a small, bounded label set.
+// Prometheus label values must not carry arbitrary error text.
+func classifyRepoError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "access denied"), strings.Contains(msg, "forbidden"),
+		strings.Contains(msg, "403"), strings.Contains(msg, "unauthorized"):
+		return "auth_denied"
+	case strings.Contains(msg, "not found"), strings.Contains(msg, "nosuchbucket"),
+		strings.Contains(msg, "no such"), strings.Contains(msg, "404"):
+		return "not_found"
+	case strings.Contains(msg, "timeout"), strings.Contains(msg, "connection"),
+		strings.Contains(msg, "dial"), strings.Contains(msg, "refused"),
+		strings.Contains(msg, "unreachable"):
+		return "network"
+	case strings.Contains(msg, "format"), strings.Contains(msg, "decode"),
+		strings.Contains(msg, "checksum"), strings.Contains(msg, "corrupt"):
+		return "corrupt"
+	default:
+		return "other"
 	}
 }

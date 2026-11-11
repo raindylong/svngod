@@ -525,10 +525,12 @@ func writeReplicaMetrics(path, repoName string, stats []memberStat, drift bool) 
 	fmt.Fprintf(&b, "svngod_replica_last_run_timestamp{repo=%q} %d\n", repoName, time.Now().Unix())
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, []byte(b.String()), 0o644); err != nil {
+		os.Remove(tmp)
 		fmt.Fprintf(os.Stderr, "replicas: write %s: %v\n", tmp, err)
 		return
 	}
 	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
 		fmt.Fprintf(os.Stderr, "replicas: rename %s: %v\n", path, err)
 	}
 }
@@ -1135,10 +1137,12 @@ func writeVerifyMetrics(path, repoName, scope string, issues int, dur time.Durat
 	fmt.Fprintf(&b, "svngod_verify_last_run_timestamp{repo=%q} %d\n", repoName, time.Now().Unix())
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, []byte(b.String()), 0o644); err != nil {
+		os.Remove(tmp)
 		fmt.Fprintf(os.Stderr, "verify: write %s: %v\n", tmp, err)
 		return
 	}
 	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
 		fmt.Fprintf(os.Stderr, "verify: rename %s: %v\n", path, err)
 	}
 }

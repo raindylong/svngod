@@ -718,3 +718,24 @@ func TestMetricsCommitHistogram(t *testing.T) {
 		}
 	}
 }
+
+// TestMetricsRepoReadiness checks the startup self-check gauges.
+func TestMetricsRepoReadiness(t *testing.T) {
+	srv := New(Config{
+		BasePath:       "/svn",
+		RepoReady:      map[string]bool{"ok": true, "bad": false},
+		RepoReadyError: map[string]string{"bad": "network"},
+	})
+	rec := httptest.NewRecorder()
+	srv.serveMetrics(rec)
+	body := rec.Body.String()
+	for _, want := range []string{
+		`svngod_repo_ready{repo="ok"} 1`,
+		`svngod_repo_ready{repo="bad"} 0`,
+		`svngod_repo_ready_error{repo="bad",reason="network"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics missing %q:\n%s", want, body)
+		}
+	}
+}
