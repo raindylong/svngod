@@ -81,6 +81,8 @@ type Repo struct {
 	blockCacheMisses atomic.Uint64
 	segCacheHits     atomic.Uint64
 	segCacheMisses   atomic.Uint64
+	// Revisions published by WAL replay (crash-recovery roll-forwards).
+	journalReplayed atomic.Uint64
 	// seqMu guards the sequential-read hint: same segment, previous revision.
 	seqMu   sync.Mutex
 	seqKey  string
@@ -186,6 +188,12 @@ func (r *Repo) CacheStats() CacheStats {
 		BlockHits: r.blockCacheHits.Load(), BlockMisses: r.blockCacheMisses.Load(),
 		SegmentHits: r.segCacheHits.Load(), SegmentMisses: r.segCacheMisses.Load(),
 	}
+}
+
+// JournalReplayed returns how many revisions WAL replay has rolled forward
+// (crashes between quorum-ack and HEAD publication that recovery published).
+func (r *Repo) JournalReplayed() uint64 {
+	return r.journalReplayed.Load()
 }
 
 // storeBlock inserts a decoded block, dropping the whole set when over budget.

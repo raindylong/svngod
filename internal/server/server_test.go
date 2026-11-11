@@ -677,6 +677,9 @@ func TestMetricsMirrorStatus(t *testing.T) {
 	if !strings.Contains(body, `svngod_mirror_primary{repo="demo",replica="0"} 1`) {
 		t.Fatalf("primary metric missing:\n%s", body)
 	}
+	if !strings.Contains(body, `svngod_journal_replayed_total{repo="demo"} 0`) {
+		t.Fatalf("journal replay metric missing:\n%s", body)
+	}
 }
 
 // TestMetricsCommitHistogram checks the commit latency histogram and the

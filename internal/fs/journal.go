@@ -291,6 +291,7 @@ func (r *Repo) replayJournal() {
 			}
 			r.setHead(last)
 			r.cache.Clear()
+			r.journalReplayed.Add(rec.Count)
 			log.Printf("journal: rolled forward revisions %d..%d (segment, %d group(s), head was %d)",
 				rec.First, last, len(groups), head)
 			head = last
@@ -318,6 +319,7 @@ func (r *Repo) replayJournal() {
 		}
 		r.setHead(rev)
 		r.cache.Clear()
+		r.journalReplayed.Add(1)
 		log.Printf("journal: rolled forward revision %d (quorum-acked, head was %d)", rev, head)
 		head = rev
 		rev = head + 1

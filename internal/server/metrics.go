@@ -291,6 +291,11 @@ func (s *Server) serveMetrics(w http.ResponseWriter) {
 		fmt.Fprintf(&b, "svngod_segment_cache_hits_total{repo=%q} %d\n", escapeLabel(name), cs.SegmentHits)
 		fmt.Fprintf(&b, "svngod_segment_cache_misses_total{repo=%q} %d\n", escapeLabel(name), cs.SegmentMisses)
 	}
+	b.WriteString("# HELP svngod_journal_replayed_total Revisions published by WAL replay after a crash (head advance recovery).\n")
+	b.WriteString("# TYPE svngod_journal_replayed_total counter\n")
+	for _, name := range names {
+		fmt.Fprintf(&b, "svngod_journal_replayed_total{repo=%q} %d\n", escapeLabel(name), repos[name].JournalReplayed())
+	}
 	wroteMirror := false
 	for _, name := range names {
 		statuses := repos[name].ReplicaStatus()

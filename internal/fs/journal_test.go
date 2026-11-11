@@ -235,6 +235,9 @@ func TestJournalReplayRollsForward(t *testing.T) {
 	if h, _ := r2.HeadFresh(); h != 1 {
 		t.Fatalf("head=%d after replay, want 1", h)
 	}
+	if n := r2.JournalReplayed(); n != 1 {
+		t.Fatalf("journalReplayed=%d after rolling forward one revision, want 1", n)
+	}
 	if nr, err := r2.Resolve(1, "/a"); err != nil || nr == nil {
 		t.Fatalf("rolled-forward revision unreadable: %v", err)
 	}
