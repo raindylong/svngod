@@ -83,6 +83,16 @@ func (k *Keys) SegmentIndex(shard uint64) string {
 	return k.p("segs", padShard(shard)+".idx")
 }
 
+// LooseRevDir lists one shard's loose revision-block objects.
+func (k *Keys) LooseRevDir(shard uint64) string {
+	return k.p("revs-loose", padShard(shard)) + "/"
+}
+
+// LooseRevPropsDir lists one shard's loose revision-property objects.
+func (k *Keys) LooseRevPropsDir(shard uint64) string {
+	return k.p("revprops-loose", padShard(shard)) + "/"
+}
+
 // LooseRev returns the loose (active-shard) revision-block key.
 func (k *Keys) LooseRev(shard, rev uint64) string {
 	return k.p("revs-loose", padShard(shard), padRev(rev))

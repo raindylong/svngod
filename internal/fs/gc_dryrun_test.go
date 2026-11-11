@@ -2,6 +2,7 @@ package fs
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -104,5 +105,60 @@ func TestGCCompactionDryRun(t *testing.T) {
 	}
 	if len(after) != len(before) {
 		t.Fatalf("dry run changed the index: %d -> %d entries", len(before), len(after))
+	}
+}
+
+// TestCollectLooseDryRunEstimatesBytes: on a packed format-v1 repository the dry
+// run counts and sizes the loose leftovers it would delete, without touching
+// them.
+func TestCollectLooseDryRunEstimatesBytes(t *testing.T) {
+	st := store.NewMemoryStore()
+	r, err := CreateRepo(st, "repos/ldry", 2, 64) // two revisions per shard
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 4; i++ {
+		if _, cerr := r.CommitTxn(uint64(i-1), []Change{{
+			Path: fmt.Sprintf("/f%d.txt", i), Action: ActionAdd, Kind: KindFile,
+			Data: []byte(fmt.Sprintf("content %d", i)),
+		}}, nil); cerr != nil {
+			t.Fatalf("commit %d: %v", i, cerr)
+		}
+	}
+	// Committing a full shard packs it; the loose copies remain for GC.
+	var havePacked bool
+	for sh := uint64(0); sh <= r.shard(4); sh++ {
+		if packed, _ := r.isPacked(sh); packed {
+			havePacked = true
+		}
+	}
+	if !havePacked {
+		t.Fatal("test setup: no packed shard")
+	}
+	var bytes int64
+	n, err := r.CollectLooseProgress(context.Background(), true, func(phase string, done, total int, b int64) {
+		bytes = b
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n == 0 || bytes == 0 {
+		t.Fatalf("dry loose count=%d bytes=%d, want both > 0", n, bytes)
+	}
+	// A real pass removes them; the next dry run then reports nothing. (The real
+	// pass counts issued deletes, an upper bound, so only the dry-run counts are
+	// compared.)
+	if _, err := r.CollectLooseProgress(context.Background(), false, nil); err != nil {
+		t.Fatal(err)
+	}
+	var after int64
+	n2, err := r.CollectLooseProgress(context.Background(), true, func(phase string, done, total int, b int64) {
+		after = b
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n2 != 0 || after != 0 {
+		t.Fatalf("dry run after real gc: count=%d bytes=%d, want 0", n2, after)
 	}
 }

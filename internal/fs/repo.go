@@ -2169,12 +2169,27 @@ func (r *Repo) CollectLooseProgress(ctx context.Context, dryRun bool, progress G
 		return 0, err
 	}
 	deleted := 0
+	var bytes int64
 	for shard := uint64(0); shard <= r.shard(head); shard++ {
 		packed, err := r.isPacked(shard)
 		if err != nil || !packed {
 			continue
 		}
-		n, err := r.collectLooseShard(ctx, shard, dryRun)
+		if dryRun {
+			// A dry run must not report the shard's theoretical key count: list
+			// the loose prefixes to count (and size) what actually remains.
+			n, b, cerr := r.countLooseShard(ctx, shard)
+			if cerr != nil {
+				return deleted, cerr
+			}
+			deleted += n
+			bytes += b
+			if progress != nil {
+				progress("loose", deleted, 0, bytes)
+			}
+			continue
+		}
+		n, err := r.collectLooseShard(ctx, shard, false)
 		deleted += n
 		if progress != nil {
 			progress("loose", deleted, 0, 0)
@@ -2751,4 +2766,28 @@ func changeFragmentID(rel string) (string, bool) {
 		return "", false
 	}
 	return rest[:i], true
+}
+
+// countLooseShard counts (and sizes) one packed shard's loose objects.
+func (r *Repo) countLooseShard(ctx context.Context, shard uint64) (int, int64, error) {
+	n := 0
+	var bytes int64
+	for _, prefix := range []string{r.keys.LooseRevDir(shard), r.keys.LooseRevPropsDir(shard)} {
+		next := ""
+		for {
+			objs, cont, err := r.store.ListPrefix(ctx, prefix, next, 1000)
+			if err != nil {
+				return n, bytes, err
+			}
+			for _, o := range objs {
+				n++
+				bytes += o.Size
+			}
+			if cont == "" || cont == next {
+				break
+			}
+			next = cont
+		}
+	}
+	return n, bytes, nil
 }

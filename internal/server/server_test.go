@@ -757,3 +757,42 @@ func TestMetricsRepoReadiness(t *testing.T) {
 		t.Fatalf("ready_error survived recovery:\n%s", body)
 	}
 }
+
+// TestSetReposAddsRepository: hot recovery adds a repository to the live set
+// without disturbing the others.
+func TestSetReposAddsRepository(t *testing.T) {
+	repo := buildRepo(t)
+	extra, err := fs.CreateRepo(store.NewMemoryStore(), "extra", 8, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := New(Config{
+		BasePath: "/svn",
+		Repos: []*RepoConfig{{
+			Name: "demo",
+			OpenRepo: func(string) (*fs.Repo, error) {
+				return repo, nil
+			},
+		}},
+	})
+	srv.SetRepoReady("demo", true, "")
+	newExtra := &RepoConfig{Name: "extra", OpenRepo: func(string) (*fs.Repo, error) { return extra, nil }}
+	list := append(srv.RepoConfigs(), newExtra)
+	added := map[string]bool{"extra": true}
+	if _, err := srv.SetRepos(list, added); err != nil {
+		t.Fatal(err)
+	}
+	names := srv.RepoNames()
+	if len(names) != 2 {
+		t.Fatalf("names=%v", names)
+	}
+	found := false
+	for _, n := range names {
+		if n == "extra" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("recovered repository missing: %v", names)
+	}
+}
