@@ -474,6 +474,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 
 	// Authorize: for methods that mutate, require write to the resource path.
 	if !s.authorized(ident.Username, res, r.Method) {
+		s.audit("deny", "reason", "forbidden", "repo", res.repo, "user", auditActor(ident.Username),
+			"method", r.Method, "path", res.path)
 		if ident.Username == "" && s.authFor(res.repo) != nil {
 			// Anonymous was denied: challenge for credentials so the SVN
 			// client retries with Basic auth, instead of a 403 it cannot
@@ -591,6 +593,11 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request, repo strin
 	}
 	id, err := chain.Authenticate(r.Context(), user, pass)
 	if err != nil {
+		// Failed credentials are worth a record: repeated lines from one source
+		// are the standard signal for credential stuffing. The password is
+		// never logged.
+		s.audit("deny", "reason", "bad_credentials", "repo", repo, "user", auditActor(user),
+			"method", r.Method, "path", r.URL.Path)
 		return auth.Identity{}, s.unauthorized(w)
 	}
 	return id, true

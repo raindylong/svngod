@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"svngod/internal/auth"
+	"svngod/internal/authz"
 	"svngod/internal/fs"
 	"svngod/internal/fs/store"
 )
@@ -144,5 +145,80 @@ func TestWarnsWhenAuthHasNoAuthz(t *testing.T) {
 	})
 	if out := buf.String(); !strings.Contains(out, "anonymous") || !strings.Contains(out, "no authz") {
 		t.Fatalf("missing anonymous-access warning: %q", out)
+	}
+}
+
+func TestAuditDeniedCredentials(t *testing.T) {
+	repo := buildRepo(t)
+	dir := t.TempDir()
+	p := filepath.Join(dir, "passwd")
+	if err := os.WriteFile(p, []byte("alice:"+shaPass("secret")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var buf syncBuffer
+	srv := New(Config{
+		BasePath:     "/svn",
+		Authenticate: auth.NewChain(auth.NewLocalPasswordFile(p)),
+		OpenRepo: func(name string) (*fs.Repo, error) {
+			if name == "demo" {
+				return repo, nil
+			}
+			return nil, fs.ErrRepoNotFound
+		},
+		Logger: log.New(&buf, "", 0),
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp := doRequest(t, "OPTIONS", ts.URL+"/svn/demo", "", "alice", "wrong", nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status=%d want 401", resp.StatusCode)
+	}
+	resp.Body.Close()
+	out := buf.String()
+	for _, want := range []string{`audit deny reason="bad_credentials"`, `user="alice"`, `repo="demo"`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("audit stream missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestAuditDeniedAuthorization(t *testing.T) {
+	repo := buildRepo(t)
+	dir := t.TempDir()
+	p := filepath.Join(dir, "passwd")
+	if err := os.WriteFile(p, []byte("bob:"+shaPass("secret")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	az, err := authz.Parse([]byte("[demo:/]\n* = r\nbob = r\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf syncBuffer
+	srv := New(Config{
+		BasePath:     "/svn",
+		Authenticate: auth.NewChain(auth.NewLocalPasswordFile(p)),
+		Authorize:    az,
+		OpenRepo: func(name string) (*fs.Repo, error) {
+			if name == "demo" {
+				return repo, nil
+			}
+			return nil, fs.ErrRepoNotFound
+		},
+		Logger: log.New(&buf, "", 0),
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp := doRequest(t, "PROPPATCH", ts.URL+"/svn/demo/trunk/README.txt", "<x/>", "bob", "secret", nil)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status=%d want 403", resp.StatusCode)
+	}
+	resp.Body.Close()
+	out := buf.String()
+	for _, want := range []string{`audit deny reason="forbidden"`, `user="bob"`, `method="PROPPATCH"`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("audit stream missing %q:\n%s", want, out)
+		}
 	}
 }
