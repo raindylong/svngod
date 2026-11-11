@@ -42,6 +42,7 @@
 | GET | `/_api/v1/repos` | 仓库摘要（名称/存储类型/authz/认证类型） |
 | GET | `/_api/v1/repos/{name}` | 单个仓库的完整配置（含密钥，需管理员权限） |
 | POST | `/_api/v1/repos` | 新增仓库；`?create=1` 自动建库，`?dry_run=1` 只校验 |
+| GET | `/_api/v1/repos` | 返回每个仓库的 `ready` / `ready_error`（启动自检与热恢复状态） |
 | PUT | `/_api/v1/repos/{name}` | 替换仓库配置 |
 | DELETE | `/_api/v1/repos/{name}` | 从配置移除（**不删除数据**） |
 | POST | `/_api/v1/reload` | 重读配置文件并热加载 |

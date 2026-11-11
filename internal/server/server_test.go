@@ -719,7 +719,8 @@ func TestMetricsCommitHistogram(t *testing.T) {
 	}
 }
 
-// TestMetricsRepoReadiness checks the startup self-check gauges.
+// TestMetricsRepoReadiness checks the startup self-check gauges and the hot
+// recovery counter.
 func TestMetricsRepoReadiness(t *testing.T) {
 	srv := New(Config{
 		BasePath:       "/svn",
@@ -737,5 +738,22 @@ func TestMetricsRepoReadiness(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("metrics missing %q:\n%s", want, body)
 		}
+	}
+	// A failed repository that becomes available flips the gauge and counts one
+	// recovery.
+	srv.SetRepoReady("bad", true, "")
+	rec = httptest.NewRecorder()
+	srv.serveMetrics(rec)
+	body = rec.Body.String()
+	for _, want := range []string{
+		`svngod_repo_ready{repo="bad"} 1`,
+		`svngod_repo_recovered_total{repo="bad"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics missing %q after recovery:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, `svngod_repo_ready_error{repo="bad"`) {
+		t.Fatalf("ready_error survived recovery:\n%s", body)
 	}
 }

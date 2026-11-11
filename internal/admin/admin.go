@@ -8,8 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -150,11 +150,23 @@ type repoView struct {
 	Storage string   `json:"storage"`
 	Authz   string   `json:"authz,omitempty"`
 	Auth    []string `json:"auth,omitempty"`
+	// Ready/ReadyError mirror the startup and hot-recovery self-check, so an
+	// operator can query repository health instead of scraping /_metrics.
+	Ready      bool   `json:"ready"`
+	ReadyError string `json:"ready_error,omitempty"`
 }
 
 func (s *Service) repos(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
+		readyMap, readyErr := map[string]bool{}, map[string]string{}
+		live := map[string]bool{}
+		if s.srv != nil {
+			readyMap, readyErr = s.srv.RepoReadySnapshot()
+			for _, n := range s.srv.RepoNames() {
+				live[n] = true
+			}
+		}
 		s.mu.Lock()
 		out := make([]repoView, 0, len(s.cfg.Repos))
 		for i := range s.cfg.Repos {
@@ -163,7 +175,14 @@ func (s *Service) repos(w http.ResponseWriter, r *http.Request) {
 			for _, a := range rp.Auth {
 				types = append(types, a.Type)
 			}
-			out = append(out, repoView{Name: rp.Name, Storage: rp.Storage.Type, Authz: rp.Authz, Auth: types})
+			ready, known := readyMap[rp.Name]
+			if !known {
+				// Repositories added through the API have no startup entry; they
+				// are ready when the server actually serves them.
+				ready = live[rp.Name]
+			}
+			out = append(out, repoView{Name: rp.Name, Storage: rp.Storage.Type, Authz: rp.Authz,
+				Auth: types, Ready: ready, ReadyError: readyErr[rp.Name]})
 		}
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{"generation": s.gen, "repos": out})

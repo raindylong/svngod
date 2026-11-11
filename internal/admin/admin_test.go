@@ -219,3 +219,36 @@ func TestAdminReplaceRepo(t *testing.T) {
 		t.Fatalf("open after replace: %v", err)
 	}
 }
+
+// TestAdminReposExposeHealth: the repository list reports the self-check state
+// so operators can query health without scraping /_metrics.
+func TestAdminReposExposeHealth(t *testing.T) {
+	svc, srv, dir := testService(t)
+	h := svc.Handler()
+	passwd := filepath.Join(dir, "passwd")
+	if rec, out := call(t, h, http.MethodPost, "/_api/v1/repos?create=1", "tok", repoBody("health", dir, passwd)); rec.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%v", rec.Code, out)
+	}
+	srv.SetRepoReady("health", false, "network")
+	rec, out := call(t, h, http.MethodGet, "/_api/v1/repos", "tok", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status=%d", rec.Code)
+	}
+	repos, _ := out["repos"].([]any)
+	if len(repos) != 1 {
+		t.Fatalf("repos=%v", out)
+	}
+	rv, _ := repos[0].(map[string]any)
+	if rv["ready"] != false {
+		t.Fatalf("ready=%v, want false", rv["ready"])
+	}
+	if rv["ready_error"] != "network" {
+		t.Fatalf("ready_error=%v", rv["ready_error"])
+	}
+	srv.SetRepoReady("health", true, "")
+	_, out = call(t, h, http.MethodGet, "/_api/v1/repos", "tok", nil)
+	rv, _ = out["repos"].([]any)[0].(map[string]any)
+	if rv["ready"] != true {
+		t.Fatalf("ready after recovery=%v", rv["ready"])
+	}
+}

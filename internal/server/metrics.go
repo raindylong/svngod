@@ -38,6 +38,9 @@ type metrics struct {
 	commitCount   atomic.Uint64
 	commitSumBits atomic.Uint64 // math.Float64bits
 
+	// repoRecovered counts readiness transitions to true (hot recovery).
+	repoRecoveredMu sync.Mutex
+	repoRecovered   map[string]uint64
 	// commitErrors counts commit failures by reason (out_of_date, lease_busy,
 	// quorum, index_conflict, backend, other) so alerting can distinguish a
 	// client conflict from a storage problem.
@@ -51,7 +54,8 @@ type metrics struct {
 var commitLatencyBuckets = [...]float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30}
 
 func newMetrics(limit int) *metrics {
-	return &metrics{reqs: map[string]uint64{}, limit: limit, commitErrors: map[string]uint64{}}
+	return &metrics{reqs: map[string]uint64{}, limit: limit,
+		commitErrors: map[string]uint64{}, repoRecovered: map[string]uint64{}}
 }
 
 // observeCommit records one commit attempt's latency and outcome.
@@ -252,6 +256,19 @@ func (s *Server) serveMetrics(w http.ResponseWriter) {
 			}
 		}
 	}
+	rec := s.m.repoRecoveredSnapshot()
+	if len(rec) > 0 {
+		names := make([]string, 0, len(rec))
+		for name := range rec {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		b.WriteString("# HELP svngod_repo_recovered_total Times a repository became ready after a failure.\n")
+		b.WriteString("# TYPE svngod_repo_recovered_total counter\n")
+		for _, name := range names {
+			fmt.Fprintf(&b, "svngod_repo_recovered_total{repo=%q} %d\n", escapeLabel(name), rec[name])
+		}
+	}
 	b.WriteString("# HELP svngod_repo_head HEAD of each repository this process has open.\n")
 	b.WriteString("# TYPE svngod_repo_head gauge\n")
 	for _, name := range names {
@@ -330,3 +347,21 @@ func (c *countingReadCloser) Read(p []byte) (int, error) {
 }
 
 func (c *countingReadCloser) Close() error { return c.r.Close() }
+
+// noteRepoRecovered counts a repository becoming ready after having been down.
+func (m *metrics) noteRepoRecovered(name string) {
+	m.repoRecoveredMu.Lock()
+	m.repoRecovered[name]++
+	m.repoRecoveredMu.Unlock()
+}
+
+// repoRecoveredSnapshot copies the recovery counters.
+func (m *metrics) repoRecoveredSnapshot() map[string]uint64 {
+	m.repoRecoveredMu.Lock()
+	defer m.repoRecoveredMu.Unlock()
+	out := make(map[string]uint64, len(m.repoRecovered))
+	for k, v := range m.repoRecovered {
+		out[k] = v
+	}
+	return out
+}

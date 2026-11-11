@@ -154,9 +154,13 @@ func (s *Server) SetRepoReady(name string, ok bool, reason string) {
 	if s.repoReadyErr == nil {
 		s.repoReadyErr = map[string]string{}
 	}
+	was, known := s.repoReady[name]
 	s.repoReady[name] = ok
 	if ok {
 		delete(s.repoReadyErr, name)
+		if known && !was && s.m != nil {
+			s.m.noteRepoRecovered(name)
+		}
 		return
 	}
 	if reason == "" {
