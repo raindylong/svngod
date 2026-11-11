@@ -339,7 +339,11 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 			s.m.addRead(cr.n)
 		}
 		s.m.addWrite(sw.n)
-		s.m.observe(r.Method, sw.code, time.Since(start))
+		elapsed := time.Since(start)
+		s.m.observe(r.Method, sw.code, elapsed)
+		if r.Method == "MERGE" {
+			s.m.observeCommit(elapsed)
+		}
 		if s.cfg.Logger != nil {
 			s.cfg.Logger.Printf("HTTP %d %s %s user=%q %v", sw.code, r.Method, r.URL.Path, user, time.Since(start).Round(time.Microsecond))
 		}

@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"svngod/internal/auth"
 	"svngod/internal/authz"
@@ -675,5 +676,39 @@ func TestMetricsMirrorStatus(t *testing.T) {
 	}
 	if !strings.Contains(body, `svngod_mirror_primary{repo="demo",replica="0"} 1`) {
 		t.Fatalf("primary metric missing:\n%s", body)
+	}
+}
+
+// TestMetricsCommitHistogram checks the commit latency histogram and the
+// failure-reason counter are exposed in the Prometheus text.
+func TestMetricsCommitHistogram(t *testing.T) {
+	repo := buildRepo(t)
+	srv := New(Config{
+		BasePath: "/svn",
+		OpenRepo: func(name string) (*fs.Repo, error) {
+			if name == "demo" {
+				return repo, nil
+			}
+			return nil, fs.ErrRepoNotFound
+		},
+	})
+	srv.m.observeCommit(120 * time.Millisecond)
+	srv.m.observeCommit(2 * time.Second)
+	srv.m.noteCommitError("out_of_date")
+	srv.m.noteCommitError("lease_busy")
+	rec := httptest.NewRecorder()
+	srv.serveMetrics(rec)
+	body := rec.Body.String()
+	for _, want := range []string{
+		`svngod_commit_duration_seconds_bucket{le="0.25"} 1`,
+		`svngod_commit_duration_seconds_bucket{le="2.5"} 2`,
+		`svngod_commit_duration_seconds_bucket{le="+Inf"} 2`,
+		`svngod_commit_duration_seconds_count 2`,
+		`svngod_commit_errors_total{reason="lease_busy"} 1`,
+		`svngod_commit_errors_total{reason="out_of_date"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics missing %q:\n%s", want, body)
+		}
 	}
 }

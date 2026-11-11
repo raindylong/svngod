@@ -1526,12 +1526,25 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 		}
 		var ood *fs.OutOfDateError
 		if errors.As(err, &ood) {
+			s.m.noteCommitError("out_of_date")
 			writeOutOfDate(w, ood.Path)
 			return
 		}
 		if errors.Is(err, fs.ErrOutOfDate) {
+			s.m.noteCommitError("out_of_date")
 			writeOutOfDate(w, "/")
 			return
+		}
+		if errors.Is(err, store.ErrQuorumUnmet) {
+			s.m.noteCommitError("quorum")
+		} else if errors.Is(err, store.ErrReplicaLagging) {
+			s.m.noteCommitError("replica_lagging")
+		} else if errors.Is(err, fs.ErrCommitBusy) {
+			s.m.noteCommitError("lease_busy")
+		} else if errors.Is(err, fs.ErrSegmentIndexConflict) {
+			s.m.noteCommitError("index_conflict")
+		} else if errors.Is(err, fs.ErrLeaseLost) || errors.Is(err, fs.ErrLeaseUnverified) {
+			s.m.noteCommitError("lease_lost")
 		}
 		if errors.Is(err, store.ErrQuorumUnmet) || errors.Is(err, store.ErrReplicaLagging) ||
 			errors.Is(err, fs.ErrCommitBusy) || errors.Is(err, fs.ErrLeaseLost) ||
@@ -1544,6 +1557,7 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 			http.Error(w, "repository backend is catching up; retry the commit", http.StatusServiceUnavailable)
 			return
 		}
+		s.m.noteCommitError("other")
 		http.Error(w, "commit failed: "+err.Error(), http.StatusConflict)
 		return
 	}
