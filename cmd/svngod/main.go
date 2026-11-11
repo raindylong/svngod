@@ -363,6 +363,9 @@ func runMultiRepo(configPath string, commitBatch, commitWindowMs int, adminAddr,
 		DisableMetrics:       cfg.DisableMetrics,
 		Logger:               logger,
 	})
+	if len(buildFailures) > 0 {
+		go retryFailedRepos(cfg, buildFailures, srv, logger)
+	}
 	startAdmin(configPath, cfg, cfgs, srv, adminAddr, adminToken, adminAllowCIDR, logger)
 	log.Printf("svngod listening on %s (base %s, %d repos)", addr, cfg.BasePath, len(repos))
 	hs := newHTTPServer(addr, srv.Handler())
@@ -492,5 +495,62 @@ func classifyRepoError(err error) string {
 		return "corrupt"
 	default:
 		return "other"
+	}
+}
+
+// retryFailedRepos periodically retries repositories that failed the startup
+// build. A backend that was down at boot therefore comes back into service
+// without a process restart; svngod_repo_ready flips to 1 when it does.
+// SVNGOD_REPO_RETRY_SECONDS overrides the 60s interval (tests, tuning).
+func retryFailedRepos(cfg *config.Config, failed map[string]string, srv *server.Server, logger *log.Logger) {
+	every := time.Minute
+	if v := os.Getenv("SVNGOD_REPO_RETRY_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			every = time.Duration(n) * time.Second
+		}
+	}
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for range t.C {
+		for name := range failed {
+			var entry *config.Repo
+			for i := range cfg.Repos {
+				if cfg.Repos[i].Name == name {
+					entry = &cfg.Repos[i]
+					break
+				}
+			}
+			if entry == nil {
+				delete(failed, name)
+				continue
+			}
+			one := *cfg
+			one.Repos = []config.Repo{*entry}
+			built, _, err := one.BuildRepos(nil, nil)
+			if err != nil || len(built) == 0 {
+				continue
+			}
+			// Do not clobber a concurrent admin reload: if the repository is
+			// already in the live set, only refresh the readiness gauge.
+			present := false
+			for _, rc := range srv.RepoConfigs() {
+				if rc.Name == name {
+					present = true
+					break
+				}
+			}
+			if present {
+				delete(failed, name)
+				srv.SetRepoReady(name, true, "")
+				continue
+			}
+			if _, serr := srv.SetRepos(append(srv.RepoConfigs(), built...), map[string]bool{name: true}); serr != nil {
+				logger.Printf("self-check: recovery of %q: %v", name, serr)
+				continue
+			}
+			delete(failed, name)
+			srv.SetRepoReady(name, true, "")
+			logger.Printf("self-check: repository %q recovered", name)
+		}
 	}
 }

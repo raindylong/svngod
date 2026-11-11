@@ -222,9 +222,10 @@ func (s *Server) serveMetrics(w http.ResponseWriter) {
 		names = append(names, k)
 	}
 	sort.Strings(names)
-	if len(s.cfg.RepoReady) > 0 {
-		readyNames := make([]string, 0, len(s.cfg.RepoReady))
-		for name := range s.cfg.RepoReady {
+	readyMap, readyErrMap := s.RepoReadySnapshot()
+	if len(readyMap) > 0 {
+		readyNames := make([]string, 0, len(readyMap))
+		for name := range readyMap {
 			readyNames = append(readyNames, name)
 		}
 		sort.Strings(readyNames)
@@ -232,22 +233,22 @@ func (s *Server) serveMetrics(w http.ResponseWriter) {
 		b.WriteString("# TYPE svngod_repo_ready gauge\n")
 		for _, name := range readyNames {
 			v := 0
-			if s.cfg.RepoReady[name] {
+			if readyMap[name] {
 				v = 1
 			}
 			fmt.Fprintf(&b, "svngod_repo_ready{repo=%q} %d\n", escapeLabel(name), v)
 		}
-		if len(s.cfg.RepoReadyError) > 0 {
+		if len(readyErrMap) > 0 {
 			b.WriteString("# HELP svngod_repo_ready_error Repositories that failed the startup self-check, by reason.\n")
 			b.WriteString("# TYPE svngod_repo_ready_error gauge\n")
-			errNames := make([]string, 0, len(s.cfg.RepoReadyError))
-			for name := range s.cfg.RepoReadyError {
+			errNames := make([]string, 0, len(readyErrMap))
+			for name := range readyErrMap {
 				errNames = append(errNames, name)
 			}
 			sort.Strings(errNames)
 			for _, name := range errNames {
 				fmt.Fprintf(&b, "svngod_repo_ready_error{repo=%q,reason=%q} 1\n",
-					escapeLabel(name), escapeLabel(s.cfg.RepoReadyError[name]))
+					escapeLabel(name), escapeLabel(readyErrMap[name]))
 			}
 		}
 	}

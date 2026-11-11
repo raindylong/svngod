@@ -132,6 +132,54 @@ func (s *Server) openerFor(name string) RepoOpener {
 	return s.cfg.OpenRepo
 }
 
+// RepoConfigs returns a snapshot of the current repository descriptors.
+func (s *Server) RepoConfigs() []*RepoConfig {
+	set := s.repos.Load()
+	if set == nil {
+		return nil
+	}
+	out := make([]*RepoConfig, len(set.list))
+	copy(out, set.list)
+	return out
+}
+
+// SetRepoReady updates one repository's self-check status, so a repository that
+// becomes available after startup is reflected in svngod_repo_ready.
+func (s *Server) SetRepoReady(name string, ok bool, reason string) {
+	s.repoReadyMu.Lock()
+	defer s.repoReadyMu.Unlock()
+	if s.repoReady == nil {
+		s.repoReady = map[string]bool{}
+	}
+	if s.repoReadyErr == nil {
+		s.repoReadyErr = map[string]string{}
+	}
+	s.repoReady[name] = ok
+	if ok {
+		delete(s.repoReadyErr, name)
+		return
+	}
+	if reason == "" {
+		reason = "other"
+	}
+	s.repoReadyErr[name] = reason
+}
+
+// RepoReadySnapshot returns copies of the readiness maps.
+func (s *Server) RepoReadySnapshot() (map[string]bool, map[string]string) {
+	s.repoReadyMu.Lock()
+	defer s.repoReadyMu.Unlock()
+	ready := make(map[string]bool, len(s.repoReady))
+	for k, v := range s.repoReady {
+		ready[k] = v
+	}
+	errs := make(map[string]string, len(s.repoReadyErr))
+	for k, v := range s.repoReadyErr {
+		errs[k] = v
+	}
+	return ready, errs
+}
+
 // RepoNames returns the repositories currently configured (for the admin API).
 func (s *Server) RepoNames() []string {
 	set := s.repos.Load()
@@ -187,22 +235,25 @@ func (s *Server) SetRepos(list []*RepoConfig, invalidate map[string]bool) ([]*fs
 type Server struct {
 	cfg Config
 
-	mu          sync.Mutex
-	activities  map[string]*activity
-	txns        map[string]*txn
-	locks       map[string]*lockEntry // key: repo + "\x00" + path
-	locksLoaded map[string]bool       // repositories whose persisted locks were restored
-	locksETag   map[string]string     // content hash of the persisted lock table last seen
-	lockOpsMu   sync.Mutex            // serialises refresh/mutate of the lock table
-	stateLoaded map[string]bool       // repositories whose persisted activities were restored
-	repoMapMu   sync.Mutex
-	repos       atomic.Pointer[repoSet] // current per-repo overrides (hot-swappable)
-	repoCache   map[string]*fs.Repo     // per-name repo singletons (shared r.mu)
-	txnCleanup  chan txnCleanupItem     // background fragment cleanup
-	uploads     chan struct{}           // nil when uploads are unlimited
-	upMu        sync.Mutex
-	userUploads map[string]int
-	m           *metrics
+	mu           sync.Mutex
+	activities   map[string]*activity
+	txns         map[string]*txn
+	locks        map[string]*lockEntry // key: repo + "\x00" + path
+	locksLoaded  map[string]bool       // repositories whose persisted locks were restored
+	locksETag    map[string]string     // content hash of the persisted lock table last seen
+	lockOpsMu    sync.Mutex            // serialises refresh/mutate of the lock table
+	stateLoaded  map[string]bool       // repositories whose persisted activities were restored
+	repoMapMu    sync.Mutex
+	repoReadyMu  sync.Mutex
+	repoReady    map[string]bool
+	repoReadyErr map[string]string
+	repos        atomic.Pointer[repoSet] // current per-repo overrides (hot-swappable)
+	repoCache    map[string]*fs.Repo     // per-name repo singletons (shared r.mu)
+	txnCleanup   chan txnCleanupItem     // background fragment cleanup
+	uploads      chan struct{}           // nil when uploads are unlimited
+	upMu         sync.Mutex
+	userUploads  map[string]int
+	m            *metrics
 }
 
 // New builds a Server.
@@ -226,6 +277,14 @@ func New(cfg Config) *Server {
 	}
 	if set, err := makeRepoSet(cfg.Repos); err == nil {
 		s.repos.Store(set)
+	}
+	s.repoReady = make(map[string]bool, len(cfg.RepoReady))
+	for k, v := range cfg.RepoReady {
+		s.repoReady[k] = v
+	}
+	s.repoReadyErr = make(map[string]string, len(cfg.RepoReadyError))
+	for k, v := range cfg.RepoReadyError {
+		s.repoReadyErr[k] = v
 	}
 	return s
 }
