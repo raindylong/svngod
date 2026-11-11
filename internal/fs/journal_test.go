@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"svngod/internal/fs/store"
 )
@@ -275,6 +276,110 @@ func TestJournalReplayAvailabilityMode(t *testing.T) {
 	}
 	if h, _ := r2.HeadFresh(); h != 1 {
 		t.Fatalf("head=%d after replay, want 1", h)
+	}
+}
+
+// blockGoneStore makes Get fail for one configured key while every other
+// object stays readable - used to drop a rev-block below quorum without
+// taking a whole replica out of service.
+type blockGoneStore struct {
+	store.Store
+	mu  sync.Mutex
+	key string
+}
+
+func (s *blockGoneStore) dead(k string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.key != "" && s.key == k
+}
+
+func (s *blockGoneStore) block(k string) {
+	s.mu.Lock()
+	s.key = k
+	s.mu.Unlock()
+}
+
+func (s *blockGoneStore) unblock() {
+	s.mu.Lock()
+	s.key = ""
+	s.mu.Unlock()
+}
+
+func (s *blockGoneStore) Get(ctx context.Context, key string, rng *store.Range) ([]byte, error) {
+	if s.dead(key) {
+		return nil, store.ErrNotFound
+	}
+	return s.Store.Get(ctx, key, rng)
+}
+
+// TestJournalReplayStopsAtUnreadableRevBlock: when the WAL record of head+1
+// is durable but its revision block cannot be read from a quorum (replica
+// outage or corruption), replay must end the run promptly. The replay loop
+// advances `rev` only on a publish, so the old `continue` here re-examined
+// the same revision forever while holding journalMu - a crash-recovery
+// livelock. After the copies come back, a later replay must still publish.
+func TestJournalReplayStopsAtUnreadableRevBlock(t *testing.T) {
+	var stores []*blockGoneStore
+	var members []store.Store
+	for i := 0; i < 3; i++ {
+		b := &blockGoneStore{Store: store.NewMemoryStore()}
+		stores = append(stores, b)
+		members = append(members, b)
+	}
+	ms := store.NewMirror(members, store.WithWriteQuorum(2))
+	r, err := CreateRepo(ms, "rb", 4096, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.CommitTxn(0, []Change{{Path: "/a", Action: ActionAdd, Kind: KindFile, Data: []byte("1")}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := r.JournalRecord(1)
+	if err != nil || rec == nil {
+		t.Fatalf("journal record missing: %v", err)
+	}
+	// Simulate the crash window with the rev-block unreachable everywhere:
+	// rewind HEAD, then make every replica fail Get on the block key only.
+	ctx := context.Background()
+	cur, etag, err := r.readCurrent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ms.CAS(ctx, r.keys.Current(), etag, (&Current{Head: 0, Created: cur.Created}).Marshal()); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range stores {
+		s.block(rec.RevBlockKey)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		r.reconcileJournal(true)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("replayJournal livelocked on a rev-block below quorum")
+	}
+	if c, _, err := r.readCurrent(); err != nil || c.Head != 0 {
+		t.Fatalf("head=%v after paused replay (err %v), want 0: nothing may publish without the data", c.Head, err)
+	}
+
+	// Replicas recover: the next replay must roll the revision forward.
+	for _, s := range stores {
+		s.unblock()
+	}
+	r2, err := OpenRepo(ms, "rb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h, _ := r2.HeadFresh(); h != 1 {
+		t.Fatalf("head=%d after recovery, want 1", h)
+	}
+	if nr, err := r2.Resolve(1, "/a"); err != nil || nr == nil {
+		t.Fatalf("rolled-forward revision unreadable: %v", err)
 	}
 }
 

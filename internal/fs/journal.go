@@ -301,13 +301,20 @@ func (r *Repo) replayJournal() {
 		if rec.Version != 1 || rec.Rev != rev {
 			break
 		}
+		// A rev-block that is missing below quorum, unreadable, or corrupt
+		// ends the run: the loop has no post statement (batch publishes
+		// advance rev manually), so `continue` would re-examine the same
+		// revision forever while holding journalMu. Reconciliation retries
+		// once repair restores a verifying copy.
 		rb, rbCount, rerr := read(rec.RevBlockKey)
 		if rerr != nil || rbCount < quorum {
-			continue
+			log.Printf("journal: replay paused at revision %d: rev-block copies %d < quorum %d (err %v)", rev, rbCount, quorum, rerr)
+			break
 		}
 		sum := sha256.Sum256(rb)
 		if hex.EncodeToString(sum[:]) != rec.RevBlockSHA {
-			continue
+			log.Printf("journal: replay paused at revision %d: rev-block SHA mismatch (possible corruption)", rev)
+			break
 		}
 		cur, etag, cerr := r.readCurrent()
 		if cerr != nil || cur.Head != head {
