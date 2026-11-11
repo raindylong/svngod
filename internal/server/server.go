@@ -658,6 +658,66 @@ func (s *Server) absURL(r *http.Request, repo, href string) string {
 	return fmt.Sprintf("%s://%s%s/%s%s", scheme, host, base, repo, href)
 }
 
+// audit emits one structured audit record for a security-relevant event.
+// Only metadata is recorded (who, which repository, which revision, counts):
+// usernames and repository names are quoted so an embedded newline cannot
+// forge a second record, and file contents, log messages and property values
+// never appear. The stream can therefore be shipped to a SIEM without leaking
+// repository data.
+func (s *Server) audit(kind string, kv ...any) {
+	var b strings.Builder
+	b.WriteString("audit ")
+	b.WriteString(kind)
+	for i := 0; i+1 < len(kv); i += 2 {
+		switch v := kv[i+1].(type) {
+		case int:
+			fmt.Fprintf(&b, " %v=%d", kv[i], v)
+		case int64:
+			fmt.Fprintf(&b, " %v=%d", kv[i], v)
+		case uint64:
+			fmt.Fprintf(&b, " %v=%d", kv[i], v)
+		case bool:
+			fmt.Fprintf(&b, " %v=%t", kv[i], v)
+		default:
+			fmt.Fprintf(&b, " %v=%q", kv[i], fmt.Sprint(v))
+		}
+	}
+	if s.cfg.Logger != nil {
+		s.cfg.Logger.Print(b.String())
+		return
+	}
+	log.Print(b.String())
+}
+
+// auditActor labels unauthenticated activity so a blank field in the audit
+// stream is never mistaken for a missing log line.
+func auditActor(user string) string {
+	if user == "" {
+		return "anonymous"
+	}
+	return user
+}
+
+// auditCommit reports the durable outcome of a commit. It runs after CommitTxn
+// returned, so every revision in the audit stream is one the repository
+// actually holds (and every acknowledged commit appears in the stream).
+func (s *Server) auditCommit(mode, repo, user string, rev uint64, changes []fs.Change) {
+	user = auditActor(user)
+	add, mod, del := 0, 0, 0
+	for i := range changes {
+		switch changes[i].Action {
+		case fs.ActionAdd:
+			add++
+		case fs.ActionDelete:
+			del++
+		default:
+			mod++
+		}
+	}
+	s.audit("commit", "mode", mode, "repo", repo, "rev", rev, "user", user,
+		"paths", len(changes), "add", add, "modify", mod, "delete", del)
+}
+
 // notImpl logs and returns 501 for methods not yet implemented.
 func (s *Server) notImpl(w http.ResponseWriter, method string) {
 	http.Error(w, method+" not yet implemented", http.StatusNotImplemented)

@@ -531,6 +531,8 @@ func (s *Server) handleRevPropPatch(w http.ResponseWriter, r *http.Request, res 
 		http.Error(w, "revision property update failed", http.StatusInternalServerError)
 		return
 	}
+	s.audit("revprop", "repo", res.repo, "rev", res.rev, "user", auditActor(user),
+		"set", len(setMap), "remove", len(rem))
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
 	b.WriteString(`<D:multistatus xmlns:D="` + NS_DAV + `">` + "\n")
@@ -1563,6 +1565,7 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request, res resourc
 	}
 	// A commit made without --no-unlock asks the server to release the locks it
 	// used; the client sends no separate UNLOCK for them.
+	s.auditCommit("dav", res.repo, user, rev, changes)
 	if strings.Contains(r.Header.Get("X-SVN-Options"), "release-locks") {
 		s.releaseCommittedLocks(res.repo, repo, res.path, mergeLocks)
 	}

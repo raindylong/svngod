@@ -448,6 +448,7 @@ func (s *Server) handleBundleCommit(w http.ResponseWriter, r *http.Request) {
 	rev, cerr := repo.CommitTxn(base, changes, revProps)
 	if cerr == nil {
 		s.m.commits.Add(1)
+		s.auditCommit("bundle", name, user, rev, changes)
 	}
 	if cerr != nil {
 		var ood *fs.OutOfDateError
