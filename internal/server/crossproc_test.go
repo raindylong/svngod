@@ -78,4 +78,14 @@ func TestReportSeesCommitsFromAnotherProcess(t *testing.T) {
 			t.Fatalf("update-report served by another process is missing %q:\n%s", want, out)
 		}
 	}
+
+	// B just cached revision 2's properties. Process A edits svn:log; the next
+	// log-report must not serve the pre-edit copy from B's cache.
+	if err := procA.UpdateRevProps(2, map[string]string{"svn:log": "edited from A"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	out = doReportAt(t, ts.URL+"/svn/demo/!svn/me", logBody)
+	if !strings.Contains(out, "edited from A") {
+		t.Fatalf("log-report served a stale svn:log after a cross-process edit:\n%s", out)
+	}
 }

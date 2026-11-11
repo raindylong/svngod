@@ -984,7 +984,15 @@ func (s *Server) reportLog(w http.ResponseWriter, repo *fs.Repo, reportPath stri
 			}
 		}
 		count++
-		rp, err := repo.GetRevProps(rv)
+		var rp *fs.RevProps
+		if rv == head {
+			// Revision-property edits land on another process's store writes;
+			// the newest revision is the one being fixed immediately after a
+			// commit, so read its props past the 1s cache.
+			rp, err = repo.GetRevPropsFresh(rv)
+		} else {
+			rp, err = repo.GetRevProps(rv)
+		}
 		if err != nil {
 			// Never drop a revision from the log silently: the client would
 			// read a shorter history and believe the revision does not exist.
