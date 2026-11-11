@@ -81,7 +81,12 @@ func (s *FileStore) SyncAll(_ context.Context) error {
 		return err
 	}
 	defer d.Close()
-	return unix.Syncfs(int(d.Fd()))
+	// On platforms without syncfs this is a no-op; per-write durability is
+	// already ensured by the fsyncs in the syncWrites path.
+	if handled, serr := syncFs(int(d.Fd())); serr != nil && handled {
+		return serr
+	}
+	return nil
 }
 
 func (s *FileStore) syncDir(dir string) error {
