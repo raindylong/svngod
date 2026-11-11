@@ -86,3 +86,37 @@ func TestVerifyProgressCallback(t *testing.T) {
 		t.Fatalf("progress calls=%d, want 4", calls.Load())
 	}
 }
+
+// TestCacheStatsCounters: repeated reads must show up as hits, and the first
+// read of a revision as a miss. The counters feed the /_metrics cache gauges.
+func TestCacheStatsCounters(t *testing.T) {
+	st := store.NewMemoryStore()
+	if _, err := CreateRepoSegments(st, "repos/cstats", 8, 64, cdc.DefaultParams(), false, 8); err != nil {
+		t.Fatal(err)
+	}
+	r, err := OpenRepo(st, "repos/cstats")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitBatches(t, r, 1, 4) // one segment covering revs 1..4
+	r2, err := OpenRepo(st, "repos/cstats")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rev := uint64(1); rev <= 3; rev++ {
+		if _, err := r2.readBlock(rev); err != nil {
+			t.Fatalf("read %d: %v", rev, err)
+		}
+	}
+	// Reading a revision again must be served from the block cache.
+	if _, err := r2.readBlock(1); err != nil {
+		t.Fatal(err)
+	}
+	cs := r2.CacheStats()
+	if cs.BlockHits == 0 || cs.BlockMisses == 0 {
+		t.Fatalf("block counters: %+v", cs)
+	}
+	if cs.SegmentHits == 0 {
+		t.Fatalf("segment cache never hit across sequential reads: %+v", cs)
+	}
+}

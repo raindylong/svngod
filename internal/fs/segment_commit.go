@@ -398,8 +398,10 @@ func (r *Repo) segmentEntry(rev uint64, fresh bool) ([]byte, []byte, error) {
 	// serves the rest from memory; isolated reads stay ranged.
 	sequential := r.noteSegmentRead(objKey, rev)
 	if seg := r.segDecoded.get(objKey); seg != nil {
+		r.segCacheHits.Add(1)
 		return segmentEntryAt(seg, rev, ref)
 	}
+	r.segCacheMisses.Add(1)
 	if !sequential {
 		block, props, err := r.readSegmentEntry(context.Background(), *ref, rev-ref.First)
 		if err == nil {

@@ -75,6 +75,11 @@ type Repo struct {
 	// fullReads forces whole-object segment reads. Verify sets it so the index
 	// SHA-256 is checked; ranged reads only see the per-entry CRC.
 	fullReads atomic.Bool
+	// Read-path cache counters (exposed via CacheStats / metrics).
+	blockCacheHits   atomic.Uint64
+	blockCacheMisses atomic.Uint64
+	segCacheHits     atomic.Uint64
+	segCacheMisses   atomic.Uint64
 	// seqMu guards the sequential-read hint: same segment, previous revision.
 	seqMu   sync.Mutex
 	seqKey  string
@@ -156,9 +161,30 @@ const blockCacheBudget = 64 << 20
 // cachedBlock returns a decoded block, if present.
 func (r *Repo) cachedBlock(rev uint64) (*RevBlock, bool) {
 	r.blockCacheMu.Lock()
-	defer r.blockCacheMu.Unlock()
 	rb, ok := r.blockCache[rev]
+	r.blockCacheMu.Unlock()
+	if ok {
+		r.blockCacheHits.Add(1)
+	} else {
+		r.blockCacheMisses.Add(1)
+	}
 	return rb, ok
+}
+
+// CacheStats reports read-path cache effectiveness. Counters are cumulative
+// since the repository was opened; the metrics endpoint exposes deltas through
+// Prometheus' rate().
+type CacheStats struct {
+	BlockHits, BlockMisses     uint64
+	SegmentHits, SegmentMisses uint64
+}
+
+// CacheStats returns a snapshot of the read-path cache counters.
+func (r *Repo) CacheStats() CacheStats {
+	return CacheStats{
+		BlockHits: r.blockCacheHits.Load(), BlockMisses: r.blockCacheMisses.Load(),
+		SegmentHits: r.segCacheHits.Load(), SegmentMisses: r.segCacheMisses.Load(),
+	}
 }
 
 // storeBlock inserts a decoded block, dropping the whole set when over budget.

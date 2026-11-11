@@ -692,6 +692,10 @@ func TestMetricsCommitHistogram(t *testing.T) {
 			return nil, fs.ErrRepoNotFound
 		},
 	})
+	// Expose per-repo cache counters too.
+	srv.repoMapMu.Lock()
+	srv.repoCache["demo"] = repo
+	srv.repoMapMu.Unlock()
 	srv.m.observeCommit(120 * time.Millisecond)
 	srv.m.observeCommit(2 * time.Second)
 	srv.m.noteCommitError("out_of_date")
@@ -706,6 +710,8 @@ func TestMetricsCommitHistogram(t *testing.T) {
 		`svngod_commit_duration_seconds_count 2`,
 		`svngod_commit_errors_total{reason="lease_busy"} 1`,
 		`svngod_commit_errors_total{reason="out_of_date"} 1`,
+		`svngod_block_cache_misses_total{repo="demo"}`,
+		`svngod_segment_cache_hits_total{repo="demo"}`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("metrics missing %q:\n%s", want, body)

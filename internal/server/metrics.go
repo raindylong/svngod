@@ -202,6 +202,21 @@ func (s *Server) serveMetrics(w http.ResponseWriter) {
 		names = append(names, k)
 	}
 	sort.Strings(names)
+	b.WriteString("# HELP svngod_block_cache_hits_total Revision-block cache hits.\n")
+	b.WriteString("# TYPE svngod_block_cache_hits_total counter\n")
+	b.WriteString("# HELP svngod_block_cache_misses_total Revision-block cache misses.\n")
+	b.WriteString("# TYPE svngod_block_cache_misses_total counter\n")
+	b.WriteString("# HELP svngod_segment_cache_hits_total Decoded-segment cache hits.\n")
+	b.WriteString("# TYPE svngod_segment_cache_hits_total counter\n")
+	b.WriteString("# HELP svngod_segment_cache_misses_total Decoded-segment cache misses.\n")
+	b.WriteString("# TYPE svngod_segment_cache_misses_total counter\n")
+	for _, name := range names {
+		cs := repos[name].CacheStats()
+		fmt.Fprintf(&b, "svngod_block_cache_hits_total{repo=%q} %d\n", escapeLabel(name), cs.BlockHits)
+		fmt.Fprintf(&b, "svngod_block_cache_misses_total{repo=%q} %d\n", escapeLabel(name), cs.BlockMisses)
+		fmt.Fprintf(&b, "svngod_segment_cache_hits_total{repo=%q} %d\n", escapeLabel(name), cs.SegmentHits)
+		fmt.Fprintf(&b, "svngod_segment_cache_misses_total{repo=%q} %d\n", escapeLabel(name), cs.SegmentMisses)
+	}
 	wroteMirror := false
 	for _, name := range names {
 		statuses := repos[name].ReplicaStatus()
