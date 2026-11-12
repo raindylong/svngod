@@ -13,11 +13,9 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -35,6 +33,7 @@ import (
 	"svngod/internal/dump"
 	"svngod/internal/fs"
 	"svngod/internal/fs/store"
+	"svngod/internal/mirrorspec"
 )
 
 const (
@@ -97,38 +96,10 @@ type options struct {
 	migrateChunkAvg uint64
 }
 
-// mirrorEntry is one backend in a --mirror-file JSON object. It accepts both
-// spellings operators actually have on disk:
-//
-//	--mirror-file style: {"access":"...","secret":"..."}
-//	config style:        {"access-key":"...","secret-key":"..."}
-//
-// The two used to differ, so pasting a storage.mirrors block straight into
-// --mirror-file silently sent anonymous requests ("Access Denied") with no hint
-// that the keys had been dropped.
-type mirrorEntry struct {
-	Type      string `json:"type"`
-	Root      string `json:"root"`
-	Endpoint  string `json:"endpoint"`
-	Access    string `json:"access"`
-	Secret    string `json:"secret"`
-	AccessKey string `json:"access-key"`
-	SecretKey string `json:"secret-key"`
-	Bucket    string `json:"bucket"`
-	SSL       bool   `json:"ssl"`
-}
-
-// creds returns the access/secret pair under either accepted spelling.
-func (e mirrorEntry) creds() (string, string) {
-	ak, sk := e.Access, e.Secret
-	if ak == "" {
-		ak = e.AccessKey
-	}
-	if sk == "" {
-		sk = e.SecretKey
-	}
-	return ak, sk
-}
+// mirrorEntry is one backend in a --mirror-file JSON object. Parsing and
+// construction live in internal/mirrorspec so svnadmin and revscale cannot
+// drift apart on credential field names.
+type mirrorEntry = mirrorspec.Member
 
 func (o *options) repoStore(localPath string) (store.Store, string, error) {
 	name := filepath.Base(localPath)
@@ -329,49 +300,15 @@ func main() {
 
 // readMirrorFile parses a --mirror-file (array or {"mirrors":[...],"quorum":N,"prefix":P}).
 func readMirrorFile(path string) ([]mirrorEntry, int, string, error) {
-	data, err := os.ReadFile(path)
+	spec, err := mirrorspec.Parse(path)
 	if err != nil {
 		return nil, 0, "", err
 	}
-	var entries []mirrorEntry
-	var quorum int
-	repoPrefix := "repos"
-	trimmed := bytes.TrimSpace(data)
-	if len(trimmed) > 0 && trimmed[0] == '{' {
-		var obj struct {
-			Mirrors []mirrorEntry `json:"mirrors"`
-			Quorum  int           `json:"quorum"`
-			Prefix  string        `json:"prefix"`
-		}
-		if err := json.Unmarshal(trimmed, &obj); err != nil {
-			return nil, 0, "", fmt.Errorf("parse --mirror-file: %v", err)
-		}
-		entries, quorum = obj.Mirrors, obj.Quorum
-		if obj.Prefix != "" {
-			repoPrefix = obj.Prefix
-		}
-	} else if err := json.Unmarshal(data, &entries); err != nil {
-		return nil, 0, "", fmt.Errorf("parse --mirror-file: %v", err)
-	}
-	return entries, quorum, repoPrefix, nil
+	return spec.Members, spec.Quorum, spec.Prefix, nil
 }
 
-// memberStore opens one mirror member as an independent view of the repository
-// (keys relative to the bucket/root, repository prefix applied by the caller).
-func memberStore(e mirrorEntry) (store.Store, error) {
-	if e.Type == "s3" {
-		ak, sk := e.creds()
-		if ak == "" || sk == "" {
-			return nil, fmt.Errorf("mirror %s: missing credentials "+
-				"(set \"access\"/\"secret\" or \"access-key\"/\"secret-key\")", e.Endpoint)
-		}
-		return store.NewS3Store(store.S3Config{
-			Endpoint: e.Endpoint, AccessKey: ak, SecretKey: sk,
-			Bucket: e.Bucket, Region: "us-east-1", UseSSL: e.SSL,
-		})
-	}
-	return store.NewFileStore(e.Root)
-}
+// memberStore opens one mirror member as an independent view of the repository.
+func memberStore(e mirrorEntry) (store.Store, error) { return e.Store() }
 
 // memberStat is one mirror member's reported state.
 type memberStat struct {

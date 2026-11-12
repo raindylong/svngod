@@ -26,6 +26,7 @@ import (
 
 	"svngod/internal/fs"
 	"svngod/internal/fs/store"
+	"svngod/internal/mirrorspec"
 )
 
 var (
@@ -46,6 +47,7 @@ var (
 	rawBench  = flag.Int("raw", 0, "measure raw 1KiB Put/Get round trips and exit")
 	batch     = flag.Int("batch", 1, "revisions per group commit (1 = one commit per revision)")
 	idxBase   = flag.Int64("idxbase", 0, "path index base for batch mode (keeps paths unique across resumed runs)")
+	mirrorF   = flag.String("mirror-file", "", "JSON mirror spec (same shape as svnadmin --mirror-file); overrides -endpoints for -store mirrorfile")
 )
 
 var authors = []string{"alice", "bob", "carol", "admin", "dave", "erin", "frank", "grace"}
@@ -81,21 +83,35 @@ func main() {
 	case "s3":
 		st = s3Store(strings.Split(*endpoints, ",")[0])
 	case "mirrorfile":
-		// Same mirror/WAL/quorum code path as production, but each -endpoints
-		// entry is a local directory: lets a restore drill exercise the journal
-		// hash chain without an S3 dependency.
+		// Same mirror/WAL/quorum code path as production. Without -mirror-file
+		// each -endpoints entry is a local directory (restore drill without an
+		// S3 dependency); with it, the spec decides the backends (local S3 lab).
+		rp := strings.Trim(*prefix, "/") + "/" + *repoName
 		var ms []store.Store
-		for _, ep := range strings.Split(*endpoints, ",") {
-			root := strings.TrimSpace(ep)
-			os.MkdirAll(root, 0o755)
-			s, err := store.NewFileStore(root)
+		if *mirrorF != "" {
+			spec, err := mirrorspec.Parse(*mirrorF)
 			if err != nil {
-				fmt.Fprintln(os.Stderr, "store:", err)
+				fmt.Fprintln(os.Stderr, "mirror-file:", err)
 				os.Exit(1)
 			}
-			ms = append(ms, s)
+			m, err := spec.Stores()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "mirror-file:", err)
+				os.Exit(1)
+			}
+			ms, rp = m, spec.RepoPrefix(*repoName)
+		} else {
+			for _, ep := range strings.Split(*endpoints, ",") {
+				root := strings.TrimSpace(ep)
+				os.MkdirAll(root, 0o755)
+				s, err := store.NewFileStore(root)
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "store:", err)
+					os.Exit(1)
+				}
+				ms = append(ms, s)
+			}
 		}
-		rp := strings.Trim(*prefix, "/") + "/" + *repoName
 		st = store.NewMirror(ms, store.WithMutableOrder(fs.CompareMutable),
 			store.WithRepoPrefix(rp), store.WithLazyRepair())
 	case "file":

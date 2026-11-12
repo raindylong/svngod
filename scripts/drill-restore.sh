@@ -18,6 +18,13 @@
 # journal, so a chain check there would silently pass and prove nothing.
 #
 # Usage: scripts/drill-restore.sh [revisions] [workers]
+#        DRILL_MIRROR_FILE=/path/mirror.json scripts/drill-restore.sh [revs]
+#
+# DRILL_MIRROR_FILE points the positive chain at an external mirror spec (for
+# example the two-instance S3 lab) instead of two local directories. The
+# negative controls always run on local directories: they exercise the gates,
+# not the backend, and must be able to corrupt objects directly.
+#
 # Exit: 0 = every recovery assumption held, non-zero = a link is broken.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -42,26 +49,40 @@ CGO_ENABLED=0 go build -o "$WORK/svnadmin" ./cmd/svnadmin
 CGO_ENABLED=0 go build -o "$WORK/revscale" ./cmd/revscale
 SVNADMIN="$WORK/svnadmin"
 
-step "seed a repository with $REVS revisions (two-node WAL mirror, quorum 2)"
-mkdir -p "$WORK/src1" "$WORK/src2"
-mirrorSpec "$WORK/src1" "$WORK/src2" "$WORK/src.json"
-"$SVNADMIN" create --mirror-file "$WORK/src.json" app >/dev/null
+if [ -n "${DRILL_MIRROR_FILE:-}" ]; then
+  step "seed a repository with $REVS revisions (external mirror: $DRILL_MIRROR_FILE)"
+  [ -r "$DRILL_MIRROR_FILE" ] || fail "DRILL_MIRROR_FILE is not readable: $DRILL_MIRROR_FILE"
+  SRC_MIRROR=$DRILL_MIRROR_FILE
+  "$SVNADMIN" create --mirror-file "$SRC_MIRROR" app >/dev/null
+else
+  step "seed a repository with $REVS revisions (two-node WAL mirror, quorum 2)"
+  mkdir -p "$WORK/src1" "$WORK/src2"
+  mirrorSpec "$WORK/src1" "$WORK/src2" "$WORK/src.json"
+  SRC_MIRROR="$WORK/src.json"
+  "$SVNADMIN" create --mirror-file "$SRC_MIRROR" app >/dev/null
+fi
 # -mixed (adds/modifies/deletes/copies) needs a single writer: its generator
 # assumes sequential state, so concurrent deletes of the same path abort
 # commits. The drill wants a predictable seed, not throughput.
-SEED_LOG=$("$WORK/revscale" -store mirrorfile -endpoints "$WORK/src1,$WORK/src2" \
-  -repo app -target "$REVS" -workers 1 -mixed -progress 1m 2>&1)
+if [ -n "${DRILL_MIRROR_FILE:-}" ]; then
+  SEED_LOG=$("$WORK/revscale" -store mirrorfile \
+    -mirror-file "$DRILL_MIRROR_FILE" -repo app \
+    -target "$REVS" -workers 1 -mixed -progress 1m 2>&1)
+else
+  SEED_LOG=$("$WORK/revscale" -store mirrorfile -endpoints "$WORK/src1,$WORK/src2" \
+    -repo app -target "$REVS" -workers 1 -mixed -progress 1m 2>&1)
+fi
 echo "$SEED_LOG" | tail -2
 if echo "$SEED_LOG" | grep -q ' ERR '; then
   fail "seeding aborted a commit (see log above)"
 fi
-HEAD_SEED=$("$SVNADMIN" info --mirror-file "$WORK/src.json" app | awk '/^head:/{print $2}')
+HEAD_SEED=$("$SVNADMIN" info --mirror-file "$SRC_MIRROR" app | awk '/^head:/{print $2}')
 [ -n "${HEAD_SEED:-}" ] || fail "could not read seeded HEAD"
 [ "$HEAD_SEED" -ge "$REVS" ] || fail "seeded only $HEAD_SEED of $REVS revisions"
 echo "seeded head=$HEAD_SEED"
 
 step "backup: dump --verify (refuses to export corrupt history)"
-"$SVNADMIN" dump --mirror-file "$WORK/src.json" --verify --output "$WORK/app.dump" app \
+"$SVNADMIN" dump --mirror-file "$SRC_MIRROR" --verify --output "$WORK/app.dump" app \
   2> "$WORK/dump.log"
 grep -v '^dump: repo=' "$WORK/dump.log" || true
 cat "$WORK/dump.log" | grep '^dump: repo=' || fail "dump produced no manifest"
@@ -81,18 +102,32 @@ step "no .partial file left at the trusted path"
 [ ! -f "$WORK/app.dump.partial" ] || fail "dump left a .partial file behind"
 
 step "restore into a fresh mirror, asserting the revision count"
-mkdir -p "$WORK/dst1" "$WORK/dst2"
-mirrorSpec "$WORK/dst1" "$WORK/dst2" "$WORK/dst.json"
-"$SVNADMIN" load --mirror-file "$WORK/dst.json" --input "$WORK/app.dump" \
+if [ -n "${DRILL_MIRROR_FILE:-}" ]; then
+  # Restore into a different bucket prefix so the source copy is untouched and
+  # the seed cannot be mistaken for the restored repository.
+  DST_MIRROR="$WORK/dst-ext.json"
+  python3 - "$DRILL_MIRROR_FILE" "$DST_MIRROR" <<'PYEOF'
+import json, sys
+src, dst = sys.argv[1], sys.argv[2]
+spec = json.load(open(src))
+spec["prefix"] = "drill-restore"
+json.dump(spec, open(dst, "w"))
+PYEOF
+else
+  mkdir -p "$WORK/dst1" "$WORK/dst2"
+  mirrorSpec "$WORK/dst1" "$WORK/dst2" "$WORK/dst.json"
+  DST_MIRROR="$WORK/dst.json"
+fi
+"$SVNADMIN" load --mirror-file "$DST_MIRROR" --input "$WORK/app.dump" \
   --expect-head "$HEAD_SEED" app 2>&1 | tail -2
 
 step "restore assertions: tree, every text, WORM journal chain"
-"$SVNADMIN" verify --mirror-file "$WORK/dst.json" --all-revs --texts --workers "$WORKERS" app \
+"$SVNADMIN" verify --mirror-file "$DST_MIRROR" --all-revs --texts --workers "$WORKERS" app \
   2>&1 | tail -3
-"$SVNADMIN" journal --mirror-file "$WORK/dst.json" -n 1 app | tail -1
+"$SVNADMIN" journal --mirror-file "$DST_MIRROR" -n 1 app | tail -1
 
 step "fingerprint: an independent re-dump must reproduce the backup exactly"
-"$SVNADMIN" dump --mirror-file "$WORK/dst.json" --verify --output "$WORK/app2.dump" app \
+"$SVNADMIN" dump --mirror-file "$DST_MIRROR" --verify --output "$WORK/app2.dump" app \
   2> "$WORK/dump2.log"
 RESTORED_SHA=$(shasum -a 256 "$WORK/app2.dump" | awk '{print $1}')
 [ "$RESTORED_SHA" = "$ACTUAL_SHA" ] || fail "re-dump differs from backup: $RESTORED_SHA != $ACTUAL_SHA"
