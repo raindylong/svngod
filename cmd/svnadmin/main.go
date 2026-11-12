@@ -1235,6 +1235,14 @@ func doVerify(o *options, repoName string) {
 	if o.verifyTextfile != "" {
 		writeVerifyMetrics(o.verifyTextfile, repoName, scope, len(issues), time.Since(begin))
 	}
+	// WORM hash chain over the journal: proves the revision log was not
+	// silently rewritten (each record pins its predecessor's bytes).
+	if chainErr := repo.VerifyJournalChain(1, head); chainErr != nil {
+		fmt.Printf("verify: journal hash chain: %v\n", chainErr)
+		issues = append(issues, fs.VerifyIssue{Rev: 0, Err: chainErr})
+	} else {
+		fmt.Printf("verify: journal hash chain intact (revs 1..%d)\n", head)
+	}
 	if len(issues) == 0 {
 		fmt.Printf("verify: repository %q %s: no integrity issues\n", repoName, scope)
 		return

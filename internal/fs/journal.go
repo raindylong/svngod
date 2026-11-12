@@ -60,9 +60,15 @@ type CommitRecord struct {
 	// Segment (v2) records do not set it - their props live inside the
 	// immutable segment covered by SegmentSHA.
 	PropsSHA string `json:"props_sha256,omitempty"`
-	Author   string `json:"author,omitempty"`
-	Log      string `json:"log,omitempty"`
-	Quorum   int    `json:"quorum"`
+	// PrevJournalSHA chains this record to journal/<rev-1> as stored: the
+	// SHA-256 of the previous record's encoded bytes. Any silent rewrite of a
+	// historical record breaks the chain of every later record, so a verifier
+	// can prove the revision log was not tampered with (WORM audit chain).
+	// Empty on the first record (or a pre-4.2 record) starts a fresh chain.
+	PrevJournalSHA string `json:"prev_journal_sha256,omitempty"`
+	Author         string `json:"author,omitempty"`
+	Log            string `json:"log,omitempty"`
+	Quorum         int    `json:"quorum"`
 }
 
 // CommitGroup is one shard's slice of a segmented commit batch.
@@ -154,8 +160,68 @@ func (r *Repo) writeCommitJournal(ctx context.Context, rev, parent uint64, lease
 		psum := sha256.Sum256(propsBytes)
 		rec.PropsSHA = hex.EncodeToString(psum[:])
 	}
+	if prev := r.prevJournalSHA(ctx, rev); prev != "" {
+		rec.PrevJournalSHA = prev
+	}
 	if err := r.store.Put(ctx, r.keys.Journal(rev), EncodeCommitRecord(rec)); err != nil {
 		return fmt.Errorf("journal: %w", err)
+	}
+	return nil
+}
+
+// prevJournalSHA returns the SHA-256 of journal/<rev-1> as stored, or "" when
+// rev is the first record (or the predecessor is absent/unreadable, which
+// starts a fresh chain rather than failing the commit - the chain is verified
+// as a whole by VerifyJournalChain, not per write).
+func (r *Repo) prevJournalSHA(ctx context.Context, rev uint64) string {
+	if rev == 0 {
+		return ""
+	}
+	b, err := r.store.Get(ctx, r.keys.Journal(rev-1), nil)
+	if err != nil || len(b) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// VerifyJournalChain walks journal records from..to and checks the hash
+// chain: each record's PrevJournalSHA (when set) must equal the SHA-256 of
+// the previous record's stored bytes. Returns the first break as an error
+// naming the revision. Records predating the chain feature have an empty
+// PrevJournalSHA and simply continue the walk (a fresh chain starts at the
+// next record that has one).
+func (r *Repo) VerifyJournalChain(from, to uint64) error {
+	if !r.journal {
+		return nil
+	}
+	ctx := context.Background()
+	var prev []byte
+	for rev := from; rev <= to; rev++ {
+		b, err := r.store.Get(ctx, r.keys.Journal(rev), nil)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				if prev == nil {
+					continue // gap before the first record we saw
+				}
+				return fmt.Errorf("journal: chain gap at rev %d (predecessor exists, record missing)", rev)
+			}
+			return err
+		}
+		rec, derr := DecodeCommitRecord(b)
+		if derr != nil {
+			return fmt.Errorf("journal: rev %d: %w", rev, derr)
+		}
+		if rec.Rev != rev {
+			return fmt.Errorf("journal: rev %d: record claims rev %d", rev, rec.Rev)
+		}
+		if prev != nil && rec.PrevJournalSHA != "" {
+			sum := sha256.Sum256(prev)
+			if hex.EncodeToString(sum[:]) != rec.PrevJournalSHA {
+				return fmt.Errorf("journal: hash chain broken at rev %d: predecessor was rewritten or forged", rev)
+			}
+		}
+		prev = b
 	}
 	return nil
 }
@@ -220,6 +286,12 @@ func (r *Repo) replayJournal() {
 	// replica was down (measured as ~10s per upload in availability mode).
 	// The window covers one maximum-size commit batch so a crash after the
 	// batch's WAL append still rolls the whole batch forward.
+	var prevBytes []byte // journal/<head> bytes for the chain check
+	if head > 0 {
+		if pb, perr := r.store.Get(ctx, r.keys.Journal(head), nil); perr == nil {
+			prevBytes = pb
+		}
+	}
 	for rev := head + 1; rev <= head+journalReplayWindow; {
 		key := r.keys.Journal(rev)
 		// Cheap presence probe first. A plain Get reads the primary and does
@@ -236,6 +308,18 @@ func (r *Repo) replayJournal() {
 		if derr != nil || rec.Parent != head {
 			break
 		}
+		// WORM hash chain: this record (and its predecessor bytes we just
+		// verified in the previous iteration) must be the bytes that were
+		// committed. A broken chain means a historical record was rewritten;
+		// publishing on top of a forged log would certify tampered history.
+		if prevBytes != nil && rec.PrevJournalSHA != "" {
+			sum := sha256.Sum256(prevBytes)
+			if hex.EncodeToString(sum[:]) != rec.PrevJournalSHA {
+				log.Printf("journal: replay paused at revision %d: hash chain broken (predecessor rewritten?)", rev)
+				break
+			}
+		}
+		prevBytes = b
 		if rec.Version == 2 {
 			if rec.First != rev || rec.Count == 0 {
 				break
