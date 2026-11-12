@@ -177,26 +177,14 @@ func (o *options) mirrorStore(name string) (store.Store, string, error) {
 	}
 	ms := make([]store.Store, 0, len(entries))
 	for _, e := range entries {
-		if e.Type == "s3" {
-			st, err := store.NewS3Store(store.S3Config{
-				Endpoint:  e.Endpoint,
-				AccessKey: e.Access,
-				SecretKey: e.Secret,
-				Bucket:    e.Bucket,
-				Region:    "us-east-1",
-				UseSSL:    e.SSL,
-			})
-			if err != nil {
-				return nil, "", err
-			}
-			ms = append(ms, st)
-		} else {
-			st, err := store.NewFileStore(e.Root)
-			if err != nil {
-				return nil, "", err
-			}
-			ms = append(ms, st)
+		// Always go through memberStore: it is the single place that resolves
+		// credential spellings, so a second inline construction here would
+		// silently drop keys again.
+		st, err := memberStore(e)
+		if err != nil {
+			return nil, "", err
 		}
+		ms = append(ms, st)
 	}
 	if len(ms) < 2 {
 		return nil, "", fmt.Errorf("--mirror-file requires at least 2 backends (got %d)", len(ms))
