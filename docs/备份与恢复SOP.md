@@ -262,11 +262,15 @@ svnadmin info ... myrepo | grep head   # 少于清单 head
 | WORM 哈希链 | 历史被改写（审计证据） | 尾部记录被删（靠 `repo_head` 单调性告警） |
 | **本文档 dump/load** | 误删、灾难、跨环境迁移、合规归档 | 分钟级 RPO（dump 是快照语义） |
 
-**大批量恢复时注意**：`load` 逐修订提交。真实 S3 上 batch=1 的 v1 仓库只有 0.6–0.9 rev/s，
-100 万修订要数周。恢复目标仓应建为 segment 格式（`svnadmin create --segments`），
-它把每批压成常数次往返（实测 200 修订 batch=50 达 33 rev/s，见《性能基线与回归.md》）。
-`load` 目前逐修订调用提交接口，尚未接入批量——这是恢复速度的已知上限。
+**大批量恢复**：`load` 已接入批量提交（默认每批 256 修订，`--batch N` 可调），
+一批只付一次 commit lease + WAL + HEAD CAS。真实 S3 上 1000 修订的恢复从 34.9 分钟
+（`--batch 1`）降到约 13 秒（默认），结果与逐条导入**字节一致**（详见
+《性能基线与回归.md》）。恢复目标仓建议建为 segment 格式（`svnadmin create --segments`），
+它在批内把修订数据压成一次对象写入，吞吐更高。
 
-RPO/RTO 参考（实测于两节点 mirror，104 万修订仓）：
-日备 RPO ≤ 24h；从 dump 恢复 100 万修订约 1 小时量级（含 verify）。
-需要更小 RPO 时用 geo 复制（`type=geo`）做热备，dump 仍作为**离线归档与最后手段**保留。
+RPO/RTO 参考（实测于两节点 mirror）：日备 RPO ≤ 24h。
+导入本身在批量提交下约每千修订 13 秒（真实 S3）；`verify --all-revs --texts`
+在 1000 修订的测试仓上约 70 ms。百万修订的 RTO 未在此环境实测，制定时应按目标数据量
+自行标定（对象数、文本体积、`--texts` 是否开启都会影响），不要把本节的千修订数字
+直接外推。需要更小 RPO 时用 geo 复制（`type=geo`）做热备，dump 仍作为**离线归档与
+最后手段**保留。

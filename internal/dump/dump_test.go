@@ -540,3 +540,64 @@ func TestDumpStreamsChunkedText(t *testing.T) {
 		t.Fatal("chunked text differs after dump/load")
 	}
 }
+
+// TestLoadBatchBoundariesMatchSequentialImport runs the round trip with a tiny
+// batch size so every revision lands on or across a batch boundary. Batching
+// must be invisible: the restored repository has to be byte-identical to a
+// sequential import, including revisions that modify what an earlier revision
+// in the same batch created (the dependency that made naive batching corrupt
+// data).
+func TestLoadBatchBoundariesMatchSequentialImport(t *testing.T) {
+	src := buildSourceRepo(t)
+	var buf bytes.Buffer
+	if err := Dump(src, &buf); err != nil {
+		t.Fatal(err)
+	}
+	for _, size := range []int{1, 2, 3, 64} {
+		prev := SetLoadBatchSize(size)
+		dst, err := fs.CreateRepo(store.NewMemoryStore(), "repos/bdst", 4096, 64)
+		if err != nil {
+			SetLoadBatchSize(prev)
+			t.Fatal(err)
+		}
+		if err := Load(dst, bytes.NewReader(buf.Bytes())); err != nil {
+			SetLoadBatchSize(prev)
+			t.Fatalf("batch %d: %v", size, err)
+		}
+		hw, _ := src.Head()
+		if h, _ := dst.Head(); h != hw {
+			SetLoadBatchSize(prev)
+			t.Fatalf("batch %d: head=%d want %d", size, h, hw)
+		}
+		assertSameTree(t, src, dst)
+		SetLoadBatchSize(prev)
+	}
+}
+
+// TestLoadBatchResumesAcrossBoundary interrupts an import mid-way (a --to cut
+// that lands inside a batch) and continues it, which is the恢复 path an operator
+// actually uses after a failed transfer.
+func TestLoadBatchResumesAcrossBoundary(t *testing.T) {
+	src := buildSourceRepo(t)
+	var buf bytes.Buffer
+	if err := Dump(src, &buf); err != nil {
+		t.Fatal(err)
+	}
+	prev := SetLoadBatchSize(2)
+	defer SetLoadBatchSize(prev)
+
+	dst, err := fs.CreateRepo(store.NewMemoryStore(), "repos/brdst", 4096, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := LoadRange(dst, bytes.NewReader(buf.Bytes()), 0, 2); err != nil {
+		t.Fatalf("first range: %v", err)
+	}
+	if h, _ := dst.Head(); h != 2 {
+		t.Fatalf("after --to 2 head=%d", h)
+	}
+	if err := LoadRange(dst, bytes.NewReader(buf.Bytes()), 3, 0); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	assertSameTree(t, src, dst)
+}
