@@ -143,23 +143,8 @@ func (r *Repo) writeCommitJournal(ctx context.Context, rev, parent uint64, lease
 		return nil
 	}
 	sum := sha256.Sum256(revBlock)
-	rec := &CommitRecord{
-		Version:     journalVersion,
-		Rev:         rev,
-		Parent:      parent,
-		Lease:       lease,
-		Created:     created,
-		RevBlockKey: revBlockKey,
-		RevBlockSHA: hex.EncodeToString(sum[:]),
-		PropsKey:    propsKey,
-		Author:      revProps["svn:author"],
-		Log:         revProps["svn:log"],
-		Quorum:      r.writeQuorum,
-	}
-	if propsBytes != nil {
-		psum := sha256.Sum256(propsBytes)
-		rec.PropsSHA = hex.EncodeToString(psum[:])
-	}
+	rec := r.newCommitRecord(rev, parent, lease, created, revBlockKey,
+		hex.EncodeToString(sum[:]), propsKey, propsBytes, revProps)
 	if prev := r.prevJournalSHA(ctx, rev); prev != "" {
 		rec.PrevJournalSHA = prev
 	}
@@ -169,6 +154,47 @@ func (r *Repo) writeCommitJournal(ctx context.Context, rev, parent uint64, lease
 	}
 	r.rememberJournal(rev, enc)
 	return nil
+}
+
+// newCommitRecord fills the WAL record for one revision. Shared by the single
+// commit path and the batch path so the two cannot drift; the caller adds the
+// chain link, which differs (store lookup vs in-memory predecessor).
+func (r *Repo) newCommitRecord(rev, parent uint64, lease string, created int64,
+	revBlockKey, revBlockSHA, propsKey string, propsBytes []byte, revProps map[string]string) *CommitRecord {
+	rec := &CommitRecord{
+		Version:     journalVersion,
+		Rev:         rev,
+		Parent:      parent,
+		Lease:       lease,
+		Created:     created,
+		RevBlockKey: revBlockKey,
+		RevBlockSHA: revBlockSHA,
+		PropsKey:    propsKey,
+		Author:      revProps["svn:author"],
+		Log:         revProps["svn:log"],
+		Quorum:      r.writeQuorum,
+	}
+	if propsBytes != nil {
+		psum := sha256.Sum256(propsBytes)
+		rec.PropsSHA = hex.EncodeToString(psum[:])
+	}
+	return rec
+}
+
+// encodeCommitRecord builds the WAL record for one plan of a batch and chains
+// it to prevBytes (the encoded predecessor, held in memory while the batch is
+// written). Keeping this next to writeCommitJournal means both paths derive the
+// record from the same constructor.
+func (r *Repo) encodeCommitRecord(p batchPlan, lease string, created int64, prevBytes []byte) ([]byte, error) {
+	sum := sha256.Sum256(p.rb)
+	rec := r.newCommitRecord(p.rev, p.rev-1, lease, created,
+		r.keys.LooseRev(r.shard(p.rev), p.rev), hex.EncodeToString(sum[:]),
+		r.keys.LooseRevProps(r.shard(p.rev), p.rev), p.rp, p.props)
+	if len(prevBytes) > 0 {
+		psum := sha256.Sum256(prevBytes)
+		rec.PrevJournalSHA = hex.EncodeToString(psum[:])
+	}
+	return EncodeCommitRecord(rec), nil
 }
 
 // rememberJournal caches the just-written record so the next commit chains

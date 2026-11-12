@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -574,32 +575,48 @@ func (r *Repo) CommitBatch(reqs []BatchCommit) ([]uint64, []error, error) {
 	return revs, errs, nil
 }
 
-// writeBatchJournals appends the WAL record for every plan concurrently.
+// writeBatchJournals appends one WAL record per revision in the batch.
+//
+// The records must be written in revision order and the hash chain threaded
+// through them in memory: prevJournalSHA falls back to a store read when the
+// single-slot record cache misses, and within a batch every revision's
+// predecessor is itself un-written while the batch is in flight. Writing them
+// concurrently therefore left every record after the first with an empty
+// PrevJournalSHA - the chain silently restarted once per batch, which
+// VerifyJournalChain cannot detect (an empty link is legal for legacy records).
+//
+// Serialising costs one round trip per record, which group commit is already
+// amortising: the batch shares one lease, one HEAD CAS, and the revision/segment
+// writes. Ordering is what makes the chain real.
 func (r *Repo) writeBatchJournals(ctx context.Context, plans []batchPlan, token string, created int64) error {
-	sem := make(chan struct{}, 16)
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var firstErr error
-	for _, p := range plans {
-		p := p
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			sh := r.shard(p.rev)
-			if err := r.writeCommitJournal(ctx, p.rev, p.rev-1, token, created, p.rb, p.rp,
-				r.keys.LooseRev(sh, p.rev), r.keys.LooseRevProps(sh, p.rev), p.props); err != nil {
-				mu.Lock()
-				if firstErr == nil {
-					firstErr = err
-				}
-				mu.Unlock()
-			}
-		}()
+	if !r.journal {
+		return nil
 	}
-	wg.Wait()
-	return firstErr
+	ordered := make([]batchPlan, len(plans))
+	copy(ordered, plans)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].rev < ordered[j].rev })
+
+	// Seed the chain from the record just below the batch, if this process has
+	// it cached; otherwise the first write does one store read.
+	var prevBytes []byte
+	first := ordered[0].rev
+	if cached := r.cachedJournal(first - 1); cached != nil {
+		prevBytes = cached
+	} else if b, err := r.store.Get(ctx, r.keys.Journal(first-1), nil); err == nil && len(b) > 0 {
+		prevBytes = b
+	}
+	for _, p := range ordered {
+		enc, err := r.encodeCommitRecord(p, token, created, prevBytes)
+		if err != nil {
+			return err
+		}
+		if err := r.store.Put(ctx, r.keys.Journal(p.rev), enc); err != nil {
+			return fmt.Errorf("journal: %w", err)
+		}
+		r.rememberJournal(p.rev, enc)
+		prevBytes = enc
+	}
+	return nil
 }
 
 // putBatchObjects writes every plan's revision block and properties with
