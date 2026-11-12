@@ -4,6 +4,7 @@ import (
 	"sync"
 	"testing"
 
+	"svngod/internal/cdc"
 	"svngod/internal/fs/store"
 )
 
@@ -105,4 +106,53 @@ func itoa(i int) string {
 		return string(rune('0' + i))
 	}
 	return string(rune('a' + i - 10))
+}
+
+// TestSegmentedBatchChainVerifies covers the version-2 record shape: group
+// commit writes ONE record per batch covering [First, First+Count), so the
+// revisions after it legitimately have no record of their own. VerifyJournalChain
+// used to report the first such revision as "chain gap at rev 2" and declare a
+// healthy segmented repository corrupt - every real v2 repository failed verify.
+func TestSegmentedBatchChainVerifies(t *testing.T) {
+	mems := []*store.MemoryStore{store.NewMemoryStore(), store.NewMemoryStore()}
+	ms := store.NewMirror([]store.Store{mems[0], mems[1]},
+		store.WithMutableOrder(CompareMutable), store.WithRepoPrefix("segc"))
+	r, err := CreateRepoSegments(ms, "segc", 4096, 64, cdc.DefaultParams(), false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two batches so the chain has an inter-batch link as well.
+	for round := 0; round < 2; round++ {
+		reqs := make([]BatchCommit, 0, 10)
+		for i := 0; i < 10; i++ {
+			reqs = append(reqs, BatchCommit{Changes: []Change{{
+				Path: "/s" + itoa(round*10+i), Action: ActionAdd, Kind: KindFile, Data: []byte("x"),
+			}}})
+		}
+		if _, errs, err := r.CommitBatch(reqs); err != nil {
+			t.Fatalf("round %d: %v", round, err)
+		} else {
+			for i := range errs {
+				if errs[i] != nil {
+					t.Fatalf("round %d req %d: %v", round, i, errs[i])
+				}
+			}
+		}
+	}
+	head, _ := r.HeadFresh()
+	if head != 20 {
+		t.Fatalf("head=%d, want 20", head)
+	}
+	if err := r.VerifyJournalChain(1, head); err != nil {
+		t.Fatalf("segmented repository must pass the chain check: %v", err)
+	}
+	// A batch record must still be tamper-evident: the second batch's record
+	// chains to the first batch's record, not to a per-revision record.
+	rec, err := r.JournalRecord(11)
+	if err != nil || rec == nil {
+		t.Fatalf("record for rev 11 (second batch first rev): %v", err)
+	}
+	if rec.PrevJournalSHA == "" {
+		t.Fatal("second batch record lost its chain link to the first batch")
+	}
 }

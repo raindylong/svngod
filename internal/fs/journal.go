@@ -246,6 +246,49 @@ func (r *Repo) prevJournalSHA(ctx context.Context, rev uint64) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// prevBatchJournalSHA returns the chain hash for a version-2 record that
+// starts at rev and spans count revisions.
+//
+// A v2 record covers [rev, rev+count), so its predecessor is NOT journal/rev-1
+// (that revision has no record of its own) but whichever record covers rev-1 -
+// typically the previous batch, which starts earlier and spans further. The
+// in-memory cache normally answers this: the previous batch was written by this
+// process moments ago under the same lease. Otherwise look back over the
+// maximum batch span and take the newest record that covers rev-1.
+func (r *Repo) prevBatchJournalSHA(ctx context.Context, rev uint64) string {
+	if rev <= 1 {
+		return ""
+	}
+	if b := r.cachedJournal(rev - 1); b != nil {
+		sum := sha256.Sum256(b)
+		return hex.EncodeToString(sum[:])
+	}
+	for back := uint64(1); back <= maxCommitBatch && back < rev; back++ {
+		cand := rev - back
+		b, err := r.store.Get(ctx, r.keys.Journal(cand), nil)
+		if err != nil || len(b) == 0 {
+			continue
+		}
+		rec, derr := DecodeCommitRecord(b)
+		if derr != nil {
+			return ""
+		}
+		last := rec.First + maxU64(rec.Count, 1) - 1
+		if last >= rev-1 && rec.First <= rev-1 {
+			sum := sha256.Sum256(b)
+			return hex.EncodeToString(sum[:])
+		}
+	}
+	return ""
+}
+
+func maxU64(a, b uint64) uint64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 // VerifyJournalChain walks journal records from..to and checks the hash
 // chain: each record's PrevJournalSHA (when set) must equal the SHA-256 of
 // the previous record's stored bytes. Returns the first break as an error
@@ -283,6 +326,20 @@ func (r *Repo) VerifyJournalChain(from, to uint64) error {
 			}
 		}
 		prev = b
+		// A version-2 record covers [First, First+Count): group commit writes one
+		// record per batch, so the revisions after it have no record of their own
+		// and must not be reported as a gap. Skipping the covered range is also
+		// what keeps the chain check meaningful for segmented repositories, where
+		// every batch is a single record.
+		if rec.Count > 1 {
+			end := rec.First + rec.Count - 1
+			if end > to {
+				end = to
+			}
+			if end > rev {
+				rev = end
+			}
+		}
 	}
 	return nil
 }

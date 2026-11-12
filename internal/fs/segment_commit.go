@@ -899,6 +899,14 @@ func (r *Repo) writeSegmentJournalBatch(ctx context.Context, first, count uint64
 		SegmentKey: groups[0].key, SegmentSHA: groups[0].sha,
 		Quorum: r.writeQuorum,
 	}
+	// Chain to the record covering the previous revision. A v2 record spans the
+	// whole batch, so its predecessor is journal/<first-1>, which is the first
+	// revision of the previous batch (or absent for the very first one). Without
+	// this link every batch started a fresh chain, leaving segmented
+	// repositories with no cross-batch tamper evidence at all.
+	if prev := r.prevBatchJournalSHA(ctx, first); prev != "" {
+		rec.PrevJournalSHA = prev
+	}
 	for _, g := range groups {
 		rec.Groups = append(rec.Groups, CommitGroup{
 			First: g.first, Count: g.count, SegmentKey: g.key, SegmentSHA: g.sha,
