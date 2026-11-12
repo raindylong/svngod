@@ -140,11 +140,33 @@ sha256sum /tmp/redo.dump   # 必须等于清单里的 sha256
 **纯 FileStore 没有 journal，链校验是 no-op**。因此演练用双目录 WAL mirror：
 
 ```bash
+# 双目录 WAL mirror（最快，约 5 秒）
 scripts/drill-restore.sh 200 8
+
+# 真实 S3 mirror（验收环境，40 修订约 2 分钟）
+DRILL_MIRROR_FILE=/etc/svngod/mirror.json scripts/drill-restore.sh 40 8
 ```
 
 脚本依次执行：建仓 → 提交 → `dump --verify` → sha256/字节数认证 → `load --expect-head`
-→ `verify --all-revs --texts` → 再 dump 比对 → 4 条负向控制。任一步失败即非零退出。
+→ UUID 一致性 → `verify --all-revs --texts` → 再 dump 比对 → 负向控制。任一步失败即非零退出。
+
+**两种模式的分工**：
+
+| | 本地目录 | `DRILL_MIRROR_FILE`（真实 S3） |
+|---|---|---|
+| 正向链路 | ✅ | ✅ 备份/恢复/校验/幂等全跑 |
+| 对象损坏负向控制 | ✅（直接改文件） | 跳过（并打印原因） |
+| 每次运行隔离 | 临时目录 | 独立 bucket 前缀 + 独立仓名 |
+
+负向控制依赖直接改写磁盘对象，因此只在本地模式下执行；**门禁逻辑在 svnadmin 里，
+与后端无关**，所以本地覆盖是有效的。脚本会显式打印跳过，不会静默通过。
+
+`--mirror-file` 同时接受 `access`/`secret` 与配置里的 `access-key`/`secret-key`，
+所以 `storage.mirrors` 段可以原样复制使用；S3 成员缺少凭据时会直接报
+`missing credentials`，而不是发出匿名请求后显示 Access Denied。
+
+**真实 S3 上的耗时预期**：种子提交约 0.5 rev/s（Put 往返 95–200 ms + WAL 放大，
+详见《性能基线与回归.md》），其余步骤很快。因此演练规模按分钟预算选，默认 40 修订。
 
 **负向控制是演练的核心**——只证明"好的能恢复"不够，还必须证明"坏的能被拦住"：
 
