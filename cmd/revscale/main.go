@@ -86,6 +86,9 @@ func main() {
 		// Same mirror/WAL/quorum code path as production. Without -mirror-file
 		// each -endpoints entry is a local directory (restore drill without an
 		// S3 dependency); with it, the spec decides the backends (local S3 lab).
+		// rp scopes repair/listing to this repository (MirrorStore.repoPrefix);
+		// it is NOT the object-key prefix. svnadmin passes exactly this value,
+		// so a repository created by svnadmin is visible here.
 		rp := strings.Trim(*prefix, "/") + "/" + *repoName
 		var ms []store.Store
 		if *mirrorF != "" {
@@ -99,7 +102,10 @@ func main() {
 				fmt.Fprintln(os.Stderr, "mirror-file:", err)
 				os.Exit(1)
 			}
-			ms, rp = m, spec.RepoPrefix(*repoName)
+			// Object keys live under the spec's bucket prefix; MirrorStore's
+			// repoPrefix must match what svnadmin uses for the same repository.
+			ms = m
+			rp = spec.RepoPrefix(*repoName)
 		} else {
 			for _, ep := range strings.Split(*endpoints, ",") {
 				root := strings.TrimSpace(ep)
