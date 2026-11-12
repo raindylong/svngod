@@ -30,6 +30,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 REVS=${1:-40}
+# One identity per run: a reused repository name would seed on top of a previous
+# run (head carries over) and the restored UUID could never match, making the
+# drill's verdict depend on history instead of on this run's backup.
+RUN_ID=$(date -u +%Y%m%dT%H%M%S)-$$
+REPO=drill-$RUN_ID
 WORKERS=${2:-4}
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/svngod-drill.XXXXXX")
 trap 'echo "artifacts: $WORK"' EXIT
@@ -52,37 +57,46 @@ SVNADMIN="$WORK/svnadmin"
 if [ -n "${DRILL_MIRROR_FILE:-}" ]; then
   step "seed a repository with $REVS revisions (external mirror: $DRILL_MIRROR_FILE)"
   [ -r "$DRILL_MIRROR_FILE" ] || fail "DRILL_MIRROR_FILE is not readable: $DRILL_MIRROR_FILE"
-  SRC_MIRROR=$DRILL_MIRROR_FILE
-  "$SVNADMIN" create --mirror-file "$SRC_MIRROR" app >/dev/null
+  # Keep the caller's spec untouched: copy it with this run's prefix so the seed
+  # starts empty and cannot accumulate across runs.
+  SRC_MIRROR="$WORK/src-ext.json"
+  python3 - "$DRILL_MIRROR_FILE" "$SRC_MIRROR" "drill-src-$RUN_ID" <<'PYEOF'
+import json, sys
+src, dst, prefix = sys.argv[1], sys.argv[2], sys.argv[3]
+spec = json.load(open(src))
+spec["prefix"] = prefix
+json.dump(spec, open(dst, "w"))
+PYEOF
+  "$SVNADMIN" create --mirror-file "$SRC_MIRROR" "$REPO" >/dev/null
 else
   step "seed a repository with $REVS revisions (two-node WAL mirror, quorum 2)"
   mkdir -p "$WORK/src1" "$WORK/src2"
   mirrorSpec "$WORK/src1" "$WORK/src2" "$WORK/src.json"
   SRC_MIRROR="$WORK/src.json"
-  "$SVNADMIN" create --mirror-file "$SRC_MIRROR" app >/dev/null
+  "$SVNADMIN" create --mirror-file "$SRC_MIRROR" "$REPO" >/dev/null
 fi
 # -mixed (adds/modifies/deletes/copies) needs a single writer: its generator
 # assumes sequential state, so concurrent deletes of the same path abort
 # commits. The drill wants a predictable seed, not throughput.
 if [ -n "${DRILL_MIRROR_FILE:-}" ]; then
   SEED_LOG=$("$WORK/revscale" -store mirrorfile \
-    -mirror-file "$DRILL_MIRROR_FILE" -repo app \
+    -mirror-file "$SRC_MIRROR" -repo "$REPO" \
     -target "$REVS" -workers 1 -mixed -progress 1m 2>&1)
 else
   SEED_LOG=$("$WORK/revscale" -store mirrorfile -endpoints "$WORK/src1,$WORK/src2" \
-    -repo app -target "$REVS" -workers 1 -mixed -progress 1m 2>&1)
+    -repo "$REPO" -target "$REVS" -workers 1 -mixed -progress 1m 2>&1)
 fi
 echo "$SEED_LOG" | tail -2
 if echo "$SEED_LOG" | grep -q ' ERR '; then
   fail "seeding aborted a commit (see log above)"
 fi
-HEAD_SEED=$("$SVNADMIN" info --mirror-file "$SRC_MIRROR" app | awk '/^head:/{print $2}')
+HEAD_SEED=$("$SVNADMIN" info --mirror-file "$SRC_MIRROR" "$REPO" | awk '/^head:/{print $2}')
 [ -n "${HEAD_SEED:-}" ] || fail "could not read seeded HEAD"
 [ "$HEAD_SEED" -ge "$REVS" ] || fail "seeded only $HEAD_SEED of $REVS revisions"
 echo "seeded head=$HEAD_SEED"
 
 step "backup: dump --verify (refuses to export corrupt history)"
-"$SVNADMIN" dump --mirror-file "$SRC_MIRROR" --verify --output "$WORK/app.dump" app \
+"$SVNADMIN" dump --mirror-file "$SRC_MIRROR" --verify --output "$WORK/app.dump" "$REPO" \
   2> "$WORK/dump.log"
 grep -v '^dump: repo=' "$WORK/dump.log" || true
 cat "$WORK/dump.log" | grep '^dump: repo=' || fail "dump produced no manifest"
@@ -102,15 +116,18 @@ step "no .partial file left at the trusted path"
 [ ! -f "$WORK/app.dump.partial" ] || fail "dump left a .partial file behind"
 
 step "restore into a fresh mirror, asserting the revision count"
+# Each run owns a unique prefix. A reused prefix would restore into the previous
+# run's repository: load then skips existing revisions by design and cannot
+# adopt the dump's UUID, so the re-dump comparison would fail for a reason that
+# has nothing to do with this run's backup.
+RUN_ID=$(date -u +%Y%m%dT%H%M%S)-$$
 if [ -n "${DRILL_MIRROR_FILE:-}" ]; then
-  # Restore into a different bucket prefix so the source copy is untouched and
-  # the seed cannot be mistaken for the restored repository.
   DST_MIRROR="$WORK/dst-ext.json"
-  python3 - "$DRILL_MIRROR_FILE" "$DST_MIRROR" <<'PYEOF'
+  python3 - "$DRILL_MIRROR_FILE" "$DST_MIRROR" "drill-restore-$RUN_ID" <<'PYEOF'
 import json, sys
-src, dst = sys.argv[1], sys.argv[2]
+src, dst, prefix = sys.argv[1], sys.argv[2], sys.argv[3]
 spec = json.load(open(src))
-spec["prefix"] = "drill-restore"
+spec["prefix"] = prefix
 json.dump(spec, open(dst, "w"))
 PYEOF
 else
@@ -119,15 +136,22 @@ else
   DST_MIRROR="$WORK/dst.json"
 fi
 "$SVNADMIN" load --mirror-file "$DST_MIRROR" --input "$WORK/app.dump" \
-  --expect-head "$HEAD_SEED" app 2>&1 | tail -2
+  --expect-head "$HEAD_SEED" "$REPO" 2>&1 | tail -2
+
+step "restored repository carries the source UUID"
+SRC_UUID=$("$SVNADMIN" info --mirror-file "$SRC_MIRROR" "$REPO" | awk '/^uuid:/{print $2}')
+DST_UUID=$("$SVNADMIN" info --mirror-file "$DST_MIRROR" "$REPO" | awk '/^uuid:/{print $2}')
+[ -n "$SRC_UUID" ] && [ -n "$DST_UUID" ] || fail "could not read uuids (src=$SRC_UUID dst=$DST_UUID)"
+[ "$SRC_UUID" = "$DST_UUID" ] || fail "restored uuid $DST_UUID != source $SRC_UUID"
+echo "uuid preserved: $SRC_UUID"
 
 step "restore assertions: tree, every text, WORM journal chain"
-"$SVNADMIN" verify --mirror-file "$DST_MIRROR" --all-revs --texts --workers "$WORKERS" app \
+"$SVNADMIN" verify --mirror-file "$DST_MIRROR" --all-revs --texts --workers "$WORKERS" "$REPO" \
   2>&1 | tail -3
-"$SVNADMIN" journal --mirror-file "$DST_MIRROR" -n 1 app | tail -1
+"$SVNADMIN" journal --mirror-file "$DST_MIRROR" -n 1 "$REPO" | tail -1
 
 step "fingerprint: an independent re-dump must reproduce the backup exactly"
-"$SVNADMIN" dump --mirror-file "$DST_MIRROR" --verify --output "$WORK/app2.dump" app \
+"$SVNADMIN" dump --mirror-file "$DST_MIRROR" --verify --output "$WORK/app2.dump" "$REPO" \
   2> "$WORK/dump2.log"
 RESTORED_SHA=$(shasum -a 256 "$WORK/app2.dump" | awk '{print $1}')
 [ "$RESTORED_SHA" = "$ACTUAL_SHA" ] || fail "re-dump differs from backup: $RESTORED_SHA != $ACTUAL_SHA"
