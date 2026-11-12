@@ -55,9 +55,14 @@ type CommitRecord struct {
 	RevBlockKey string        `json:"revblock"`
 	RevBlockSHA string        `json:"revblock_sha256"`
 	PropsKey    string        `json:"props"`
-	Author      string        `json:"author,omitempty"`
-	Log         string        `json:"log,omitempty"`
-	Quorum      int           `json:"quorum"`
+	// PropsSHA pins the initial revprops object of the revision (v1 records).
+	// Empty means a pre-2.6' record: presence at a quorum is checked only.
+	// Segment (v2) records do not set it - their props live inside the
+	// immutable segment covered by SegmentSHA.
+	PropsSHA string `json:"props_sha256,omitempty"`
+	Author   string `json:"author,omitempty"`
+	Log      string `json:"log,omitempty"`
+	Quorum   int    `json:"quorum"`
 }
 
 // CommitGroup is one shard's slice of a segmented commit batch.
@@ -122,9 +127,12 @@ func writeQuorumOf(s store.Store) int {
 
 // writeCommitJournal appends the commit record. In quorum mode the Put itself
 // fails unless the record reached the configured number of replicas, so a
-// commit is never acknowledged on a single copy.
+// commit is never acknowledged on a single copy. propsBytes is the initial
+// revprops object the commit wrote; its SHA is pinned in the record so replay
+// can reject a torn or foreign props write before publishing HEAD (empty for
+// segment commits, whose props are inside the segment).
 func (r *Repo) writeCommitJournal(ctx context.Context, rev, parent uint64, lease string, created int64,
-	revBlock []byte, revBlockKey, propsKey string, revProps map[string]string) error {
+	revBlock, propsBytes []byte, revBlockKey, propsKey string, revProps map[string]string) error {
 	if !r.journal {
 		return nil
 	}
@@ -141,6 +149,10 @@ func (r *Repo) writeCommitJournal(ctx context.Context, rev, parent uint64, lease
 		Author:      revProps["svn:author"],
 		Log:         revProps["svn:log"],
 		Quorum:      r.writeQuorum,
+	}
+	if propsBytes != nil {
+		psum := sha256.Sum256(propsBytes)
+		rec.PropsSHA = hex.EncodeToString(psum[:])
 	}
 	if err := r.store.Put(ctx, r.keys.Journal(rev), EncodeCommitRecord(rec)); err != nil {
 		return fmt.Errorf("journal: %w", err)
@@ -315,12 +327,27 @@ func (r *Repo) replayJournal() {
 		// The revision block and its property set were written together under
 		// one quorum; publishing without a quorum copy of the props would
 		// roll forward a revision whose log/author data is still missing on
-		// a majority (the read path would fail it after HEAD moved). Props
-		// are mutable after commit, so the record pins the block SHA only -
-		// presence at a quorum is the right invariant for them here.
+		// a majority (the read path would fail it after HEAD moved). Newer
+		// records pin the initial props SHA as well: replay must refuse a
+		// props object that is not the committed one (a torn write would
+		// otherwise publish a revision whose properties are corrupt). The
+		// revision is not yet published, so user revprop edits - which
+		// require rev <= head - cannot have legitimately replaced it.
 		if _, pCount, perr := read(rec.PropsKey); perr != nil || pCount < quorum {
 			log.Printf("journal: replay paused at revision %d: rev-props copies %d < quorum %d (err %v)", rev, pCount, quorum, perr)
 			break
+		}
+		if rec.PropsSHA != "" {
+			pb, _, pberr := read(rec.PropsKey)
+			if pberr != nil {
+				log.Printf("journal: replay paused at revision %d: rev-props unreadable (%v)", rev, pberr)
+				break
+			}
+			psum := sha256.Sum256(pb)
+			if hex.EncodeToString(psum[:]) != rec.PropsSHA {
+				log.Printf("journal: replay paused at revision %d: rev-props SHA mismatch (possible corruption)", rev)
+				break
+			}
 		}
 		cur, etag, cerr := r.readCurrent()
 		if cerr != nil || cur.Head != head {

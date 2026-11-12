@@ -596,3 +596,56 @@ func TestCommitPublishesWhenLeaseUnverifiedAfterWAL(t *testing.T) {
 		t.Fatalf("head=%d, want 1", h)
 	}
 }
+
+// TestJournalReplayStopsOnPropsSHAMismatch: the props object exists at a
+// quorum but its bytes are not the committed set (torn write). The pinned
+// PropsSHA must pause replay instead of publishing HEAD with corrupt
+// revision properties.
+func TestJournalReplayStopsOnPropsSHAMismatch(t *testing.T) {
+	a, b, c := store.NewMemoryStore(), store.NewMemoryStore(), store.NewMemoryStore()
+	ms := store.NewMirror([]store.Store{a, b, c}, store.WithWriteQuorum(2))
+	r, err := CreateRepo(ms, "ps", 4096, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.CommitTxn(0, []Change{{Path: "/a", Action: ActionAdd, Kind: KindFile, Data: []byte("1")}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := r.JournalRecord(1)
+	if err != nil || rec == nil {
+		t.Fatalf("journal record missing: %v", err)
+	}
+	if rec.PropsSHA == "" {
+		t.Fatal("new records must pin the initial props SHA")
+	}
+	ctx := context.Background()
+	cur, etag, err := r.readCurrent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ms.CAS(ctx, r.keys.Current(), etag, (&Current{Head: 0, Created: cur.Created}).Marshal()); err != nil {
+		t.Fatal(err)
+	}
+	// Overwrite the props object with foreign bytes on every replica: the
+	// object is present at full quorum but is not the committed set.
+	for _, s := range []store.Store{a, b, c} {
+		if err := s.Put(ctx, rec.PropsKey, []byte("torn-write")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		r.reconcileJournal(true)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("replayJournal did not return on props SHA mismatch")
+	}
+	if hc, _, err := r.readCurrent(); err != nil || hc.Head != 0 {
+		t.Fatalf("head=%v after props SHA mismatch (err %v), want 0: must not publish corrupt properties", hc.Head, err)
+	}
+	// Replay stays paused until an operator repairs the props object.
+}

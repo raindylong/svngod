@@ -1317,7 +1317,7 @@ func (r *Repo) commitTxn(baseRev uint64, changes []Change, revProps map[string]s
 	if err := lease.Verify(ctx, r.store); err != nil {
 		return 0, err
 	}
-	if err := r.writeCommitJournal(ctx, N, cur.Head, lease.token, nc.Created, rbBytes,
+	if err := r.writeCommitJournal(ctx, N, cur.Head, lease.token, nc.Created, rbBytes, rpBytes,
 		r.keys.LooseRev(sh, N), r.keys.LooseRevProps(sh, N), revProps); err != nil {
 		return 0, err
 	}

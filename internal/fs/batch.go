@@ -588,7 +588,7 @@ func (r *Repo) writeBatchJournals(ctx context.Context, plans []batchPlan, token 
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			sh := r.shard(p.rev)
-			if err := r.writeCommitJournal(ctx, p.rev, p.rev-1, token, created, p.rb,
+			if err := r.writeCommitJournal(ctx, p.rev, p.rev-1, token, created, p.rb, p.rp,
 				r.keys.LooseRev(sh, p.rev), r.keys.LooseRevProps(sh, p.rev), p.props); err != nil {
 				mu.Lock()
 				if firstErr == nil {
