@@ -262,6 +262,11 @@ svnadmin info ... myrepo | grep head   # 少于清单 head
 | WORM 哈希链 | 历史被改写（审计证据） | 尾部记录被删（靠 `repo_head` 单调性告警） |
 | **本文档 dump/load** | 误删、灾难、跨环境迁移、合规归档 | 分钟级 RPO（dump 是快照语义） |
 
+**大批量恢复时注意**：`load` 逐修订提交。真实 S3 上 batch=1 的 v1 仓库只有 0.6–0.9 rev/s，
+100 万修订要数周。恢复目标仓应建为 segment 格式（`svnadmin create --segments`），
+它把每批压成常数次往返（实测 200 修订 batch=50 达 33 rev/s，见《性能基线与回归.md》）。
+`load` 目前逐修订调用提交接口，尚未接入批量——这是恢复速度的已知上限。
+
 RPO/RTO 参考（实测于两节点 mirror，104 万修订仓）：
 日备 RPO ≤ 24h；从 dump 恢复 100 万修订约 1 小时量级（含 verify）。
 需要更小 RPO 时用 geo 复制（`type=geo`）做热备，dump 仍作为**离线归档与最后手段**保留。

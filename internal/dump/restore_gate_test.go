@@ -222,3 +222,72 @@ func TestDumpRefusesCorruptHead(t *testing.T) {
 		t.Fatalf("refused dump still produced %s", out)
 	}
 }
+
+// TestDumpVerifyAcceptsGroupCommittedSegments covers the interaction that made
+// backups of segmented repositories impossible to take: group commit writes one
+// WAL record per batch, and the chain verifier used to read the revisions after
+// it as a gap. dump --verify therefore refused a perfectly healthy repository -
+// a backup gate that blocks all backups is as bad as no gate.
+func TestDumpVerifyAcceptsGroupCommittedSegments(t *testing.T) {
+	dir := t.TempDir()
+	mirror := filepath.Join(dir, "m.json")
+	rootA, rootB := filepath.Join(dir, "ga"), filepath.Join(dir, "gb")
+	for _, r := range []string{rootA, rootB} {
+		if err := os.MkdirAll(r, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	spec := `{"quorum":2,"prefix":"repos","mirrors":[{"type":"file","root":"` +
+		rootA + `"},{"type":"file","root":"` + rootB + `"}]}`
+	if err := os.WriteFile(mirror, []byte(spec), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := runSvnadmin(t, "create", "--segments", "--mirror-file", mirror, "g"); err != nil {
+		t.Fatalf("create: %v\n%s", err, out)
+	}
+
+	ms := make([]store.Store, 0, 2)
+	for _, r := range []string{rootA, rootB} {
+		st, err := store.NewFileStore(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ms = append(ms, st)
+	}
+	m := store.NewMirror(ms,
+		store.WithMutableOrder(fs.CompareMutable),
+		store.WithRepoPrefix("repos/g"),
+		store.WithWriteQuorum(2))
+	repo, err := fs.OpenRepo(m, "repos/g")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two batches: exercises both the intra-batch coverage and the link between
+	// one batch's record and the previous batch's record.
+	for round := 0; round < 2; round++ {
+		reqs := make([]fs.BatchCommit, 0, 8)
+		for i := 0; i < 8; i++ {
+			reqs = append(reqs, fs.BatchCommit{Changes: []fs.Change{{
+				Path: "/g" + string(rune('a'+round*8+i)), Action: fs.ActionAdd,
+				Kind: fs.KindFile, Data: []byte("payload"),
+			}}})
+		}
+		if _, errs, err := repo.CommitBatch(reqs); err != nil {
+			t.Fatalf("batch %d: %v", round, err)
+		} else {
+			for i := range errs {
+				if errs[i] != nil {
+					t.Fatalf("batch %d req %d: %v", round, i, errs[i])
+				}
+			}
+		}
+	}
+	out := filepath.Join(dir, "g.dump")
+	msg, err := runSvnadmin(t, "dump", "--mirror-file", mirror, "--verify", "--output", out, "g")
+	if err != nil {
+		t.Fatalf("dump --verify rejected a group-committed segmented repo: %v\n%s", err, msg)
+	}
+	if !strings.Contains(msg, "head=16") {
+		t.Fatalf("manifest head wrong: %s", msg)
+	}
+}
