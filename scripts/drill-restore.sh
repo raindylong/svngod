@@ -133,51 +133,60 @@ RESTORED_SHA=$(shasum -a 256 "$WORK/app2.dump" | awk '{print $1}')
 [ "$RESTORED_SHA" = "$ACTUAL_SHA" ] || fail "re-dump differs from backup: $RESTORED_SHA != $ACTUAL_SHA"
 echo "re-dump identical: $RESTORED_SHA"
 
-step "negative control: a damaged WAL record must block the backup"
-cp -a "$WORK/src1" "$WORK/badchain1"
-cp -a "$WORK/src2" "$WORK/badchain2"
-mirrorSpec "$WORK/badchain1" "$WORK/badchain2" "$WORK/bad.json"
-REC=$(printf '%s/badchain1/repos/app/journal/%012d' "$WORK" 2)
-[ -f "$REC" ] || fail "expected journal record at $REC"
-printf 'journal tampering test\n' > "$REC"
-if "$SVNADMIN" dump --mirror-file "$WORK/bad.json" --verify --output "$WORK/bad.dump" app \
-      2> "$WORK/bad.log"; then
-  fail "dump --verify accepted a damaged journal record"
-fi
-[ ! -f "$WORK/bad.dump" ] || fail "a refused dump still produced a file"
-echo "damaged WAL refused: $(grep -v '^dump: repo=' "$WORK/bad.log" | tail -1)"
+# The three controls below corrupt objects on disk, so they only apply when
+# the positive chain used local directories. The gates themselves live in
+# svnadmin, not in a backend, so local coverage is representative - but say
+# so out loud instead of passing quietly.
+if [ -n "${DRILL_MIRROR_FILE:-}" ]; then
+  step "object-corruption negative controls: skipped (external mirror in use)"
+  echo "  rerun without DRILL_MIRROR_FILE to exercise them on local directories"
+else
+  step "negative control: a damaged WAL record must block the backup"
+  cp -a "$WORK/src1" "$WORK/badchain1"
+  cp -a "$WORK/src2" "$WORK/badchain2"
+  mirrorSpec "$WORK/badchain1" "$WORK/badchain2" "$WORK/bad.json"
+  REC=$(printf '%s/badchain1/repos/app/journal/%012d' "$WORK" 2)
+  [ -f "$REC" ] || fail "expected journal record at $REC"
+  printf 'journal tampering test\n' > "$REC"
+  if "$SVNADMIN" dump --mirror-file "$WORK/bad.json" --verify --output "$WORK/bad.dump" app \
+        2> "$WORK/bad.log"; then
+    fail "dump --verify accepted a damaged journal record"
+  fi
+  [ ! -f "$WORK/bad.dump" ] || fail "a refused dump still produced a file"
+  echo "damaged WAL refused: $(grep -v '^dump: repo=' "$WORK/bad.log" | tail -1)"
 
-step "negative control: a missing WAL record must be detected as a chain gap"
-cp -a "$WORK/src1" "$WORK/gap1"
-cp -a "$WORK/src2" "$WORK/gap2"
-mirrorSpec "$WORK/gap1" "$WORK/gap2" "$WORK/gap.json"
-# Move the record out of the tree instead of deleting it: the drill only needs
-  # the journal hole, and keeping the file makes the artifact inspectable.
-  mv "$(printf '%s/repos/app/journal/%012d' "$WORK/gap1" 2)" "$WORK/gap1-removed-journal-2"
-  mv "$(printf '%s/repos/app/journal/%012d' "$WORK/gap2" 2)" "$WORK/gap2-removed-journal-2"
-if "$SVNADMIN" dump --mirror-file "$WORK/gap.json" --verify --output "$WORK/gap.dump" app \
-      2> "$WORK/gap.log"; then
-  fail "dump --verify accepted a journal with a hole in it"
-fi
-[ ! -f "$WORK/gap.dump" ] || fail "a refused dump still produced a file"
-grep -qi 'gap\|chain' "$WORK/gap.log" \
-  || { cat "$WORK/gap.log"; fail "refusal did not name the chain gap"; }
-echo "chain gap refused: $(grep -v '^dump: repo=' "$WORK/gap.log" | tail -1)"
+  step "negative control: a missing WAL record must be detected as a chain gap"
+  cp -a "$WORK/src1" "$WORK/gap1"
+  cp -a "$WORK/src2" "$WORK/gap2"
+  mirrorSpec "$WORK/gap1" "$WORK/gap2" "$WORK/gap.json"
+  # Move the record out of the tree instead of deleting it: the drill only needs
+    # the journal hole, and keeping the file makes the artifact inspectable.
+    mv "$(printf '%s/repos/app/journal/%012d' "$WORK/gap1" 2)" "$WORK/gap1-removed-journal-2"
+    mv "$(printf '%s/repos/app/journal/%012d' "$WORK/gap2" 2)" "$WORK/gap2-removed-journal-2"
+  if "$SVNADMIN" dump --mirror-file "$WORK/gap.json" --verify --output "$WORK/gap.dump" app \
+        2> "$WORK/gap.log"; then
+    fail "dump --verify accepted a journal with a hole in it"
+  fi
+  [ ! -f "$WORK/gap.dump" ] || fail "a refused dump still produced a file"
+  grep -qi 'gap\|chain' "$WORK/gap.log" \
+    || { cat "$WORK/gap.log"; fail "refusal did not name the chain gap"; }
+  echo "chain gap refused: $(grep -v '^dump: repo=' "$WORK/gap.log" | tail -1)"
 
-step "negative control: a corrupted HEAD rev-block must block the backup"
-cp -a "$WORK/src1" "$WORK/badhead1"
-cp -a "$WORK/src2" "$WORK/badhead2"
-mirrorSpec "$WORK/badhead1" "$WORK/badhead2" "$WORK/badhead.json"
-BLOCK=$(find "$WORK/badhead1" "$WORK/badhead2" -path '*revs*' -type f -name "$(printf '%012d' "$HEAD_SEED")" | head -1)
-[ -n "$BLOCK" ] || BLOCK=$(find "$WORK/badhead1" "$WORK/badhead2" -type f -name '*.pack' | head -1)
-[ -n "$BLOCK" ] || fail "could not locate the rev-block for HEAD $HEAD_SEED"
-printf 'corrupted' > "$BLOCK"
-if "$SVNADMIN" dump --mirror-file "$WORK/badhead.json" --verify \
-      --output "$WORK/bad2.dump" app 2> "$WORK/bad2.log"; then
-  fail "dump --verify accepted a corrupted HEAD"
+  step "negative control: a corrupted HEAD rev-block must block the backup"
+  cp -a "$WORK/src1" "$WORK/badhead1"
+  cp -a "$WORK/src2" "$WORK/badhead2"
+  mirrorSpec "$WORK/badhead1" "$WORK/badhead2" "$WORK/badhead.json"
+  BLOCK=$(find "$WORK/badhead1" "$WORK/badhead2" -path '*revs*' -type f -name "$(printf '%012d' "$HEAD_SEED")" | head -1)
+  [ -n "$BLOCK" ] || BLOCK=$(find "$WORK/badhead1" "$WORK/badhead2" -type f -name '*.pack' | head -1)
+  [ -n "$BLOCK" ] || fail "could not locate the rev-block for HEAD $HEAD_SEED"
+  printf 'corrupted' > "$BLOCK"
+  if "$SVNADMIN" dump --mirror-file "$WORK/badhead.json" --verify \
+        --output "$WORK/bad2.dump" app 2> "$WORK/bad2.log"; then
+    fail "dump --verify accepted a corrupted HEAD"
+  fi
+  [ ! -f "$WORK/bad2.dump" ] || fail "a refused dump still produced a file"
+  echo "HEAD corruption refused: $(grep -v '^dump: repo=' "$WORK/bad2.log" | tail -1)"
 fi
-[ ! -f "$WORK/bad2.dump" ] || fail "a refused dump still produced a file"
-echo "HEAD corruption refused: $(grep -v '^dump: repo=' "$WORK/bad2.log" | tail -1)"
 
 step "negative control: load --expect-head rejects a wrong revision count"
 mkdir -p "$WORK/wrong1" "$WORK/wrong2"
