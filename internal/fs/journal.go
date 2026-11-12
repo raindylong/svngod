@@ -183,11 +183,22 @@ func (r *Repo) rememberJournal(rev uint64, enc []byte) {
 	r.lastJournalMu.Unlock()
 }
 
+// cachedJournal returns the cached encoded bytes for journal/<rev>, or nil.
+func (r *Repo) cachedJournal(rev uint64) []byte {
+	r.lastJournalMu.Lock()
+	defer r.lastJournalMu.Unlock()
+	if r.lastJournalCached && r.lastJournalRev == rev {
+		return r.lastJournalBytes
+	}
+	return nil
+}
+
 // prevJournalSHA returns the SHA-256 of journal/<rev-1> as stored, or "" when
 // rev is the first record (or the predecessor is absent/unreadable, which
 // starts a fresh chain rather than failing the commit - the chain is verified
 // as a whole by VerifyJournalChain, not per write). The most recent write is
 // usually still cached: commits are consecutive revisions under the lease.
+
 func (r *Repo) prevJournalSHA(ctx context.Context, rev uint64) string {
 	if rev == 0 {
 		return ""
@@ -312,7 +323,9 @@ func (r *Repo) replayJournal() {
 	// batch's WAL append still rolls the whole batch forward.
 	var prevBytes []byte // journal/<head> bytes for the chain check
 	if head > 0 {
-		if pb, perr := r.store.Get(ctx, r.keys.Journal(head), nil); perr == nil {
+		if pb := r.cachedJournal(head); pb != nil {
+			prevBytes = pb
+		} else if pb, perr := r.store.Get(ctx, r.keys.Journal(head), nil); perr == nil {
 			prevBytes = pb
 		}
 	}
