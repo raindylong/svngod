@@ -66,6 +66,10 @@ func s3Store(ep string) store.Store {
 func main() {
 	flag.Parse()
 	var st store.Store
+	// rp is the repository prefix handed to OpenRepo: <spec prefix>/<repo>.
+	// Declared once here; a later shadowing declaration silently discarded the
+	// -mirror-file prefix and made every external-mirror seed fail to open.
+	rp := strings.Trim(*prefix, "/") + "/" + *repoName
 	switch *storeMode {
 	case "mirror":
 		eps := strings.Split(*endpoints, ",")
@@ -77,19 +81,14 @@ func main() {
 		for _, ep := range eps {
 			ms = append(ms, s3Store(strings.TrimSpace(ep)))
 		}
-		rp := strings.Trim(*prefix, "/") + "/" + *repoName
 		st = store.NewMirror(ms, store.WithMutableOrder(fs.CompareMutable),
-			store.WithRepoPrefix(rp), store.WithLazyRepair())
+			store.WithRepoPrefix(strings.Trim(*prefix, "/")+"/"+*repoName), store.WithLazyRepair())
 	case "s3":
 		st = s3Store(strings.Split(*endpoints, ",")[0])
 	case "mirrorfile":
 		// Same mirror/WAL/quorum code path as production. Without -mirror-file
 		// each -endpoints entry is a local directory (restore drill without an
 		// S3 dependency); with it, the spec decides the backends (local S3 lab).
-		// rp scopes repair/listing to this repository (MirrorStore.repoPrefix);
-		// it is NOT the object-key prefix. svnadmin passes exactly this value,
-		// so a repository created by svnadmin is visible here.
-		rp := strings.Trim(*prefix, "/") + "/" + *repoName
 		var ms []store.Store
 		if *mirrorF != "" {
 			spec, err := mirrorspec.Parse(*mirrorF)
@@ -132,7 +131,6 @@ func main() {
 		fmt.Fprintln(os.Stderr, "unknown -store")
 		os.Exit(2)
 	}
-	rp := strings.Trim(*prefix, "/") + "/" + *repoName
 	if *rawBench > 0 {
 		ctx := context.Background()
 		data := make([]byte, 1024)
