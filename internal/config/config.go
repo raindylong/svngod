@@ -46,9 +46,11 @@ type Config struct {
 	MaxUploads     int  `json:"max-uploads"`
 	MaxUserUploads int  `json:"max-user-uploads"`
 	DisableMetrics bool `json:"disable-metrics"`
+	// ScrubInterval enables the background integrity Verifier at this period
+	// (0 disables it). Default when unset: 10m.
+	ScrubInterval jsonDuration `json:"scrub-interval"`
 
 	// AdminAddr enables the management API on a separate listener (empty =
-	// disabled). AdminToken may also come from SVNGOD_ADMIN_TOKEN or
 	// AdminTokenFile; it is redacted from API responses.
 	AdminAddr      string `json:"admin-addr,omitempty"`
 	AdminToken     string `json:"admin-token,omitempty"`
@@ -57,6 +59,34 @@ type Config struct {
 
 	Repos []Repo `json:"repos"`
 }
+
+// jsonDuration accepts either a duration string ("10m", "1h30m") or a whole
+// number of seconds in JSON.
+type jsonDuration time.Duration
+
+func (d *jsonDuration) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		v, err := time.ParseDuration(s)
+		if err != nil {
+			return err
+		}
+		*d = jsonDuration(v)
+		return nil
+	}
+	var n float64
+	if err := json.Unmarshal(b, &n); err != nil {
+		return err
+	}
+	*d = jsonDuration(time.Duration(n * float64(time.Second)))
+	return nil
+}
+
+func (d jsonDuration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(time.Duration(d).String())
+}
+
+func (d jsonDuration) Std() time.Duration { return time.Duration(d) }
 
 // Repo is one repository entry.
 type Repo struct {

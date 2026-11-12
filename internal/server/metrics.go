@@ -47,6 +47,11 @@ type metrics struct {
 	commitErrorsMu sync.Mutex
 	commitErrors   map[string]uint64
 
+	// scrubIssues counts integrity corruptions found by the background
+	// Verifier per repository.
+	scrubIssuesMu sync.Mutex
+	scrubIssues   map[string]uint64
+
 	limit int
 }
 
@@ -55,7 +60,8 @@ var commitLatencyBuckets = [...]float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30}
 
 func newMetrics(limit int) *metrics {
 	return &metrics{reqs: map[string]uint64{}, limit: limit,
-		commitErrors: map[string]uint64{}, repoRecovered: map[string]uint64{}}
+		commitErrors: map[string]uint64{}, repoRecovered: map[string]uint64{},
+		scrubIssues: map[string]uint64{}}
 }
 
 // observeCommit records one commit attempt's latency and outcome.
@@ -269,6 +275,24 @@ func (s *Server) serveMetrics(w http.ResponseWriter) {
 			fmt.Fprintf(&b, "svngod_repo_recovered_total{repo=%q} %d\n", escapeLabel(name), rec[name])
 		}
 	}
+	m.scrubIssuesMu.Lock()
+	scr := make(map[string]uint64, len(m.scrubIssues))
+	for k, v := range m.scrubIssues {
+		scr[k] = v
+	}
+	m.scrubIssuesMu.Unlock()
+	if len(scr) > 0 {
+		scrNames := make([]string, 0, len(scr))
+		for k := range scr {
+			scrNames = append(scrNames, k)
+		}
+		sort.Strings(scrNames)
+		b.WriteString("# HELP svngod_scrub_corruptions_total Integrity issues found by the background Verifier.\n")
+		b.WriteString("# TYPE svngod_scrub_corruptions_total counter\n")
+		for _, name := range scrNames {
+			fmt.Fprintf(&b, "svngod_scrub_corruptions_total{repo=%q} %d\n", escapeLabel(name), scr[name])
+		}
+	}
 	b.WriteString("# HELP svngod_repo_head HEAD of each repository this process has open.\n")
 	b.WriteString("# TYPE svngod_repo_head gauge\n")
 	for _, name := range names {
@@ -358,6 +382,13 @@ func (m *metrics) noteRepoRecovered(name string) {
 	m.repoRecoveredMu.Lock()
 	m.repoRecovered[name]++
 	m.repoRecoveredMu.Unlock()
+}
+
+// scrubIssues counts integrity issues the background scrub found for a repo.
+func (m *metrics) scrubIssuesAdd(name string, n int) {
+	m.scrubIssuesMu.Lock()
+	m.scrubIssues[name] += uint64(n)
+	m.scrubIssuesMu.Unlock()
 }
 
 // repoRecoveredSnapshot copies the recovery counters.

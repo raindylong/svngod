@@ -258,6 +258,8 @@ type Server struct {
 	upMu         sync.Mutex
 	userUploads  map[string]int
 	m            *metrics
+	scrubMu      sync.Mutex
+	scrub        scrubState // background Verifier watermark per repo
 }
 
 // New builds a Server.
@@ -273,6 +275,7 @@ func New(cfg Config) *Server {
 		repoCache:   map[string]*fs.Repo{},
 		userUploads: map[string]int{},
 		m:           newMetrics(cfg.MaxConcurrentUploads),
+		scrub:       scrubState{verified: map[string]uint64{}},
 		txnCleanup:  make(chan txnCleanupItem, 1024),
 	}
 	go s.txnCleanupLoop()

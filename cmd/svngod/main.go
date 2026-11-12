@@ -76,6 +76,7 @@ type options struct {
 	maxUserUploads int
 	metrics        bool
 	strictStart    bool
+	scrubInterval  time.Duration
 }
 
 func (o *options) makeStore() (store.Store, error) {
@@ -136,6 +137,7 @@ func main() {
 	fl.StringVar(&o.adminAllowCIDR, "admin-allow-cidr", "", "comma-separated CIDRs allowed to call the management API (default loopback)")
 	fl.IntVar(&o.maxUserUploads, "max-user-uploads", 4, "maximum concurrent uploads per user (0 = unlimited)")
 	fl.BoolVar(&o.metrics, "metrics", true, "expose Prometheus metrics at /_metrics")
+	fl.DurationVar(&o.scrubInterval, "scrub-interval", 10*time.Minute, "background integrity-check interval (0 = disabled)")
 	fl.StringVar(&o.basePath, "base-path", "/svn", "URL prefix for repositories")
 	fl.StringVar(&o.repoRoot, "repo-root", "./repos", "local directory holding repositories")
 	fl.StringVar(&o.passwd, "passwd", "", "local password file (plain/{SHA}/{CRYPT})")
@@ -242,6 +244,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go srv.RunMaintenance(ctx, 10*time.Minute)
+	if o.scrubInterval > 0 {
+		go srv.RunScrub(ctx, o.scrubInterval)
+	}
 	hs := newHTTPServer(o.addr, srv.Handler())
 	if o.tlsCert != "" && o.tlsKey != "" {
 		log.Printf("serving HTTPS (cert %s)", o.tlsCert)
@@ -403,6 +408,11 @@ func runMultiRepo(configPath string, commitBatch, commitWindowMs int, adminAddr,
 	// The session reaper used to run only in single-repository mode; without it
 	// a long-lived multi-repository process never reaped abandoned commits.
 	go srv.RunMaintenance(ctx, 10*time.Minute)
+	if cfg.ScrubInterval.Std() > 0 {
+		go srv.RunScrub(ctx, cfg.ScrubInterval.Std())
+	} else {
+		go srv.RunScrub(ctx, 10*time.Minute)
+	}
 	hs := newHTTPServer(addr, srv.Handler())
 	if cfg.TLSCert != "" && cfg.TLSKey != "" {
 		log.Printf("serving HTTPS (cert %s)", cfg.TLSCert)

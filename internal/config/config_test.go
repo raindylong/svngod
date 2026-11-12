@@ -1,10 +1,12 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestResolveSecret(t *testing.T) {
@@ -44,4 +46,27 @@ func TestResolveSecret(t *testing.T) {
 			t.Fatal("want error for missing secret-key-file")
 		}
 	})
+}
+
+func TestScrubIntervalParsing(t *testing.T) {
+	var c Config
+	if err := json.Unmarshal([]byte(`{"scrub-interval": "10m"}`), &c); err != nil {
+		t.Fatal(err)
+	}
+	if c.ScrubInterval.Std() != 10*time.Minute {
+		t.Fatalf("got %v", c.ScrubInterval.Std())
+	}
+	if err := json.Unmarshal([]byte(`{"scrub-interval": 3600}`), &c); err != nil {
+		t.Fatal(err)
+	}
+	if c.ScrubInterval.Std() != time.Hour {
+		t.Fatalf("got %v", c.ScrubInterval.Std())
+	}
+	c = Config{}
+	if err := json.Unmarshal([]byte(`{}`), &c); err != nil {
+		t.Fatal(err)
+	}
+	if c.ScrubInterval.Std() != 0 {
+		t.Fatalf("unset should be 0, got %v", c.ScrubInterval.Std())
+	}
 }
