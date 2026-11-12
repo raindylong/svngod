@@ -81,12 +81,15 @@ fi
 if [ -n "${DRILL_MIRROR_FILE:-}" ]; then
   SEED_LOG=$("$WORK/revscale" -store mirrorfile \
     -mirror-file "$SRC_MIRROR" -repo "$REPO" \
-    -target "$REVS" -workers 1 -mixed -progress 1m 2>&1)
+    -target "$REVS" -workers 1 -mixed -progress 1m 2>&1) || SEED_RC=$?
 else
   SEED_LOG=$("$WORK/revscale" -store mirrorfile -endpoints "$WORK/src1,$WORK/src2" \
-    -repo "$REPO" -target "$REVS" -workers 1 -mixed -progress 1m 2>&1)
+    -repo "$REPO" -target "$REVS" -workers 1 -mixed -progress 1m 2>&1) || SEED_RC=$?
 fi
-echo "$SEED_LOG" | tail -2
+echo "$SEED_LOG" | tail -3
+if [ "${SEED_RC:-0}" -ne 0 ]; then
+  fail "seeding failed (rc=$SEED_RC, see output above)"
+fi
 if echo "$SEED_LOG" | grep -q ' ERR '; then
   fail "seeding aborted a commit (see log above)"
 fi
