@@ -167,6 +167,7 @@ func main() {
 		go func() {
 			defer wg.Done()
 			rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+			owned := &ownedPaths{}
 			for {
 				select {
 				case <-stop:
@@ -189,7 +190,7 @@ func main() {
 				for j := 0; j < cnt; j++ {
 					idx := *idxBase + start + int64(j)
 					reqs = append(reqs, fs.BatchCommit{
-						Changes: changeFor(idx, rng, *mixed),
+						Changes: changeFor(idx, rng, *mixed, owned),
 						RevProps: map[string]string{
 							"svn:author": authors[idx%int64(len(authors))],
 							"svn:date":   time.Now().UTC().Format("2006-01-02T15:04:05.000000Z"),
@@ -224,6 +225,7 @@ func main() {
 			go func(w int) {
 				defer wg.Done()
 				rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(w)))
+				owned := &ownedPaths{}
 				for {
 					select {
 					case <-stop:
@@ -235,7 +237,7 @@ func main() {
 						return
 					}
 					idx := first + n
-					ch := changeFor(idx, rng, *mixed)
+					ch := changeFor(idx, rng, *mixed, owned)
 					props := map[string]string{
 						"svn:author": authors[idx%int64(len(authors))],
 						"svn:date":   time.Now().UTC().Format("2006-01-02T15:04:05.000000Z"),
@@ -290,24 +292,62 @@ func main() {
 
 // changeFor builds the change set for revision index idx. Adds land on a
 // digit-sharded path; mixed mode rewrites or deletes an earlier path instead.
-func changeFor(idx int64, rng *rand.Rand, mixed bool) []fs.Change {
+// changeFor builds the change for one revision. With mixed set it also emits
+// deletes and modifies, but only against paths this generator itself created
+// and has not already deleted: a stateless "delete some earlier path" guess
+// aborts commits on repositories where that path is already gone, which made
+// the mixed mode unusable as a long-running seed.
+func changeFor(idx int64, rng *rand.Rand, mixed bool, owned *ownedPaths) []fs.Change {
 	if mixed && rng.Intn(100) < 5 {
-		// Delete an earlier file (never revision 0) and turn its parent leaf
-		// into a property change sometimes, so deletes, props and mods share
-		// the same commit stream.
-		prev := idx / 10 * 9
-		path, _ := pathFor(prev)
-		return []fs.Change{{Path: path, Action: fs.ActionDelete, Kind: fs.KindFile}}
+		if path, ok := owned.take(rng); ok {
+			return []fs.Change{{Path: path, Action: fs.ActionDelete, Kind: fs.KindFile}}
+		}
 	}
 	if mixed && rng.Intn(100) < 10 {
-		prev := idx / 10 * 8
-		path, _ := pathFor(prev)
-		return []fs.Change{{Path: path, Action: fs.ActionModify, Kind: fs.KindFile,
-			Data: []byte(fmt.Sprintf("modified by %d\n", idx))}}
+		if path, ok := owned.pick(rng); ok {
+			return []fs.Change{{Path: path, Action: fs.ActionModify, Kind: fs.KindFile,
+				Data: []byte(fmt.Sprintf("modified by %d\n", idx))}}
+		}
 	}
 	path, _ := pathFor(idx)
+	owned.add(path)
 	return []fs.Change{{Path: path, Action: fs.ActionAdd, Kind: fs.KindFile,
 		Data: []byte(fmt.Sprintf("r%d\n", idx))}}
+}
+
+// ownedPaths tracks the files this generator created and still believes to
+// exist, per worker, so mixed-mode deletes/modifies always name a live path.
+type ownedPaths struct {
+	mu   sync.Mutex
+	live []string
+	next int
+}
+
+func (o *ownedPaths) add(path string) {
+	o.mu.Lock()
+	o.live = append(o.live, path)
+	o.mu.Unlock()
+}
+
+func (o *ownedPaths) pick(rng *rand.Rand) (string, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if len(o.live) == 0 {
+		return "", false
+	}
+	return o.live[rng.Intn(len(o.live))], true
+}
+
+func (o *ownedPaths) take(rng *rand.Rand) (string, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if len(o.live) == 0 {
+		return "", false
+	}
+	i := rng.Intn(len(o.live))
+	path := o.live[i]
+	o.live = append(o.live[:i], o.live[i+1:]...)
+	return path, true
 }
 
 // pathFor maps revision n to /d0/d1/d2/d3/d4/d5/f<d6>.txt with six decimal
