@@ -97,17 +97,37 @@ type options struct {
 	migrateChunkAvg uint64
 }
 
-// mirrorEntry is one backend in a --mirror-file JSON array (same shape as the
-// svngod config "mirrors" list): {"type":"file","root":...} or
-// {"type":"s3","endpoint":...,"access":...,"secret":...,"bucket":...,"ssl":...}.
+// mirrorEntry is one backend in a --mirror-file JSON object. It accepts both
+// spellings operators actually have on disk:
+//
+//	--mirror-file style: {"access":"...","secret":"..."}
+//	config style:        {"access-key":"...","secret-key":"..."}
+//
+// The two used to differ, so pasting a storage.mirrors block straight into
+// --mirror-file silently sent anonymous requests ("Access Denied") with no hint
+// that the keys had been dropped.
 type mirrorEntry struct {
-	Type     string `json:"type"`
-	Root     string `json:"root"`
-	Endpoint string `json:"endpoint"`
-	Access   string `json:"access"`
-	Secret   string `json:"secret"`
-	Bucket   string `json:"bucket"`
-	SSL      bool   `json:"ssl"`
+	Type      string `json:"type"`
+	Root      string `json:"root"`
+	Endpoint  string `json:"endpoint"`
+	Access    string `json:"access"`
+	Secret    string `json:"secret"`
+	AccessKey string `json:"access-key"`
+	SecretKey string `json:"secret-key"`
+	Bucket    string `json:"bucket"`
+	SSL       bool   `json:"ssl"`
+}
+
+// creds returns the access/secret pair under either accepted spelling.
+func (e mirrorEntry) creds() (string, string) {
+	ak, sk := e.Access, e.Secret
+	if ak == "" {
+		ak = e.AccessKey
+	}
+	if sk == "" {
+		sk = e.SecretKey
+	}
+	return ak, sk
 }
 
 func (o *options) repoStore(localPath string) (store.Store, string, error) {
@@ -352,8 +372,13 @@ func readMirrorFile(path string) ([]mirrorEntry, int, string, error) {
 // (keys relative to the bucket/root, repository prefix applied by the caller).
 func memberStore(e mirrorEntry) (store.Store, error) {
 	if e.Type == "s3" {
+		ak, sk := e.creds()
+		if ak == "" || sk == "" {
+			return nil, fmt.Errorf("mirror %s: missing credentials "+
+				"(set \"access\"/\"secret\" or \"access-key\"/\"secret-key\")", e.Endpoint)
+		}
 		return store.NewS3Store(store.S3Config{
-			Endpoint: e.Endpoint, AccessKey: e.Access, SecretKey: e.Secret,
+			Endpoint: e.Endpoint, AccessKey: ak, SecretKey: sk,
 			Bucket: e.Bucket, Region: "us-east-1", UseSSL: e.SSL,
 		})
 	}
