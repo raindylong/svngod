@@ -546,8 +546,9 @@ func (r *Repo) CommitBatch(reqs []BatchCommit) ([]uint64, []error, error) {
 		if c, _, rerr := r.readCurrentStrict(); rerr == nil {
 			now = c.Head
 		}
-		for _, p := range plans {
-			if p.rev <= now && r.journalOwns(ctx, p.rev, lease.token, p.rb) {
+		own := r.batchPartialOwnership(ctx, plans, now, lease.token)
+		for i, p := range plans {
+			if own[i] {
 				continue
 			}
 			errs[p.idx] = store.ErrQuorumUnmet

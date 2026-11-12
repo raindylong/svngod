@@ -1369,49 +1369,6 @@ func (r *Repo) commitTxn(baseRev uint64, changes []Change, revProps map[string]s
 	return N, nil
 }
 
-// journalOwns reports whether the durable WAL record for rev still describes
-// this writer's revision block and carries its lease token.
-func (r *Repo) journalOwns(ctx context.Context, rev uint64, token string, rbBytes []byte) bool {
-	if !r.journal {
-		return false
-	}
-	b, err := r.store.Get(ctx, r.keys.Journal(rev), nil)
-	if err != nil {
-		return false
-	}
-	rec, derr := DecodeCommitRecord(b)
-	if derr != nil || rec.Rev != rev || rec.Lease != token {
-		return false
-	}
-	sum := sha256.Sum256(rbBytes)
-	return rec.RevBlockSHA == hex.EncodeToString(sum[:])
-}
-
-// publishedByReplay reports whether rev is already the published HEAD and the
-// journal record for it describes this commit: same parent, same lease token
-// and the same revision block. WAL replay publishes a record once it is
-// quorum-acked and complete, so a writer that lost the HEAD CAS to that replay
-// can safely treat its commit as successful.
-func (r *Repo) publishedByReplay(ctx context.Context, rev uint64, token string, rbBytes []byte, parent uint64) bool {
-	if !r.journal {
-		return false
-	}
-	cur, _, err := r.readCurrentStrict()
-	if err != nil || cur.Head != rev {
-		return false
-	}
-	b, err := r.store.Get(ctx, r.keys.Journal(rev), nil)
-	if err != nil {
-		return false
-	}
-	rec, derr := DecodeCommitRecord(b)
-	if derr != nil || rec.Rev != rev || rec.Parent != parent || rec.Lease != token {
-		return false
-	}
-	sum := sha256.Sum256(rbBytes)
-	return rec.RevBlockSHA == hex.EncodeToString(sum[:])
-}
-
 // VerifyIssue describes one integrity failure found by Verify.
 type VerifyIssue struct {
 	Path        string
