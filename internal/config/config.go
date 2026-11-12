@@ -116,6 +116,36 @@ type Store struct {
 	SSL           bool    `json:"ssl"`
 	Mirrors       []Store `json:"mirrors"`
 	Quorum        int     `json:"quorum"`
+	// Geo wiring: Local and Remote are mirror specs (type "mirror") for the
+	// writer region and the disaster-read region. Local commits ack on the
+	// local quorum; the remote converges asynchronously.
+	Local  *Store `json:"local,omitempty"`
+	Remote *Store `json:"remote,omitempty"`
+	// ShardRanges routes a repository's revision history across several
+	// backends (type "sharded"): [from, to] shard indices inclusive.
+	ShardRanges []ShardRange `json:"ranges,omitempty"`
+	ShardMeta   *Store       `json:"meta,omitempty"`
+	ShardSize   uint64       `json:"shard-size,omitempty"` // revisions per shard (default 4096)
+}
+
+// geoEntry pairs a GeoStore with its repository prefix for metric labels.
+type geoEntry struct {
+	prefix string
+	g      *store.GeoStore
+}
+
+// geoStores collects the GeoStores built by makeStore so the server can
+// expose their status and close them on shutdown.
+var geoStores []geoEntry
+
+// GeoStores returns the geo stores built so far (process lifetime).
+func GeoStores() []geoEntry { return geoStores }
+
+// ShardRange is one row of a sharded store's ownership table.
+type ShardRange struct {
+	From  uint64  `json:"from"`
+	To    *uint64 `json:"to"` // omit for "to infinity"
+	Store *Store  `json:"store"`
 }
 
 // Auth is one authentication backend.
@@ -239,6 +269,71 @@ func (s *Store) resolveSecret() (string, error) {
 
 func (s *Store) makeStore(prefix string) (store.Store, error) {
 	switch s.Type {
+	case "geo":
+		if s.Local == nil || s.Remote == nil {
+			return nil, fmt.Errorf("geo storage needs local and remote mirror specs")
+		}
+		local, err := s.Local.makeStore(prefix)
+		if err != nil {
+			return nil, err
+		}
+		remote, err := s.Remote.makeStore(prefix)
+		if err != nil {
+			return nil, err
+		}
+		lm, ok := local.(*store.MirrorStore)
+		if !ok {
+			return nil, fmt.Errorf("geo local must be a mirror (got %s)", s.Local.Type)
+		}
+		rm, ok := remote.(*store.MirrorStore)
+		if !ok {
+			return nil, fmt.Errorf("geo remote must be a mirror (got %s)", s.Remote.Type)
+		}
+		g := store.NewGeoStore(store.GeoConfig{
+			Local:       lm,
+			Remote:      rm,
+			RepoPrefix:  prefix,
+			ControlName: store.NewKeys(prefix).Current(),
+		})
+		gg := g
+		server.RegisterGeoStatus(prefix, func() (uint64, uint64, uint64) {
+			st := gg.Status()
+			return st.Pending, st.Shipped, st.Errors
+		})
+		geoStores = append(geoStores, geoEntry{prefix: prefix, g: g})
+		return g, nil
+	case "sharded":
+		meta := s.ShardMeta
+		if meta == nil || len(s.ShardRanges) == 0 {
+			return nil, fmt.Errorf("sharded storage needs meta and ranges")
+		}
+		mst, err := meta.makeStore(prefix)
+		if err != nil {
+			return nil, err
+		}
+		shardSize := s.ShardSize
+		if shardSize == 0 {
+			shardSize = 4096
+		}
+		var ranges []store.ShardRange
+		for i, r := range s.ShardRanges {
+			st, err := r.Store.makeStore(prefix)
+			if err != nil {
+				return nil, err
+			}
+			to := ^uint64(0)
+			if r.To != nil {
+				to = *r.To
+			}
+			ranges = append(ranges, store.ShardRange{From: r.From, To: to, Store: st})
+			_ = i
+		}
+		return store.NewShardRouter(store.ShardRouterConfig{
+			Prefix:    prefix,
+			Meta:      mst,
+			ShardSize: shardSize,
+			Ranges:    ranges,
+		})
 	case "s3":
 		secret, serr := s.resolveSecret()
 		if serr != nil {

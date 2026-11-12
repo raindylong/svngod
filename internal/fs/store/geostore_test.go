@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -143,4 +144,61 @@ func TestGeoHeadCASMonotonic(t *testing.T) {
 	if err != nil || len(cur) != 1 || cur[0] != 3 {
 		t.Fatalf("remote current=%v err=%v, want [3]", cur, err)
 	}
+}
+
+// TestGeoReconcileCoversRestartLoss: objects written to the local region but
+// never shipped (simulated crash before drain) are picked up by Reconcile.
+func TestGeoReconcileCoversRestartLoss(t *testing.T) {
+	g, local, remote := geoFixture(t)
+	ctx := context.Background()
+	// Write directly to the local mirror, bypassing the geo queue: exactly
+	// what a crash between local ack and shipment leaves behind.
+	for i := 0; i < 3; i++ {
+		if err := local.Put(ctx, fmt.Sprintf("repos/gx/obj%d", i), []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n, err := g.Reconcile(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Fatalf("reconcile re-shipped %d, want 3", n)
+	}
+	for i := 0; i < 3; i++ {
+		b, err := remote.Get(ctx, fmt.Sprintf("repos/gx/obj%d", i), nil)
+		if err != nil || string(b) != "x" {
+			t.Fatalf("remote obj%d after reconcile: %q err=%v", i, b, err)
+		}
+	}
+	// Idempotent: a second pass re-ships nothing.
+	if n, err := g.Reconcile(ctx); err != nil || n != 0 {
+		t.Fatalf("second reconcile: n=%d err=%v, want 0/nil", n, err)
+	}
+}
+
+// TestGeoReconcileRepairsCorruptRemote: a remote object with wrong bytes is
+// re-shipped with the correct content.
+func TestGeoReconcileRepairsCorruptRemote(t *testing.T) {
+	g, local, remote := geoFixture(t)
+	ctx := context.Background()
+	if err := g.Put(ctx, "repos/gx/obj1", []byte("good")); err != nil {
+		t.Fatal(err)
+	}
+	waitGeoIdle(t, g, 1)
+	// Corrupt the remote copy.
+	if err := remote.Mirrors()[0].Put(ctx, "repos/gx/obj1", []byte("bad")); err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.Mirrors()[1].Put(ctx, "repos/gx/obj1", []byte("bad")); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := g.Reconcile(ctx); err != nil || n != 1 {
+		t.Fatalf("reconcile after corruption: n=%d err=%v, want 1/nil", n, err)
+	}
+	b, err := remote.Get(ctx, "repos/gx/obj1", nil)
+	if err != nil || string(b) != "good" {
+		t.Fatalf("remote after repair: %q err=%v", b, err)
+	}
+	_ = local
 }

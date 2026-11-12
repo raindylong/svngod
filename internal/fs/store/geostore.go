@@ -23,9 +23,12 @@ package store
 //     eventual (seconds on a healthy WAN).
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log"
+	"strings"
 	"sync"
 	"time"
 )
@@ -34,6 +37,8 @@ import (
 type GeoConfig struct {
 	Local  *MirrorStore
 	Remote *MirrorStore
+	// RepoPrefix scopes the reconcile listing (e.g. "repos/alpha").
+	RepoPrefix string
 	// ControlName is the HEAD pointer object key (the mirror's control
 	// object), published on the remote via monotonic CAS.
 	ControlName string
@@ -45,9 +50,10 @@ type GeoConfig struct {
 
 // GeoStore is a Store: local-region semantics with async remote shipping.
 type GeoStore struct {
-	local  *MirrorStore
-	remote *MirrorStore
-	ctrl   string
+	local      *MirrorStore
+	remote     *MirrorStore
+	ctrl       string
+	repoPrefix string
 
 	mu    sync.Mutex
 	queue []geoItem
@@ -72,12 +78,13 @@ type geoItem struct {
 // NewGeoStore builds the store and starts the background shipper.
 func NewGeoStore(cfg GeoConfig) *GeoStore {
 	g := &GeoStore{
-		local:  cfg.Local,
-		remote: cfg.Remote,
-		ctrl:   cfg.ControlName,
-		wake:   make(chan struct{}, 1),
-		stop:   make(chan struct{}),
-		onShip: cfg.OnShip,
+		local:      cfg.Local,
+		remote:     cfg.Remote,
+		ctrl:       cfg.ControlName,
+		repoPrefix: cfg.RepoPrefix,
+		wake:       make(chan struct{}, 1),
+		stop:       make(chan struct{}),
+		onShip:     cfg.OnShip,
 	}
 	interval := cfg.Interval
 	if interval <= 0 {
@@ -88,23 +95,41 @@ func NewGeoStore(cfg GeoConfig) *GeoStore {
 	return g
 }
 
-// Close stops the shipper.
+// Close stops the shipper and the reconcile loop.
 func (g *GeoStore) Close() {
 	close(g.stop)
 	g.done.Wait()
 }
 
-// shipper drains the queue to the remote region forever.
+// shipper drains the queue to the remote region forever, and periodically
+// runs a full reconcile pass (list every local key, compare with the remote,
+// re-ship anything missing or different). The reconcile closes the in-memory
+// queue's restart hole: mutations queued but not shipped before a crash are
+// picked up by the next pass. It also heals a remote that lost objects
+// (bucket incident, partial restore).
 func (g *GeoStore) shipper(interval time.Duration) {
 	defer g.done.Done()
+	reconcileEvery := 10 * interval
+	if reconcileEvery < 5*time.Second {
+		reconcileEvery = 5 * time.Second
+	}
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	rt := time.NewTicker(reconcileEvery)
+	defer rt.Stop()
 	for {
 		select {
 		case <-g.stop:
 			return
 		case <-t.C:
 		case <-g.wake:
+		case <-rt.C:
+			if n, err := g.Reconcile(context.Background()); err != nil {
+				g.noteErr(err)
+			} else if n > 0 {
+				log.Printf("geo: reconcile re-shipped %d object(s)", n)
+			}
+			continue
 		}
 		for {
 			item, ok := g.pop()
@@ -120,6 +145,43 @@ func (g *GeoStore) shipper(interval time.Duration) {
 			g.noteShipped(item.key)
 		}
 	}
+}
+
+// Reconcile lists every object on the local region and re-ships any key the
+// remote region is missing or storing differently. Returns the number of
+// objects re-shipped. GC-only deletions are not detected (by design: each
+// region runs its own GC).
+func (g *GeoStore) Reconcile(ctx context.Context) (int, error) {
+	prefix := strings.Trim(g.repoPrefix, "/")
+	if prefix != "" {
+		prefix += "/"
+	}
+	next := ""
+	shipped := 0
+	for {
+		objs, cont, err := g.local.ListPrefix(ctx, prefix, next, 1000)
+		if err != nil {
+			return shipped, fmt.Errorf("geo reconcile: list local: %w", err)
+		}
+		next = cont
+		for _, o := range objs {
+			want, lerr := g.local.Get(ctx, o.Key, nil)
+			if lerr != nil {
+				continue // deleted between list and read (GC); skip
+			}
+			have, rerr := g.remote.Mirrors()[0].Get(ctx, o.Key, nil)
+			if rerr != nil || !bytes.Equal(have, want) {
+				if err := g.ship(geoItem{key: o.Key, data: want}); err != nil {
+					return shipped, fmt.Errorf("geo reconcile: ship %s: %w", o.Key, err)
+				}
+				shipped++
+			}
+		}
+		if next == "" {
+			break
+		}
+	}
+	return shipped, nil
 }
 
 func (g *GeoStore) pop() (geoItem, bool) {

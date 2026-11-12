@@ -300,6 +300,15 @@ func (s *Server) serveMetrics(w http.ResponseWriter) {
 			fmt.Fprintf(&b, "svngod_repo_head{repo=%q} %d\n", escapeLabel(name), head)
 		}
 	}
+	// Geo cross-region shipping lag: pending > 0 for long means the remote
+	// region is behind (partition or slow WAN); ship errors should alert.
+	for _, e := range geoStatusHooks {
+		if st, ok := e(); ok {
+			fmt.Fprintf(&b, "svngod_geo_pending{prefix=%q} %d\n", st.prefix, st.pending)
+			fmt.Fprintf(&b, "svngod_geo_shipped_total{prefix=%q} %d\n", st.prefix, st.shipped)
+			fmt.Fprintf(&b, "svngod_geo_ship_errors_total{prefix=%q} %d\n", st.prefix, st.errors)
+		}
+	}
 	b.WriteString("# HELP svngod_block_cache_hits_total Revision-block cache hits.\n")
 	b.WriteString("# TYPE svngod_block_cache_hits_total counter\n")
 	b.WriteString("# HELP svngod_block_cache_misses_total Revision-block cache misses.\n")
@@ -400,4 +409,25 @@ func (m *metrics) repoRecoveredSnapshot() map[string]uint64 {
 		out[k] = v
 	}
 	return out
+}
+
+// geoStatusSample is one geo store's snapshot for the metrics endpoint.
+type geoStatusSample struct {
+	prefix  string
+	pending uint64
+	shipped uint64
+	errors  uint64
+}
+
+// geoStatusHooks lets the config package register geo-store status sources
+// without an import cycle (server must not import config).
+var geoStatusHooks []func() (geoStatusSample, bool)
+
+// RegisterGeoStatus registers one geo-store status sampler (prefix label +
+// snapshot function). Called at store-build time.
+func RegisterGeoStatus(prefix string, sample func() (pending, shipped, errs uint64)) {
+	geoStatusHooks = append(geoStatusHooks, func() (geoStatusSample, bool) {
+		p, s, e := sample()
+		return geoStatusSample{prefix: prefix, pending: p, shipped: s, errors: e}, true
+	})
 }
