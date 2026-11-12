@@ -163,23 +163,47 @@ func (r *Repo) writeCommitJournal(ctx context.Context, rev, parent uint64, lease
 	if prev := r.prevJournalSHA(ctx, rev); prev != "" {
 		rec.PrevJournalSHA = prev
 	}
-	if err := r.store.Put(ctx, r.keys.Journal(rev), EncodeCommitRecord(rec)); err != nil {
+	enc := EncodeCommitRecord(rec)
+	if err := r.store.Put(ctx, r.keys.Journal(rev), enc); err != nil {
 		return fmt.Errorf("journal: %w", err)
 	}
+	r.rememberJournal(rev, enc)
 	return nil
+}
+
+// rememberJournal caches the just-written record so the next commit chains
+// from memory instead of re-reading journal/<rev-1> from the store (one S3
+// round trip per commit on the mirror path). Writes are serialised by the
+// commit lease; the cached bytes are exactly what was stored.
+func (r *Repo) rememberJournal(rev uint64, enc []byte) {
+	r.lastJournalMu.Lock()
+	r.lastJournalRev = rev
+	r.lastJournalCached = true
+	r.lastJournalBytes = enc
+	r.lastJournalMu.Unlock()
 }
 
 // prevJournalSHA returns the SHA-256 of journal/<rev-1> as stored, or "" when
 // rev is the first record (or the predecessor is absent/unreadable, which
 // starts a fresh chain rather than failing the commit - the chain is verified
-// as a whole by VerifyJournalChain, not per write).
+// as a whole by VerifyJournalChain, not per write). The most recent write is
+// usually still cached: commits are consecutive revisions under the lease.
 func (r *Repo) prevJournalSHA(ctx context.Context, rev uint64) string {
 	if rev == 0 {
 		return ""
 	}
-	b, err := r.store.Get(ctx, r.keys.Journal(rev-1), nil)
-	if err != nil || len(b) == 0 {
-		return ""
+	r.lastJournalMu.Lock()
+	cached, crev, cbytes := r.lastJournalCached, r.lastJournalRev, r.lastJournalBytes
+	r.lastJournalMu.Unlock()
+	var b []byte
+	if cached && crev == rev-1 {
+		b = cbytes
+	} else {
+		var err error
+		b, err = r.store.Get(ctx, r.keys.Journal(rev-1), nil)
+		if err != nil || len(b) == 0 {
+			return ""
+		}
 	}
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])

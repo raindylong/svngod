@@ -106,6 +106,14 @@ type Repo struct {
 	// journalMu serialises WAL replay and throttles it during reads.
 	journalMu sync.Mutex
 	journalAt time.Time
+	// lastJournal caches the most recently written journal record's bytes and
+	// its revision, so chaining the next record (prev_journal_sha256) reads
+	// one S3 object fewer per commit. Only the commit-lease holder writes
+	// journal records, so the pair is consistent under the lease.
+	lastJournalMu     sync.Mutex
+	lastJournalRev    uint64
+	lastJournalCached bool
+	lastJournalBytes  []byte
 
 	mu    sync.Mutex
 	cache *cache.LRU
