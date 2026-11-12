@@ -80,6 +80,24 @@ func main() {
 			store.WithRepoPrefix(rp), store.WithLazyRepair())
 	case "s3":
 		st = s3Store(strings.Split(*endpoints, ",")[0])
+	case "mirrorfile":
+		// Same mirror/WAL/quorum code path as production, but each -endpoints
+		// entry is a local directory: lets a restore drill exercise the journal
+		// hash chain without an S3 dependency.
+		var ms []store.Store
+		for _, ep := range strings.Split(*endpoints, ",") {
+			root := strings.TrimSpace(ep)
+			os.MkdirAll(root, 0o755)
+			s, err := store.NewFileStore(root)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "store:", err)
+				os.Exit(1)
+			}
+			ms = append(ms, s)
+		}
+		rp := strings.Trim(*prefix, "/") + "/" + *repoName
+		st = store.NewMirror(ms, store.WithMutableOrder(fs.CompareMutable),
+			store.WithRepoPrefix(rp), store.WithLazyRepair())
 	case "file":
 		os.MkdirAll(*root, 0o755)
 		s, err := store.NewFileStore(*root)

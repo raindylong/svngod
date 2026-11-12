@@ -29,4 +29,16 @@ CGO_ENABLED=0 GOOS=darwin  go build -o /dev/null ./cmd/svngod ./cmd/svnadmin ./c
 echo "==> test (native)"
 CGO_ENABLED=0 go test -count=1 -timeout 15m ./...
 
+# Backup/restore drill: proves the recovery runbook (docs/备份与恢复SOP.md) on
+# a two-node WAL mirror, including the negative controls that must refuse a
+# damaged backup. Fast (~5s); set CI_SKIP_DRILL=1 for a unit-tests-only run.
+if [ "${CI_SKIP_DRILL:-0}" != "1" ]; then
+  echo "==> restore drill"
+  bash scripts/drill-restore.sh 40 4 >/tmp/svngod-drill.$$ 2>&1 \
+    || { tail -30 /tmp/svngod-drill.$$; fail "restore drill failed (full log: /tmp/svngod-drill.$$)"; }
+  grep -q 'RESTORE DRILL OK' /tmp/svngod-drill.$$ \
+    || { tail -30 /tmp/svngod-drill.$$; fail "restore drill did not report OK"; }
+  tail -1 /tmp/svngod-drill.$$ | sed 's/^/    /'
+fi
+
 echo "CI OK"

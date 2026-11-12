@@ -60,6 +60,8 @@ type options struct {
 	progress        bool
 	loadFrom        uint64
 	loadTo          uint64
+	loadExpectHead  uint64
+	dumpVerify      bool
 	rebuildIndex    bool
 	verifyMembers   bool
 	verifyTextfile  string
@@ -269,12 +271,14 @@ func main() {
 	}
 	if cmd == "dump" {
 		fs.StringVar(&output, "output", "", "write dump to file (default stdout)")
+		fs.BoolVar(&o.dumpVerify, "verify", false, "before dumping: check journal hash chain and HEAD readability, abort on corruption")
 	}
 	if cmd == "load" {
 		fs.BoolVar(&o.progress, "progress", false, "print progress to stderr every 5s")
 		fs.StringVar(&input, "input", "", "read dump from file (default stdin)")
 		fs.Uint64Var(&o.loadFrom, "from", 0, "first revision number to apply (earlier ones must already exist)")
 		fs.Uint64Var(&o.loadTo, "to", 0, "last revision number to apply (0 = all)")
+		fs.Uint64Var(&o.loadExpectHead, "expect-head", 0, "fail unless the loaded repository ends at this revision (0 = no check)")
 	}
 	if err := fs.Parse(rest); err != nil {
 		os.Exit(2)
@@ -687,8 +691,8 @@ func usage() {
 
 usage:
   svnadmin create [--segments] [s3 flags | --mirror-file FILE] <repo>
-  svnadmin dump   [--output FILE] [s3 flags] <repo>
-  svnadmin load   [--input FILE] [--from N] [--to N] [s3 flags] <repo>  # resumable
+  svnadmin dump   [--output FILE] [--verify] [s3 flags] <repo>  # --verify: chain+HEAD gate before export
+  svnadmin load   [--input FILE] [--from N] [--to N] [--expect-head N] [s3 flags] <repo>  # resumable
   svnadmin verify [--all-revs [--workers N] [--texts] [--repair-index]] [s3 flags] <repo>  # integrity walk
   svnadmin repair [--mirror-file FILE] [--rebuild-index] <repo>  # reconcile mirrors / rebuild segment indexes
   svnadmin delete-repo -force [s3 flags | --mirror-file FILE] <repo>  # delete every object of a repository
@@ -1289,6 +1293,12 @@ func writeVerifyMetrics(path, repoName, scope string, issues int, dur time.Durat
 	}
 }
 
+// doDump exports the repository as an SVN-v2 stream. With --verify it refuses
+// to produce a backup from a repository whose history already fails integrity
+// checks: a dump of a corrupted repository is worthless as a recovery point,
+// and silently exporting one is worse than a loud failure. Every dump also
+// prints a manifest (head, bytes, sha256) so the copy can be authenticated
+// after it travels to the backup host.
 func doDump(o *options, repoName, output string) {
 	st, prefix, err := o.repoStore(repoName)
 	if err != nil {
@@ -1298,22 +1308,66 @@ func doDump(o *options, repoName, output string) {
 	if err != nil {
 		fatal(err)
 	}
-	var w io.Writer = os.Stdout
+	head, err := repo.HeadFresh()
+	if err != nil {
+		fatal(err)
+	}
+	if o.dumpVerify {
+		if err := repo.VerifyJournalChain(1, head); err != nil {
+			fatal(fmt.Errorf("dump: refusing to back up: %w", err))
+		}
+		issues, err := repo.Verify(head)
+		if err != nil {
+			fatal(fmt.Errorf("dump: HEAD check failed: %w", err))
+		}
+		if len(issues) > 0 {
+			for _, is := range issues {
+				fmt.Fprintf(os.Stderr, "dump: corrupt rev=%d path=%q: %v (rebuildable=%v)\n",
+					is.Rev, is.Path, is.Err, is.Rebuildable)
+			}
+			fatal(fmt.Errorf("dump: refusing to back up: %d integrity issue(s) at HEAD %d", len(issues), head))
+		}
+	}
+	// Hash exactly the bytes written, so the manifest describes the copy that
+	// exists on the backup host (not a re-read of the repository). With
+	// --output the stream lands in <output>.partial and is renamed into place
+	// only after the dump completes: an interrupted run must never leave a
+	// truncated file at the path a restore procedure would trust.
+	h := sha256.New()
+	var w io.Writer = io.MultiWriter(os.Stdout, h)
 	var f *os.File
+	partial := ""
 	if output != "" {
-		f, err = os.Create(output)
+		partial = output + ".partial"
+		f, err = os.Create(partial)
 		if err != nil {
 			fatal(err)
 		}
-		defer f.Close()
-		w = f
+		w = io.MultiWriter(f, h)
 	}
-	if err := dump.Dump(repo, w); err != nil {
+	cw := &countingWriter{w: w}
+	if err := dump.Dump(repo, cw); err != nil {
+		if f != nil {
+			f.Close()
+			fmt.Fprintf(os.Stderr, "dump: incomplete stream left at %s (not a usable backup)\n", partial)
+		}
 		fatal(err)
 	}
 	if f != nil {
-		fmt.Fprintf(os.Stderr, "dumped %s to %s\n", repoName, output)
+		if err := f.Sync(); err != nil {
+			f.Close()
+			fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			fatal(err)
+		}
+		if err := os.Rename(partial, output); err != nil {
+			fatal(err)
+		}
 	}
+	// The manifest goes to stderr so `dump > file` on stdout stays clean.
+	fmt.Fprintf(os.Stderr, "dump: repo=%s head=%d bytes=%d sha256=%s\n",
+		repoName, head, cw.n, hex.EncodeToString(h.Sum(nil)))
 }
 
 func doLoad(o *options, repoName, input string) {
@@ -1358,13 +1412,33 @@ func doLoad(o *options, repoName, input string) {
 	if err := dump.LoadRangeProgress(repo, r, o.loadFrom, o.loadTo, loadProgress); err != nil {
 		fatal(err)
 	}
-	head, _ := repo.Head()
+	head, err := repo.HeadFresh()
+	if err != nil {
+		fatal(err)
+	}
+	if o.loadExpectHead != 0 && head != o.loadExpectHead {
+		fatal(fmt.Errorf("load: repository ended at head=%d, expected %d: the dump is incomplete or from a different repository",
+			head, o.loadExpectHead))
+	}
 	fmt.Printf("loaded %s, head=%d\n", repoName, head)
 }
 
 func fatal(err error) {
 	fmt.Fprintf(os.Stderr, "svnadmin: %v\n", err)
 	os.Exit(1)
+}
+
+// countingWriter reports how many bytes reached the destination, which is the
+// size a restore must find on disk (not the repository's logical size).
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // reportDriftDiffs lists the concrete objects that differ between members, so
