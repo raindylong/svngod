@@ -259,6 +259,17 @@ func (r *Repo) buildRevisionLocked(ctx context.Context, root *tnode, parent, N, 
 		nodes = append(nodes, nr)
 	}
 
+	// Publish the just-built nodes to this process only, so later requests in
+	// the same batch can resolve a directory they created or modified before the
+	// revision is visible. Without this, a modify following a create in the same
+	// batch calls ensureDir on a NodeID pointing at the unpublished revision and
+	// fails with "store: object not found".
+	if r.pendingNodes != nil {
+		for _, nr := range nodes {
+			r.pendingNodes[nr.Node] = nr
+		}
+	}
+
 	rootID := NodeID{Rev: N, ID: root.newID}
 	rb := NewRevBlock(N, parent, rootID, nodes)
 	rp := NewRevProps()
@@ -454,6 +465,12 @@ func (r *Repo) CommitBatch(reqs []BatchCommit) ([]uint64, []error, error) {
 	phase("head")
 
 	ctx := context.Background()
+	// Nodes built by this batch are visible to later requests in the same batch
+	// through pendingNodes (see buildRevisionLocked). Cleared before returning so
+	// a later commit cannot resolve a node from a batch that failed to publish.
+	r.pendingNodes = make(map[NodeID]*NodeRev)
+	defer func() { r.pendingNodes = nil }()
+
 	root, err := r.readRootLocked(cur.Head)
 	if err != nil {
 		return revs, errs, err

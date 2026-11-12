@@ -156,3 +156,61 @@ func TestSegmentedBatchChainVerifies(t *testing.T) {
 		t.Fatal("second batch record lost its chain link to the first batch")
 	}
 }
+
+// TestBatchResolvesNodesItJustCreated covers the dependency that makes a batch
+// of consecutive revisions possible at all: a later request modifies a
+// directory created by an earlier one in the same batch. The directory's
+// NodeID points at a revision that is not published yet, so resolving it from
+// the store fails ("object not found") unless the batch keeps its own in-memory
+// nodes. This is the ordinary shape of an incremental dump import, where
+// revision 2 modifies what revision 1 added.
+func TestBatchResolvesNodesItJustCreated(t *testing.T) {
+	r, _ := mirrorFixture(t, "gcnode")
+	reqs := []BatchCommit{
+		{Changes: []Change{
+			{Path: "/trunk", Action: ActionAdd, Kind: KindDir},
+			{Path: "/trunk/a.txt", Action: ActionAdd, Kind: KindFile, Data: []byte("v1")},
+		}},
+		{Changes: []Change{
+			{Path: "/trunk", Action: ActionModify, Kind: KindDir, Props: map[string]string{"svn:ignore": "*.o"}},
+			{Path: "/trunk/a.txt", Action: ActionModify, Kind: KindFile, Data: []byte("v2 longer")},
+		}},
+		{Changes: []Change{
+			{Path: "/trunk/b.txt", Action: ActionAdd, Kind: KindFile, Data: []byte("b")},
+		}},
+	}
+	revs, errs, err := r.CommitBatch(reqs)
+	if err != nil {
+		t.Fatalf("CommitBatch: %v", err)
+	}
+	for i := range errs {
+		if errs[i] != nil {
+			t.Fatalf("req %d: %v", i, errs[i])
+		}
+	}
+	if revs[0] != 1 || revs[1] != 2 || revs[2] != 3 {
+		t.Fatalf("revs=%v, want 1,2,3", revs)
+	}
+	// Each revision must see the tree as of its own point in the batch.
+	nr, err := r.Resolve(2, "/trunk/a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.GetText(nr.Node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "v2 longer" {
+		t.Fatalf("rev2 content = %q", got)
+	}
+	dnr, err := r.Resolve(2, "/trunk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dnr.Props["svn:ignore"] != "*.o" {
+		t.Fatalf("rev2 dir props = %v", dnr.Props)
+	}
+	if _, err := r.Resolve(3, "/trunk/b.txt"); err != nil {
+		t.Fatalf("rev3 must see both the earlier files and its own: %v", err)
+	}
+}

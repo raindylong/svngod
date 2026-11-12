@@ -1,6 +1,7 @@
 package fs
 
 import (
+	"fmt"
 	"strings"
 )
 
@@ -164,7 +165,7 @@ func (r *Repo) ensureDir(t *tnode) error {
 	}
 	nr, err := r.GetNodeRev(t.id)
 	if err != nil {
-		return err
+		return fmt.Errorf("ensureDir id=%v kind=%d: %w", t.id, t.kind, err)
 	}
 	children, err := r.dirChildren(nr)
 	if err != nil {

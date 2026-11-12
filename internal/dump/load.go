@@ -90,12 +90,14 @@ func LoadRangeProgress(repo *fs.Repo, r io.Reader, from, to uint64, progress fun
 	}
 
 	var changes []fs.Change
-	// A dump that fails mid-way must not leave spooled bodies behind.
+	// Spooled bodies must not survive a failed load. liveSpool tracks every body
+	// file that has been read but not yet committed, so a failure in the middle
+	// of a buffered batch cleans up the whole batch, not just the block being
+	// parsed.
+	var liveSpool []string
 	defer func() {
-		for _, ch := range changes {
-			if ch.DataFile != "" {
-				os.Remove(ch.DataFile)
-			}
+		for _, p := range liveSpool {
+			os.Remove(p)
 		}
 	}()
 	var props map[string]string
@@ -114,36 +116,116 @@ func LoadRangeProgress(repo *fs.Repo, r io.Reader, from, to uint64, progress fun
 	lastRev = startHead
 	skipping := false
 
-	flush := func() error {
-		if !inRevision || skipping || len(changes) == 0 {
-			changes = nil
-			return nil
-		}
-		// Incremental import: each revision commit builds on the previous one so
-		// earlier revisions' tree content is preserved across shard boundaries.
-		rev, err := repo.CommitTxn(lastRev, changes, props)
-		// Spooled bodies are consumed by the commit (or dropped with it).
-		for _, ch := range changes {
-			if ch.DataFile != "" {
-				os.Remove(ch.DataFile)
+	// Revisions are committed in batches: one commit lease, one WAL record and
+	// one HEAD CAS per batch instead of per revision. On a WAN-backed store that
+	// is the difference between ~0.7 and ~30 revisions/s (see
+	// docs/性能基线与回归.md), which is what makes restoring a large repository
+	// practical at all.
+	//
+	// Ordering is preserved: CommitBatch applies the requests consecutively to
+	// the evolving tree, so revision N still sees revision N-1's content
+	// (incremental import across shard boundaries depends on this).
+	batchSize := loadBatchSize
+	pending := make([]fs.BatchCommit, 0, batchSize)
+	pendingChanges := make([][]fs.Change, 0, batchSize)
+
+	// dropSpooled removes the body files of committed (or rejected) revisions
+	// and forgets them, so the deferred sweep does not re-remove them.
+	dropSpooled := func(chs []fs.Change) {
+		for _, ch := range chs {
+			if ch.DataFile == "" {
+				continue
+			}
+			os.Remove(ch.DataFile)
+			for i, p := range liveSpool {
+				if p == ch.DataFile {
+					liveSpool = append(liveSpool[:i], liveSpool[i+1:]...)
+					break
+				}
 			}
 		}
+	}
+
+	commitPending := func() error {
+		if len(pending) == 0 {
+			return nil
+		}
+		revs, errs, err := repo.CommitBatch(pending)
+		if err != nil {
+			// Whole-batch failure: nothing was published, so every buffered
+			// revision is lost. Surface the first per-request error when there is
+			// one; it names the revision that actually failed.
+			for i := range errs {
+				if errs[i] != nil {
+					err = errs[i]
+					break
+				}
+			}
+		}
+		for _, chs := range pendingChanges {
+			dropSpooled(chs)
+		}
+		pending = pending[:0]
+		pendingChanges = pendingChanges[:0]
 		if err != nil {
 			return err
 		}
-		lastRev = rev
-		if progress != nil {
-			progress(rev)
+		for _, rv := range revs {
+			if rv == 0 {
+				return fmt.Errorf("dump: batch commit returned an empty revision")
+			}
+			lastRev = rv
+			if progress != nil {
+				progress(rv)
+			}
+		}
+		return nil
+	}
+
+	flush := func() error {
+		if inRevision && !skipping && len(changes) > 0 {
+			// A copy's source must already be published: applyChange loads the
+			// source subtree from the store at CopyFromRev. If that revision is
+			// still buffered in this batch it does not exist yet, so publish the
+			// buffer first and let the copy land in the next batch.
+			for _, ch := range changes {
+				// CopyFromRev must already be published; lastRev is the highest
+				// published revision, so anything above it is still buffered.
+				if ch.CopyFromRev > lastRev {
+					if err := commitPending(); err != nil {
+						return err
+					}
+					break
+				}
+			}
+			for _, ch := range changes {
+				if ch.DataFile != "" {
+					liveSpool = append(liveSpool, ch.DataFile)
+				}
+			}
+			pending = append(pending, fs.BatchCommit{BaseRev: lastRev + uint64(len(pending)), Changes: changes, RevProps: props})
+			pendingChanges = append(pendingChanges, changes)
+			if len(pending) >= batchSize {
+				if err := commitPending(); err != nil {
+					return err
+				}
+			}
 		}
 		changes = nil
 		return nil
 	}
+
+	// finish commits the tail and reports a failure the same way flush does.
+	finish := func() error { return commitPending() }
 
 	for {
 		hdrs, err := readHeaders(br)
 		if len(hdrs) == 0 {
 			if err == io.EOF {
 				if ferr := flush(); ferr != nil {
+					return ferr
+				}
+				if ferr := finish(); ferr != nil {
 					return ferr
 				}
 				if startHead == 0 && dumpUUID != "" {
@@ -166,7 +248,12 @@ func LoadRangeProgress(repo *fs.Repo, r io.Reader, from, to uint64, progress fun
 			}
 			if n, perr := strconv.ParseUint(strings.TrimSpace(rn), 10, 64); perr == nil {
 				if to > 0 && n > to {
-					return nil // requested range complete
+					// Requested range complete: publish what is buffered before
+					// returning, otherwise the last partial batch is silently lost.
+					if ferr := finish(); ferr != nil {
+						return ferr
+					}
+					return nil
 				}
 				skipping = n <= startHead || (from > 0 && n < from)
 			} else {
@@ -258,6 +345,23 @@ func readHeaders(br *bufio.Reader) (map[string]string, error) {
 // buildChange reads a node's props + text and turns it into fs.Change(s).
 // A "replace" expands to delete-then-add so the commit preserves the new
 // content instead of a bare delete.
+// loadBatchSize is how many revisions LoadRangeProgress submits per CommitBatch
+// call. One batch costs one commit lease, one WAL record and one HEAD CAS
+// regardless of size, so batching is the main lever for restoring over a
+// high-latency store. A variable so svnadmin can expose it.
+var loadBatchSize = 64
+
+// SetLoadBatchSize overrides the revisions per commit used by load (<=1 keeps
+// the historical per-revision behaviour). Returns the previous value.
+func SetLoadBatchSize(n int) int {
+	prev := loadBatchSize
+	if n < 1 {
+		n = 1
+	}
+	loadBatchSize = n
+	return prev
+}
+
 // loadSpoolThreshold is the node text size above which the body is spooled to a
 // temp file instead of being buffered. A variable so tests can exercise the
 // spooling path with small files.

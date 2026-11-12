@@ -60,6 +60,7 @@ type options struct {
 	loadFrom        uint64
 	loadTo          uint64
 	loadExpectHead  uint64
+	loadBatch       int
 	dumpVerify      bool
 	rebuildIndex    bool
 	verifyMembers   bool
@@ -258,6 +259,7 @@ func main() {
 		fs.Uint64Var(&o.loadFrom, "from", 0, "first revision number to apply (earlier ones must already exist)")
 		fs.Uint64Var(&o.loadTo, "to", 0, "last revision number to apply (0 = all)")
 		fs.Uint64Var(&o.loadExpectHead, "expect-head", 0, "fail unless the loaded repository ends at this revision (0 = no check)")
+		fs.IntVar(&o.loadBatch, "batch", 0, "revisions per commit (0 = built-in default; 1 = one commit per revision)")
 	}
 	if err := fs.Parse(rest); err != nil {
 		os.Exit(2)
@@ -642,7 +644,7 @@ func usage() {
 usage:
   svnadmin create [--segments] [s3 flags | --mirror-file FILE] <repo>
   svnadmin dump   [--output FILE] [--verify] [s3 flags] <repo>  # --verify: chain+HEAD gate before export
-  svnadmin load   [--input FILE] [--from N] [--to N] [--expect-head N] [s3 flags] <repo>  # resumable
+  svnadmin load   [--input FILE] [--from N] [--to N] [--expect-head N] [--batch N] [s3 flags] <repo>  # resumable
   svnadmin verify [--all-revs [--workers N] [--texts] [--repair-index]] [s3 flags] <repo>  # integrity walk
   svnadmin repair [--mirror-file FILE] [--rebuild-index] <repo>  # reconcile mirrors / rebuild segment indexes
   svnadmin delete-repo -force [s3 flags | --mirror-file FILE] <repo>  # delete every object of a repository
@@ -1358,6 +1360,9 @@ func doLoad(o *options, repoName, input string) {
 			last = time.Now()
 			fmt.Fprintf(os.Stderr, "load: revision %d applied (%s)\n", rev, time.Since(start).Round(time.Second))
 		}
+	}
+	if o.loadBatch > 0 {
+		dump.SetLoadBatchSize(o.loadBatch)
 	}
 	if err := dump.LoadRangeProgress(repo, r, o.loadFrom, o.loadTo, loadProgress); err != nil {
 		fatal(err)

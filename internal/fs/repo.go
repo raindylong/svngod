@@ -123,6 +123,13 @@ type Repo struct {
 	// []byte-only, so this is a dedicated pointer map with its own mutex.
 	nodeCacheMu sync.Mutex
 	nodeCache   map[cache.Key]*NodeRev
+
+	// pendingNodes holds node-revs built by the batch currently being
+	// published, keyed by the revision/id finalizeTree assigned. They exist only
+	// in memory: a later request in the same batch resolves a directory it just
+	// created through them, instead of trying to read an unpublished revision
+	// from the store. Nil outside CommitBatch.
+	pendingNodes map[NodeID]*NodeRev
 	// blockCache keeps decoded rev blocks. A block is immutable and its nodes
 	// are decoded on demand, so sharing it is safe; without this every Resolve
 	// and ListDir copied the whole block and re-parsed its node table, which
@@ -632,6 +639,11 @@ func (r *Repo) GetNodeRev(id NodeID) (*NodeRev, error) {
 		return v, nil
 	}
 	r.nodeCacheMu.Unlock()
+	if r.pendingNodes != nil {
+		if nr, ok := r.pendingNodes[id]; ok {
+			return nr, nil
+		}
+	}
 	rb, err := r.readBlock(id.Rev)
 	if err != nil {
 		return nil, err
@@ -1883,8 +1895,15 @@ func (r *Repo) applyChange(root *tnode, ch *Change) error {
 				t.pagedRef = old.pagedRef
 				t.priorTableRef = old.pagedRef
 				t.priorChildren = old.children
+				// Merge rather than overwrite: an earlier change in the same
+				// commit may already have replaced or added a child of this
+				// directory, and copying old.children wholesale would silently
+				// revert it (a dump sends "modify file" and "modify parent dir"
+				// in one revision, in either order).
 				for n, c := range old.children {
-					t.children[n] = c
+					if _, exists := t.children[n]; !exists {
+						t.children[n] = c
+					}
 				}
 				if len(ch.Props) == 0 {
 					t.props = copyProps(old.props)
