@@ -169,10 +169,10 @@ else
   cp -a "$WORK/src1" "$WORK/badchain1"
   cp -a "$WORK/src2" "$WORK/badchain2"
   mirrorSpec "$WORK/badchain1" "$WORK/badchain2" "$WORK/bad.json"
-  REC=$(printf '%s/badchain1/repos/app/journal/%012d' "$WORK" 2)
+  REC=$(printf '%s/badchain1/repos/%s/journal/%012d' "$WORK" "$REPO" 2)
   [ -f "$REC" ] || fail "expected journal record at $REC"
   printf 'journal tampering test\n' > "$REC"
-  if "$SVNADMIN" dump --mirror-file "$WORK/bad.json" --verify --output "$WORK/bad.dump" app \
+  if "$SVNADMIN" dump --mirror-file "$WORK/bad.json" --verify --output "$WORK/bad.dump" "$REPO" \
         2> "$WORK/bad.log"; then
     fail "dump --verify accepted a damaged journal record"
   fi
@@ -185,9 +185,9 @@ else
   mirrorSpec "$WORK/gap1" "$WORK/gap2" "$WORK/gap.json"
   # Move the record out of the tree instead of deleting it: the drill only needs
     # the journal hole, and keeping the file makes the artifact inspectable.
-    mv "$(printf '%s/repos/app/journal/%012d' "$WORK/gap1" 2)" "$WORK/gap1-removed-journal-2"
-    mv "$(printf '%s/repos/app/journal/%012d' "$WORK/gap2" 2)" "$WORK/gap2-removed-journal-2"
-  if "$SVNADMIN" dump --mirror-file "$WORK/gap.json" --verify --output "$WORK/gap.dump" app \
+    mv "$(printf '%s/repos/%s/journal/%012d' "$WORK/gap1" "$REPO" 2)" "$WORK/gap1-removed-journal-2"
+    mv "$(printf '%s/repos/%s/journal/%012d' "$WORK/gap2" "$REPO" 2)" "$WORK/gap2-removed-journal-2"
+  if "$SVNADMIN" dump --mirror-file "$WORK/gap.json" --verify --output "$WORK/gap.dump" "$REPO" \
         2> "$WORK/gap.log"; then
     fail "dump --verify accepted a journal with a hole in it"
   fi
@@ -205,7 +205,7 @@ else
   [ -n "$BLOCK" ] || fail "could not locate the rev-block for HEAD $HEAD_SEED"
   printf 'corrupted' > "$BLOCK"
   if "$SVNADMIN" dump --mirror-file "$WORK/badhead.json" --verify \
-        --output "$WORK/bad2.dump" app 2> "$WORK/bad2.log"; then
+        --output "$WORK/bad2.dump" "$REPO" 2> "$WORK/bad2.log"; then
     fail "dump --verify accepted a corrupted HEAD"
   fi
   [ ! -f "$WORK/bad2.dump" ] || fail "a refused dump still produced a file"
@@ -216,7 +216,7 @@ step "negative control: load --expect-head rejects a wrong revision count"
 mkdir -p "$WORK/wrong1" "$WORK/wrong2"
 mirrorSpec "$WORK/wrong1" "$WORK/wrong2" "$WORK/wrong.json"
 if "$SVNADMIN" load --mirror-file "$WORK/wrong.json" --input "$WORK/app.dump" \
-      --expect-head "$((HEAD_SEED + 1))" app > /dev/null 2> "$WORK/expect.log"; then
+      --expect-head "$((HEAD_SEED + 1))" "$REPO" > /dev/null 2> "$WORK/expect.log"; then
   fail "load --expect-head accepted the wrong revision count"
 fi
 grep -q 'expected' "$WORK/expect.log" || { cat "$WORK/expect.log"; fail "expect-head refusal gave no diagnostic"; }
