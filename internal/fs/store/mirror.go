@@ -272,6 +272,10 @@ func NewMirror(mirrors []Store, opts ...MirrorOption) *MirrorStore {
 }
 
 // Close stops the background repair loop.
+// Mirrors exposes the member stores (GeoStore ships directly to remote
+// members; see geostore.go).
+func (m *MirrorStore) Mirrors() []Store { return m.mirrors }
+
 func (m *MirrorStore) Close() {
 	select {
 	case <-m.stop:
