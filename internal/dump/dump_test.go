@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"svngod/internal/cdc"
@@ -660,4 +661,55 @@ func dumpBytes(t *testing.T, r *fs.Repo) []byte {
 		t.Fatal(err)
 	}
 	return b.Bytes()
+}
+
+// TestDiffRevPrunesUnchangedSubtrees pins the pruning that keeps a dump linear
+// in history. diffRev must report exactly the changed paths, and must not walk
+// into subtrees whose nodes were inherited unchanged from an earlier revision.
+// A regression here is silent in output (the dump is still correct) but turns
+// every dump into a whole-tree walk per revision - quadratic in history, which
+// on a large repository means an unpredictable, multi-hour backup window.
+func TestDiffRevPrunesUnchangedSubtrees(t *testing.T) {
+	r := buildSourceRepo(t) // rev4 is a branch copy of /trunk
+	// Rev5 touches one deep file; nothing else changes.
+	if _, err := r.CommitTxn(4, []fs.Change{
+		{Path: "/branches/br1/a.txt", Action: fs.ActionModify, Kind: fs.KindFile, Data: []byte("changed deep")},
+	}, map[string]string{"svn:log": "deep edit"}); err != nil {
+		t.Fatal(err)
+	}
+
+	changes, err := diffRev(r, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only the file and its ancestors may appear.
+	want := map[string]bool{"/branches/br1/a.txt": true, "/branches/br1": true, "/branches": true}
+	for p := range changes {
+		if !want[p] {
+			t.Fatalf("diffRev reported unrelated path %q (pruning lost: whole tree walked)", p)
+		}
+	}
+	if changes["/branches/br1/a.txt"] != chModified {
+		t.Fatalf("expected /branches/br1/a.txt modified, got %v", changes["/branches/br1/a.txt"])
+	}
+	// The untouched /trunk subtree must not be visited at all.
+	for p := range changes {
+		if strings.HasPrefix(p, "/trunk") {
+			t.Fatalf("diffRev walked into untouched subtree %q", p)
+		}
+	}
+
+	// The dump of a pruned diff must still be complete: loading it into a fresh
+	// repository reproduces the source byte for byte.
+	src := dumpBytes(t, r)
+	dst, err := fs.CreateRepo(store.NewMemoryStore(), "repos/pruned", 4096, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Load(dst, bytes.NewReader(src)); err != nil {
+		t.Fatalf("load pruned dump: %v", err)
+	}
+	if got := dumpBytes(t, dst); !bytes.Equal(got, src) {
+		t.Fatal("round trip through a pruned diff is not byte-identical")
+	}
 }

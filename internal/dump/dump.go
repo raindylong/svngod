@@ -232,13 +232,29 @@ func writeNode(w io.Writer, repo *fs.Repo, rev uint64, path string, action chang
 }
 
 // diffRev returns the set of paths changed between rev-1 and rev.
+//
+// The walk is pruned: a directory child whose node-rev predates this revision
+// (child.ID.Rev < rev) was inherited unchanged, so nothing below it can have
+// changed in this revision. Only children rebuilt at rev are visited. A commit
+// marks every ancestor directory of a changed path dirty, so a path that did
+// change always has a fresh chain of ancestors down to it and is never pruned.
+//
+// Without the pruning a dump walks the whole tree once per revision. On a
+// 100k-revision repository that is quadratic in history: the observed rate
+// decayed to ~1 KB/s, turning a backup into a multi-hour, unpredictable job.
 func diffRev(repo *fs.Repo, rev uint64) (map[string]changeKind, error) {
 	if rev == 0 {
 		return map[string]changeKind{}, nil
 	}
 	out := map[string]changeKind{}
-	var walk func(prevRev, rev uint64, path string) error
 	childOf := func(path, name string) string { return strings.TrimSuffix(path, "/") + "/" + name }
+
+	// fresh reports whether a child node-rev was created by this revision.
+	// Anything older is an inherited reference: its subtree is unchanged
+	// relative to rev-1 by construction.
+	fresh := func(id fs.NodeID) bool { return id.Rev >= rev }
+
+	var walk func(prevRev, rev uint64, path string) error
 	walk = func(prevRev, rev uint64, path string) error {
 		cur, err := repo.Resolve(rev, path)
 		_, prevErr := repo.Resolve(prevRev, path)
@@ -291,6 +307,9 @@ func diffRev(repo *fs.Repo, rev uint64) (map[string]changeKind, error) {
 				out[path] = chModified
 			}
 			for _, c := range curCh {
+				if !fresh(c.ID) {
+					continue
+				}
 				if err := walk(prevRev, rev, childOf(path, c.Name)); err != nil {
 					return err
 				}
@@ -306,6 +325,9 @@ func diffRev(repo *fs.Repo, rev uint64) (map[string]changeKind, error) {
 		}
 		return nil
 	}
+
+	// The root is rebuilt every revision (it holds the child table), so the
+	// walk starts there unconditionally.
 	if err := walk(rev-1, rev, "/"); err != nil {
 		return nil, err
 	}
