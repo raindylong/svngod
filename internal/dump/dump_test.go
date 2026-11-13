@@ -601,3 +601,63 @@ func TestLoadBatchResumesAcrossBoundary(t *testing.T) {
 	}
 	assertSameTree(t, src, dst)
 }
+
+// TestLoadManyBatchesMatchSequentialImport runs a load that spans several
+// batches (600 revisions at 200 per commit) and
+// requires the result to equal a sequential import. The 10k-revision S3 run
+// showed batch size is the main throughput lever; this keeps the larger default
+// honest on correctness, where a per-batch regression would be invisible in a
+// two- or three-revision fixture.
+func TestLoadManyBatchesMatchSequentialImport(t *testing.T) {
+	if testing.Short() {
+		t.Skip("multi-batch import")
+	}
+	const n = 600
+	src := buildPrefixRepo(t, "", "repos/mbsrc", n)
+	var buf bytes.Buffer
+	if err := Dump(src, &buf); err != nil {
+		t.Fatal(err)
+	}
+	// Control: the historical per-revision path.
+	prev := SetLoadBatchSize(1)
+	seqRepo, err := fs.CreateRepo(store.NewMemoryStore(), "repos/mbseq", 4096, 64)
+	if err != nil {
+		SetLoadBatchSize(prev)
+		t.Fatal(err)
+	}
+	if err := Load(seqRepo, bytes.NewReader(buf.Bytes())); err != nil {
+		SetLoadBatchSize(prev)
+		t.Fatalf("sequential: %v", err)
+	}
+	seqDump := dumpBytes(t, seqRepo)
+
+	// Batched, spanning several batches of 200 so the test stays quick while
+	// still crossing batch boundaries repeatedly.
+	SetLoadBatchSize(200)
+	defer SetLoadBatchSize(prev)
+	batRepo, err := fs.CreateRepo(store.NewMemoryStore(), "repos/mbbat", 4096, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Load(batRepo, bytes.NewReader(buf.Bytes())); err != nil {
+		t.Fatalf("batched: %v", err)
+	}
+	if h, _ := batRepo.Head(); h != n {
+		t.Fatalf("head=%d want %d", h, n)
+	}
+	if got := dumpBytes(t, batRepo); !bytes.Equal(got, seqDump) {
+		t.Fatalf("batched import differs from sequential (%d vs %d bytes)", len(got), len(seqDump))
+	}
+}
+
+// dumpBytes re-dumps a repository, so two imports can be compared byte for byte
+// (the strongest equivalence check: props, tree shape, text and ordering all
+// have to match).
+func dumpBytes(t *testing.T, r *fs.Repo) []byte {
+	t.Helper()
+	var b bytes.Buffer
+	if err := Dump(r, &b); err != nil {
+		t.Fatal(err)
+	}
+	return b.Bytes()
+}

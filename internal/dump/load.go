@@ -349,12 +349,18 @@ func readHeaders(br *bufio.Reader) (map[string]string, error) {
 // call. One batch costs one commit lease, one WAL record and one HEAD CAS
 // regardless of size, so batching is the main lever for restoring over a
 // high-latency store. A variable so svnadmin can expose it.
-// The default trades throughput against memory: one batch holds every revision
-// block it built until the single publish, and on the S3 lab raising it from 64
-// to 256 took a 1000-revision restore from ~34s to ~13s. 256 keeps a batch's
-// blocks well under a few MB for ordinary trees while still amortising the
-// lease/WAL/CAS cost; --batch overrides it.
-var loadBatchSize = 256
+// loadBatchSize is the default number of revisions per CommitBatch call.
+//
+// Measured on the two-instance S3 lab with a 10000-revision repository (3.4 MB
+// dump): batch 64 -> 312 s, 256 -> 108 s, 512 -> 66 s, 1000 -> 43 s,
+// 5000 -> 31 s; peak RSS was 53 / 69 / 101 MB for 256 / 1000 / 5000. Memory
+// grows with the number of nodes in a batch, not with text size: texts above
+// 4 MiB are stored as chunk manifests and bodies above 8 MiB are spooled to
+// disk, so a large batch of ordinary revisions stays well under 100 MB.
+//
+// 1000 keeps the restore close to the knee (43 s for 10k revisions, ~233 rev/s)
+// while leaving a wide margin; --batch N overrides it either way.
+var loadBatchSize = 1000
 
 // SetLoadBatchSize overrides the revisions per commit used by load (<=1 keeps
 // the historical per-revision behaviour). Returns the previous value.
