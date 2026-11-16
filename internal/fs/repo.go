@@ -138,13 +138,6 @@ type Repo struct {
 	blockCacheMu sync.Mutex
 	blockCache   map[uint64]*RevBlock
 	blockBytes   int
-	// blockSeq/blockSize/clock implement LRU eviction: blockSeq records the
-	// touch order, blockSize the byte cost per entry. Without them an overflow
-	// had to reset the whole map, which makes a sequential scan over a history
-	// larger than blockCacheBudget miss on every revision.
-	blockSeq  map[uint64]uint64
-	blockSize map[uint64]int
-	clock     uint64
 
 	// Parsed revprops packs, keyed by shard. A packed revprops object holds up
 	// to shardSz revisions; fetching it per revision made svn log O(pack size)
@@ -224,62 +217,15 @@ func (r *Repo) storeBlock(rev uint64, rb *RevBlock, size int) {
 	defer r.blockCacheMu.Unlock()
 	if r.blockCache == nil {
 		r.blockCache = map[uint64]*RevBlock{}
-		r.blockSeq = make(map[uint64]uint64)
-		r.blockSize = make(map[uint64]int)
 	}
-	// Evict least-recently-used blocks instead of dropping the whole cache.
-	// A full reset turns any sequential scan (dump, verify, load) that exceeds
-	// the budget into a cache-thrashing loop: every revision misses, so the
-	// cost per revision grows with the size of the history rather than staying
-	// flat. Evicting a slice of the oldest entries keeps recently walked
-	// revisions resident, which is exactly the access pattern of those scans.
 	if r.blockBytes+size > blockCacheBudget {
-		r.evictOldestBlocks(size)
+		r.blockCache = map[uint64]*RevBlock{}
+		r.blockBytes = 0
 	}
 	if _, ok := r.blockCache[rev]; !ok {
 		r.blockBytes += size
-		r.blockSize[rev] = size
 	}
 	r.blockCache[rev] = rb
-	r.clock++
-	r.blockSeq[rev] = r.clock
-}
-
-// evictOldestBlocks drops the oldest-touched entries until size fits.
-// Called with blockCacheMu held.
-func (r *Repo) evictOldestBlocks(size int) {
-	target := blockCacheBudget - size
-	if target < 0 {
-		target = 0
-	}
-	type kv struct {
-		rev uint64
-		seq uint64
-	}
-	order := make([]kv, 0, len(r.blockSeq))
-	for rv, sq := range r.blockSeq {
-		order = append(order, kv{rv, sq})
-	}
-	sort.Slice(order, func(i, j int) bool { return order[i].seq < order[j].seq })
-	for _, e := range order {
-		if r.blockBytes <= target {
-			break
-		}
-		if b, ok := r.blockCache[e.rev]; ok {
-			_ = b
-			r.blockBytes -= r.blockSize[e.rev]
-			delete(r.blockCache, e.rev)
-			delete(r.blockSeq, e.rev)
-			delete(r.blockSize, e.rev)
-		}
-	}
-	// Nothing tracked (legacy entries): fall back to a full reset.
-	if r.blockBytes > target {
-		r.blockCache = map[uint64]*RevBlock{}
-		r.blockSeq = make(map[uint64]uint64)
-		r.blockSize = make(map[uint64]int)
-		r.blockBytes = 0
-	}
 }
 
 // CreateRepo writes a fresh repository with the default chunk profile.
