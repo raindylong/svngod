@@ -279,34 +279,45 @@ func diffRev(repo *fs.Repo, rev uint64) (map[string]changeKind, error) {
 	// relative to rev-1 by construction.
 	fresh := func(id fs.NodeID) bool { return id.Rev >= rev }
 
+	// Resolve each side once per path. The previous shape called Resolve on
+	// prevRev twice and then ListDir (which resolves again) for every
+	// directory, so a single changed file cost a dozen segment lookups. On a
+	// 1M-revision repository each miss is milliseconds, which made dump
+	// ~19x slower at the tail of the history than at the start.
+	children := func(nr *fs.NodeRev) ([]fs.Child, error) {
+		if nr == nil || nr.Kind != fs.KindDir {
+			return nil, nil
+		}
+		return repo.DirChildren(nr)
+	}
+
 	var walk func(prevRev, rev uint64, path string) error
 	walk = func(prevRev, rev uint64, path string) error {
 		cur, err := repo.Resolve(rev, path)
-		_, prevErr := repo.Resolve(prevRev, path)
+		prev, perr := repo.Resolve(prevRev, path)
 		switch {
-		case err == nil && prevErr != nil:
+		case err == nil && perr != nil:
 			out[path] = chAdded
 			if cur.Kind == fs.KindDir {
-				children, _ := repo.ListDir(rev, path)
-				for _, c := range children {
+				ch, _ := children(cur)
+				for _, c := range ch {
 					if err := walk(prevRev, rev, childOf(path, c.Name)); err != nil {
 						return err
 					}
 				}
 			}
 			return nil
-		case err != nil && prevErr == nil:
+		case err != nil && perr == nil:
 			out[path] = chDeleted
 			return nil
-		case err != nil && prevErr != nil:
+		case err != nil && perr != nil:
 			return nil
 		}
-		prev, _ := repo.Resolve(prevRev, path)
 		if cur.Kind != prev.Kind {
 			out[path] = chReplaced
 			if cur.Kind == fs.KindDir {
-				children, _ := repo.ListDir(rev, path)
-				for _, c := range children {
+				ch, _ := children(cur)
+				for _, c := range ch {
 					if err := walk(prevRev, rev, childOf(path, c.Name)); err != nil {
 						return err
 					}
@@ -315,8 +326,8 @@ func diffRev(repo *fs.Repo, rev uint64) (map[string]changeKind, error) {
 			return nil
 		}
 		if cur.Kind == fs.KindDir {
-			curCh, _ := repo.ListDir(rev, path)
-			prevCh, _ := repo.ListDir(prevRev, path)
+			curCh, _ := children(cur)
+			prevCh, _ := children(prev)
 			names := map[string]bool{}
 			for _, c := range curCh {
 				names[c.Name] = true

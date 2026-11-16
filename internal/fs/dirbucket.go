@@ -200,6 +200,11 @@ func (r *Repo) dirChild(nr *NodeRev, name string) (Child, bool, error) {
 	return Child{}, false, nil
 }
 
+// DirChildren exposes dirChildren for callers that already resolved the
+// directory node-rev and would otherwise pay a second Resolve (the dump's
+// revision walk resolves each side once and reuses it).
+func (r *Repo) DirChildren(nr *NodeRev) ([]Child, error) { return r.dirChildren(nr) }
+
 // dirChildren materializes every child of a directory node.
 func (r *Repo) dirChildren(nr *NodeRev) ([]Child, error) {
 	t, err := r.dirTableOf(nr)
