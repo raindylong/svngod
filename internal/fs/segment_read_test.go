@@ -306,3 +306,36 @@ func TestVerifyReadsSegmentOnce(t *testing.T) {
 		t.Fatalf("verify read the segment %d times for 32 revisions", calls)
 	}
 }
+
+// TestRevisitedSegmentIsSequential pins down the sequential-read hint.
+//
+// A walk over a long history revisits older segments through ancestor lookups,
+// and those revisits are interleaved with sequential reads. Only the
+// continuation test used to qualify, so a revisited segment stayed on the
+// ranged path for every read (measured: 61 of 253 segments in a 100k-revision
+// range of a 1M-revision repository, ~12k single-entry GETs). The hint must
+// therefore also accept a segment it has already seen during this scan.
+func TestRevisitedSegmentIsSequential(t *testing.T) {
+	r := &Repo{}
+	const seg = "repos/x/segs/0000000000/000000000001-000000000004.seg"
+
+	// The first read of a segment is not a continuation: it takes the ranged
+	// path and only becomes known.
+	if r.noteSegmentRead(seg, 1) != false {
+		t.Fatal("first read of an unknown segment must not be sequential")
+	}
+	if r.noteSegmentRead(seg, 99) != true {
+		t.Fatal("revisit of a known segment must qualify as sequential")
+	}
+	// A different segment has not been seen: not sequential, but now known.
+	if r.noteSegmentRead("other.seg", 5) != false {
+		t.Fatal("first read of an unknown segment must not be sequential")
+	}
+	if r.noteSegmentRead("other.seg", 7) != true {
+		t.Fatal("revisit of the second segment must qualify")
+	}
+	// The plain continuation case still works.
+	if r.noteSegmentRead(seg, 100) != true {
+		t.Fatal("contiguous read of the current segment must qualify")
+	}
+}
