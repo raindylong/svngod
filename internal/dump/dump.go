@@ -30,9 +30,22 @@ const (
 
 // Dump writes the repository (revs 1..HEAD) to w in svn dump v2 format.
 func Dump(repo *fs.Repo, w io.Writer) error {
+	return DumpRange(repo, w, 1, 0)
+}
+
+// DumpRange writes revisions [from, to] (to=0 means HEAD) in svn dump v2
+// format. Splitting a large history into ranges is how an operator keeps a
+// backup window bounded and can resume after an interrupted run.
+func DumpRange(repo *fs.Repo, w io.Writer, from, to uint64) error {
 	head, err := repo.Head()
 	if err != nil {
 		return err
+	}
+	if from == 0 {
+		from = 1
+	}
+	if to == 0 || to > head {
+		to = head
 	}
 	if _, err := io.WriteString(w, "SVN-fs-dump-format-version: 2\n\n"); err != nil {
 		return err
@@ -45,7 +58,7 @@ func Dump(repo *fs.Repo, w io.Writer) error {
 			return err
 		}
 	}
-	for rev := uint64(1); rev <= head; rev++ {
+	for rev := from; rev <= to; rev++ {
 		if err := dumpRevision(repo, w, rev); err != nil {
 			return fmt.Errorf("dump rev %d: %w", rev, err)
 		}

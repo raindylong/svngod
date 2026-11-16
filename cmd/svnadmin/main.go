@@ -260,6 +260,8 @@ func main() {
 	if cmd == "dump" {
 		fs.StringVar(&output, "output", "", "write dump to file (default stdout)")
 		fs.BoolVar(&o.dumpVerify, "verify", false, "before dumping: check journal hash chain and HEAD readability, abort on corruption")
+		fs.Uint64Var(&o.loadFrom, "from", 0, "first revision to export (0 = 1)")
+		fs.Uint64Var(&o.loadTo, "to", 0, "last revision to export (0 = HEAD)")
 	}
 	if cmd == "load" {
 		fs.BoolVar(&o.progress, "progress", false, "print progress to stderr every 5s")
@@ -1306,7 +1308,7 @@ func doDump(o *options, repoName, output string) {
 		w = io.MultiWriter(f, h)
 	}
 	cw := &countingWriter{w: w}
-	if err := dump.Dump(repo, cw); err != nil {
+	if err := dump.DumpRange(repo, cw, o.loadFrom, o.loadTo); err != nil {
 		if f != nil {
 			f.Close()
 			fmt.Fprintf(os.Stderr, "dump: incomplete stream left at %s (not a usable backup)\n", partial)
