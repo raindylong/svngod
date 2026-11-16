@@ -23,7 +23,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"runtime/pprof"
 	"sort"
 	"strings"
 	"sync"
@@ -174,13 +173,6 @@ func (o *options) mirrorStore(name string) (store.Store, string, error) {
 }
 
 func main() {
-	if p := os.Getenv("SVNGOD_CPUPROFILE"); p != "" {
-		if f, err := os.Create(p); err == nil {
-			_ = pprof.StartCPUProfile(f)
-			defer pprof.StopCPUProfile()
-			defer f.Close()
-		}
-	}
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
@@ -1330,11 +1322,6 @@ func doDump(o *options, repoName, output string) {
 	// The manifest goes to stderr so `dump > file` on stdout stays clean.
 	fmt.Fprintf(os.Stderr, "dump: repo=%s head=%d bytes=%d sha256=%s\n",
 		repoName, head, cw.n, hex.EncodeToString(h.Sum(nil)))
-	if os.Getenv("SVNGOD_DBG_DUMP") != "" {
-		st := repo.CacheStats()
-		fmt.Fprintf(os.Stderr, "dump: cache blockHits=%d blockMisses=%d segHits=%d segMisses=%d\n",
-			st.BlockHits, st.BlockMisses, st.SegmentHits, st.SegmentMisses)
-	}
 }
 
 func doLoad(o *options, repoName, input string) {
