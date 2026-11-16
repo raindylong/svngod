@@ -205,11 +205,12 @@ func (r *Repo) initCompaction() {
 			r.segMetas = newSegMetaCache(256)
 		}
 		if r.segDecoded == nil {
-			// Holds two segments plus headroom. A dump/verify walk alternates
-			// between revision n and n-1, and those can straddle a segment
-			// boundary; with exactly two slots the straddling pair evicted each
-			// other on every step. Segments average ~0.5 MiB, so 8 is ~4 MiB.
-			r.segDecoded = newSegDecodeCache(8)
+			// A dump/verify walk alternates between revision n and n-1, and the
+			// two can straddle a segment boundary. The tail of a long history
+			// spans many segments, so a small cache re-decoded them constantly
+			// (measured 32k segment misses per 100k revisions near HEAD versus
+			// 75 at the start). Segments average ~0.5 MiB, so 64 is ~32 MiB.
+			r.segDecoded = newSegDecodeCache(64)
 		}
 	}
 }
