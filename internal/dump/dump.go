@@ -146,6 +146,9 @@ func dumpRevision(repo *fs.Repo, w io.Writer, rev uint64) error {
 			return err
 		}
 	}
+	if dbg && rev%50000 == 0 {
+		fmt.Fprintf(os.Stderr, "dbg rev=%d nodes=%v npaths=%d\n", rev, time.Since(t2), len(paths))
+	}
 
 	fmt.Fprintf(w, "Revision-number: %d\n", rev)
 	fmt.Fprintf(w, "Prop-content-length: %d\n", len(revPropsText))
