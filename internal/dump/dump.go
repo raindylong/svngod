@@ -12,8 +12,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"svngod/internal/fs"
 )
@@ -67,13 +69,20 @@ func DumpRange(repo *fs.Repo, w io.Writer, from, to uint64) error {
 }
 
 func dumpRevision(repo *fs.Repo, w io.Writer, rev uint64) error {
+	dbg := os.Getenv("SVNGOD_DBG_DUMP") != ""
+	t0 := time.Now()
 	rp, err := repo.GetRevProps(rev)
 	if err != nil {
 		return err
 	}
+	t1 := time.Now()
 	changes, err := diffRev(repo, rev)
 	if err != nil {
 		return err
+	}
+	t2 := time.Now()
+	if dbg && rev%50000 == 0 {
+		fmt.Fprintf(os.Stderr, "dbg rev=%d props=%v diff=%v\n", rev, t1.Sub(t0), t2.Sub(t1))
 	}
 	revPropsText := encodeProps(rp.Props)
 
