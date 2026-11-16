@@ -170,9 +170,19 @@ func LoadRangeProgress(repo *fs.Repo, r io.Reader, from, to uint64, progress fun
 		if err != nil {
 			return err
 		}
-		for _, rv := range revs {
+		for i, rv := range revs {
 			if rv == 0 {
-				return fmt.Errorf("dump: batch commit returned an empty revision")
+				// Part of this batch was published and part was not. Revision
+				// numbers are contiguous, so the target now holds a prefix of
+				// the dump with a gap where this request was rejected - the
+				// history is no longer a valid import and must not be resumed
+				// blindly. Say so explicitly: the caller needs to know the
+				// repository is damaged, not merely that load stopped.
+				reason := "unknown"
+				if i < len(errs) && errs[i] != nil {
+					reason = errs[i].Error()
+				}
+				return fmt.Errorf("dump: batch partially applied (%s); target head is %d and history is incomplete - re-create the repository and load again", reason, lastRev)
 			}
 			lastRev = rv
 			if progress != nil {
