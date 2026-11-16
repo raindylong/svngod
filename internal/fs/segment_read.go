@@ -118,22 +118,38 @@ type segMetaCache struct {
 	limit int
 }
 
-// segDecodeCache holds fully decoded segments (last few touched). Sequential
-// scans (log, blame, dump, verify) read every revision of a segment; without
-// this each revision re-decoded the whole object.
+// segDecodeCache holds fully decoded segments under a byte budget, evicting
+// the least recently used. Sequential scans (log, blame, dump, verify) read
+// every revision of a segment and revisit older segments while resolving
+// inherited directory nodes, so the working set is a few hundred segments
+// (~0.5 MiB each) rather than one or two; an entry-count limit made those
+// revisits miss and fall back to a ranged GET plus a full deserialisation.
 type segDecodeCache struct {
-	mu    sync.Mutex
-	items map[string]*segmentData
-	order []string
-	limit int
+	mu     sync.Mutex
+	items  map[string]*segmentData
+	order  []string
+	budget int64
+	bytes  int64
 }
 
 func newSegMetaCache(limit int) *segMetaCache {
 	return &segMetaCache{items: map[string]*segMeta{}, limit: limit}
 }
 
-func newSegDecodeCache(limit int) *segDecodeCache {
-	return &segDecodeCache{items: map[string]*segmentData{}, limit: limit}
+func newSegDecodeCache(budgetBytes int64) *segDecodeCache {
+	return &segDecodeCache{items: map[string]*segmentData{}, budget: budgetBytes}
+}
+
+// sizeOf reports the decoded footprint of a segment, used for the byte budget.
+func (s *segmentData) sizeOf() int64 {
+	n := int64(0)
+	for _, b := range s.Blocks {
+		n += int64(len(b))
+	}
+	for _, p := range s.Props {
+		n += int64(len(p))
+	}
+	return n
 }
 
 func (c *segMetaCache) get(key string) *segMeta {
@@ -183,14 +199,23 @@ func (c *segDecodeCache) get(key string) *segmentData {
 func (c *segDecodeCache) put(key string, s *segmentData) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, ok := c.items[key]; !ok {
+	if old, ok := c.items[key]; ok {
+		c.bytes -= old.sizeOf()
+	} else {
 		c.order = append(c.order, key)
 	}
 	c.items[key] = s
-	for len(c.order) > c.limit {
+	c.bytes += s.sizeOf()
+	// Evict least recently used until the budget is met. Keep at least one
+	// entry so a single oversized segment is still cached and served from
+	// memory rather than re-decoded on every revision it covers.
+	for c.bytes > c.budget && len(c.order) > 1 {
 		old := c.order[0]
 		c.order = c.order[1:]
-		delete(c.items, old)
+		if e, ok := c.items[old]; ok {
+			c.bytes -= e.sizeOf()
+			delete(c.items, old)
+		}
 	}
 }
 

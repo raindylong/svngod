@@ -205,12 +205,11 @@ func (r *Repo) initCompaction() {
 			r.segMetas = newSegMetaCache(256)
 		}
 		if r.segDecoded == nil {
-			// A dump/verify walk alternates between revision n and n-1, and the
-			// two can straddle a segment boundary. The tail of a long history
-			// spans many segments, so a small cache re-decoded them constantly
-			// (measured 32k segment misses per 100k revisions near HEAD versus
-			// 75 at the start). Segments average ~0.5 MiB, so 64 is ~32 MiB.
-			r.segDecoded = newSegDecodeCache(64)
+			// Budget, not entry count: a walk revisits a few hundred segments
+			// while resolving inherited directory nodes, and their sizes vary.
+			// 128 MiB covers the measured working set of a 1M-revision range
+			// with headroom while staying well under the process's other caches.
+			r.segDecoded = newSegDecodeCache(128 << 20)
 		}
 	}
 }
@@ -418,25 +417,51 @@ func (r *Repo) segmentEntry(rev uint64, fresh bool) ([]byte, []byte, error) {
 	}
 	seg, err := r.loadSegment(*ref)
 	if err != nil {
+		// The whole-object path verifies the segment digest, so one corrupt
+		// entry makes every revision it covers unreadable. Fall back to the
+		// ranged path, which decodes and checks only the requested entry, so a
+		// damaged entry does not take its neighbours down with it. The failure
+		// still surfaces when the damaged revision itself is read.
+		if block, props, rerr := r.readSegmentEntry(context.Background(), *ref, rev-ref.First); rerr == nil {
+			return block, props, nil
+		}
 		return nil, nil, err
 	}
 	r.segDecoded.put(objKey, seg)
 	return segmentEntryAt(seg, rev, ref)
 }
 
-// noteSegmentRead reports whether rev continues the previous read of this
-// segment, and records it as the new tail.
+// noteSegmentRead reports whether reading rev from objKey should pull the
+// whole segment instead of a single ranged entry.
 //
-// A backwards step (rev+1 -> rev) counts as sequential too: a dump compares
-// revision n against n-1 for every n, so the access pattern alternates
-// n, n-1, n+1, n, ... Treating only strictly forward steps as sequential made
-// every one of those reads a separate ranged GET plus a full deserialisation
-// of the covering segment (0.5 MiB on a 1M-revision repository), which is pure
-// CPU waste and made dump superlinear in the size of the history.
+// Two cases qualify. The first is a continuation: rev follows the previous
+// read of the same segment (a forward step, or one step back, because a dump
+// compares revision n against n-1 so the pattern alternates n, n-1, n+1, n).
+//
+// The second case is a segment that has been touched before and is still in
+// seqRecent. A walk over a long history revisits the same segments repeatedly
+// through ancestor lookups (resolving a deep path reads directory nodes
+// inherited from much older revisions), and those revisits are interleaved
+// with otherwise-sequential reads, so the continuation test alone never fires
+// for them. Measured on a 1M-revision repository, 61 of 253 segments in a
+// 100k-revision range were only ever reached that way: they stayed on the
+// ranged path forever and accounted for ~12k single-entry GETs plus a full
+// segment deserialisation each time.
 func (r *Repo) noteSegmentRead(objKey string, rev uint64) bool {
 	r.seqMu.Lock()
 	defer r.seqMu.Unlock()
-	seq := r.seqKey == objKey && (r.seqNext == rev || r.seqNext == rev+2)
+	if r.seqRecent == nil {
+		r.seqRecent = make(map[string]bool, 512)
+	}
+	seq := (r.seqKey == objKey && (r.seqNext == rev || r.seqNext == rev+2)) || r.seqRecent[objKey]
+	if !r.seqRecent[objKey] {
+		if len(r.seqRecent) >= 512 {
+			// Bounded: the hint is an optimisation, and a full scan of a huge
+			// history would otherwise grow it without limit.
+			clear(r.seqRecent)
+		}
+		r.seqRecent[objKey] = true
+	}
 	r.seqKey, r.seqNext = objKey, rev+1
 	return seq
 }

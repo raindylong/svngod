@@ -83,10 +83,13 @@ type Repo struct {
 	segCacheMisses   atomic.Uint64
 	// Revisions published by WAL replay (crash-recovery roll-forwards).
 	journalReplayed atomic.Uint64
-	// seqMu guards the sequential-read hint: same segment, previous revision.
-	seqMu   sync.Mutex
-	seqKey  string
-	seqNext uint64
+	// seqMu guards the sequential-read hint. seqRecent holds the segments
+	// touched most recently (most recent last); seqNext is the revision that
+	// would continue seqKey.
+	seqMu     sync.Mutex
+	seqKey    string
+	seqNext   uint64
+	seqRecent map[string]bool
 	// segRepairAt rate-limits read-triggered index rebuilds per shard.
 	segRepairMu sync.Mutex
 	segRepairAt map[uint64]time.Time
