@@ -205,7 +205,11 @@ func (r *Repo) initCompaction() {
 			r.segMetas = newSegMetaCache(256)
 		}
 		if r.segDecoded == nil {
-			r.segDecoded = newSegDecodeCache(2)
+			// Holds two segments plus headroom. A dump/verify walk alternates
+			// between revision n and n-1, and those can straddle a segment
+			// boundary; with exactly two slots the straddling pair evicted each
+			// other on every step. Segments average ~0.5 MiB, so 8 is ~4 MiB.
+			r.segDecoded = newSegDecodeCache(8)
 		}
 	}
 }
@@ -421,10 +425,17 @@ func (r *Repo) segmentEntry(rev uint64, fresh bool) ([]byte, []byte, error) {
 
 // noteSegmentRead reports whether rev continues the previous read of this
 // segment, and records it as the new tail.
+//
+// A backwards step (rev+1 -> rev) counts as sequential too: a dump compares
+// revision n against n-1 for every n, so the access pattern alternates
+// n, n-1, n+1, n, ... Treating only strictly forward steps as sequential made
+// every one of those reads a separate ranged GET plus a full deserialisation
+// of the covering segment (0.5 MiB on a 1M-revision repository), which is pure
+// CPU waste and made dump superlinear in the size of the history.
 func (r *Repo) noteSegmentRead(objKey string, rev uint64) bool {
 	r.seqMu.Lock()
 	defer r.seqMu.Unlock()
-	seq := r.seqKey == objKey && r.seqNext == rev
+	seq := r.seqKey == objKey && (r.seqNext == rev || r.seqNext == rev+2)
 	r.seqKey, r.seqNext = objKey, rev+1
 	return seq
 }
