@@ -2356,7 +2356,11 @@ func (r *Repo) collectTxnDataGrace(ctx context.Context, grace time.Duration, dry
 			activityIDs[strings.TrimSuffix(strings.TrimPrefix(rel, "activity-"), ".json")] = true
 			b, err := r.store.Get(ctx, o.Key, nil)
 			if err != nil {
-				continue
+				// Fail closed: an unreadable manifest hides every data object
+				// it references, and those bodies are user content that cannot
+				// be rebuilt. Skipping it would silently delete a live commit
+				// session's uploads.
+				return 0, fmt.Errorf("gc: cannot read activity manifest %s: %w", o.Key, err)
 			}
 			for _, m := range refRe.FindAllSubmatch(b, -1) {
 				referenced[string(m[1])] = true
@@ -2411,13 +2415,14 @@ func tooYoung(o store.ListedObj, grace time.Duration) bool {
 type textRefs struct {
 	texts, chunks, dirs map[string]bool
 	dirScanOK           bool
+	chunkScanOK         bool
 }
 
 // collectTextRefs builds the reference sets for revisions [from,to].
 func (r *Repo) collectTextRefs(from, to uint64) (textRefs, error) {
 	out := textRefs{
 		texts: map[string]bool{}, chunks: map[string]bool{}, dirs: map[string]bool{},
-		dirScanOK: true,
+		dirScanOK: true, chunkScanOK: true,
 	}
 	for rev := from; rev <= to; rev++ {
 		rb, err := r.readBlock(rev)
@@ -2433,10 +2438,19 @@ func (r *Repo) collectTextRefs(from, to uint64) (textRefs, error) {
 				out.texts[nr.TextRef] = true
 			}
 			if nr.Kind == KindFile && nr.TextRep == TextRepChunked {
-				if crefs, err := cdc.Parse(nr.Text); err == nil {
-					for _, ref := range crefs {
-						out.chunks[cdc.HashHex(ref)] = true
-					}
+				crefs, cerr := cdc.Parse(nr.Text)
+				if cerr != nil {
+					// Fail closed, like the dir scan below: an unparseable
+					// manifest hides every chunk this revision references, and
+					// a chunk is unrecoverable once deleted while the manifest
+					// itself can be rebuilt. Skipping the node silently would
+					// turn a single damaged manifest into the loss of its data.
+					log.Printf("gc: cannot parse chunk manifest at rev %d: %v", rev, cerr)
+					out.chunkScanOK = false
+					continue
+				}
+				for _, ref := range crefs {
+					out.chunks[cdc.HashHex(ref)] = true
 				}
 			}
 			if nr.Kind == KindDir && nr.TextRep == TextRepExternal && nr.TextRef != "" {
@@ -2513,6 +2527,7 @@ func (r *Repo) CollectTextsGraceProgress(ctx context.Context, grace time.Duratio
 	chunkRefs := map[string]bool{}
 	dirRefs := map[string]bool{}
 	dirScanOK := true
+	chunkScanOK := true
 	for i := range parts {
 		if partErrs[i] != nil {
 			return 0, partErrs[i]
@@ -2528,6 +2543,9 @@ func (r *Repo) CollectTextsGraceProgress(ctx context.Context, grace time.Duratio
 		}
 		if !parts[i].dirScanOK {
 			dirScanOK = false
+		}
+		if !parts[i].chunkScanOK {
+			chunkScanOK = false
 		}
 	}
 	if progress != nil {
@@ -2557,27 +2575,33 @@ func (r *Repo) CollectTextsGraceProgress(ctx context.Context, grace time.Duratio
 		}
 		next = n
 	}
-	chunkPrefix := r.keys.ListingPrefix("chunks")
-	next = ""
-	for {
-		objs, n, err := r.store.ListPrefix(ctx, chunkPrefix, next, 500)
-		if err != nil {
-			return 0, err
-		}
-		for _, o := range objs {
-			ref := strings.TrimPrefix(o.Key, chunkPrefix)
-			if !chunkRefs[ref] {
-				if tooYoung(o, grace) {
-					continue
-				}
-				victims = append(victims, o.Key)
-				victimBytes += o.Size
+	if chunkScanOK {
+		chunkPrefix := r.keys.ListingPrefix("chunks")
+		next = ""
+		for {
+			objs, n, err := r.store.ListPrefix(ctx, chunkPrefix, next, 500)
+			if err != nil {
+				return 0, err
 			}
+			for _, o := range objs {
+				ref := strings.TrimPrefix(o.Key, chunkPrefix)
+				if !chunkRefs[ref] {
+					if tooYoung(o, grace) {
+						continue
+					}
+					victims = append(victims, o.Key)
+					victimBytes += o.Size
+				}
+			}
+			if n == "" {
+				break
+			}
+			next = n
 		}
-		if n == "" {
-			break
-		}
-		next = n
+	} else if !dryRun {
+		// Do not delete chunks when any manifest was unreadable: the reference
+		// set is incomplete and would include live data.
+		return 0, errors.New("gc: chunk reference scan incomplete (unparseable manifest); refusing to collect chunks")
 	}
 	if dirScanOK {
 		dirPrefix := r.keys.ListingPrefix("dirs")

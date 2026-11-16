@@ -301,8 +301,31 @@ func (r *Repo) segmentKeepSet(head uint64) (map[string]bool, error) {
 		if err != nil {
 			return nil, err
 		}
+		// A missing index reads as "no segments" (ErrNotFound maps to nil), so
+		// an index object lost to storage corruption would make every segment
+		// of that shard look unreferenced - the sweep would delete a whole
+		// shard of history. Require the index to cover the shard contiguously
+		// before trusting it as a keep set.
+		want := sh * r.shardSz
+		if want < r.segmentFrom {
+			want = r.segmentFrom
+		}
+		last := (sh+1)*r.shardSz - 1
+		if last > head {
+			last = head
+		}
+		next := want
 		for _, ref := range refs {
+			if ref.Count == 0 || ref.First != next {
+				return nil, fmt.Errorf("gc: segment index %d does not cover revision %d (next segment starts at %d); refusing to collect segments",
+					sh, next, ref.First)
+			}
+			next = ref.First + ref.Count
 			keep[normalizeListKey(r.segmentKeyFor(ref.First, ref.Count))] = true
+		}
+		if next <= last {
+			return nil, fmt.Errorf("gc: segment index %d ends at %d but HEAD needs %d; refusing to collect segments",
+				sh, next-1, last)
 		}
 	}
 	return keep, nil
