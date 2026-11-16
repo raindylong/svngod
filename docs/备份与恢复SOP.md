@@ -275,9 +275,19 @@ svnadmin info ... myrepo | grep head   # 少于清单 head
 
 RPO/RTO 参考（实测于两节点 mirror）：日备 RPO ≤ 24h。
 RTO 由备份窗口（dump）与恢复窗口（load + verify）构成。
-10 万修订实测：dump 15.2 s、load 513.8 s（默认 batch 1000）、
-`verify --all-revs --texts` 7.65 s，峰值内存 152 MB。
-**百万级仍未在此环境实测**：dump 已近线性，load 在 10 万级速率略降（233 → 195 rev/s）
-但未塌陷；不要按千修订数字直接线性外推，应在目标数据量上标定后再承诺 RTO。
+
+| 规模 | dump | load（batch 1000） | verify --texts | load 峰值内存 |
+|---|---|---|---|---|
+| 10 万 | 15.2 s | 513.8 s | 7.65 s | 152 MB |
+| 100 万 | 163.2 s | 3658.1 s | 83.7 s | 1008 MB |
+
+百万级已实测：dump 356 MB、恢复后 re-dump sha256 与源仓一致。
+每 10 倍规模，dump 与 verify 的**每修订成本保持同量级**（dump 尾部仍有约 6 倍
+缓存惩罚），load 受批内演进树影响需预留约 1 GB 内存。
+
+**千万级（1000 万修订）仍未实测**。按百万级的尾部惩罚趋势，不要直接线性外推；
+应在目标数据量上按同样三段（dump / load / verify）标定后再承诺 RTO。
+需要更小 RPO 时用 geo 复制（`type=geo`）做热备，dump 仍作为**离线归档与
+最后手段**保留。
 需要更小 RPO 时用 geo 复制（`type=geo`）做热备，dump 仍作为**离线归档与
 最后手段**保留。
