@@ -30,6 +30,19 @@ func (s *readFaultStore) Get(ctx context.Context, key string, rng *store.Range) 
 	return s.Store.Get(ctx, key, rng)
 }
 
+// Head is intercepted too: the loose sweep's only gate is isPacked, which asks
+// Head for the packed-done marker. A predicate that matches that marker must
+// make the sweep skip the shard rather than assume it is unpacked.
+func (s *readFaultStore) Head(ctx context.Context, key string) (string, bool, error) {
+	s.mu.Lock()
+	m := s.match
+	s.mu.Unlock()
+	if m != nil && m(key) {
+		return "", false, fmt.Errorf("injected head failure at %s", key)
+	}
+	return s.Store.Head(ctx, key)
+}
+
 func (s *readFaultStore) setFault(m func(string) bool) {
 	s.mu.Lock()
 	s.match = m
