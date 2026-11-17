@@ -174,6 +174,15 @@ func readUint(b []byte) (uint64, int, error) {
 	var temp uint64
 	for i := 0; i < len(b); i++ {
 		c := b[i]
+		// Shifting a uint64 left by 7 discards the top bits silently. A stream
+		// of continuation bytes therefore wraps to a small value and passes
+		// downstream bounds checks that assume the decoded number is what the
+		// sender wrote. Reject the overflow instead: svndiff lengths are
+		// bounded by maxSectionLen anyway, and a wrapped value reaching int()
+		// can go negative (that produced a slice-bounds panic).
+		if temp > (^uint64(0) >> 7) {
+			return 0, 0, errors.New("svndiff: length varint overflows uint64")
+		}
 		if c < 0x80 {
 			return (temp << 7) | uint64(c), i + 1, nil
 		}
@@ -432,10 +441,22 @@ func Apply(src, delta []byte) ([]byte, error) {
 		}
 		p += n
 
+		// Declared lengths are attacker-controlled and only a few bytes each, so
+		// they must be bounded before being used for allocation or arithmetic.
+		// Without this a 14-byte delta claiming a 1 TiB target view makes Apply
+		// reserve that much capacity. ApplyToSource has always had this bound;
+		// this path did not.
+		if sviewLen > maxSectionLen || tviewLen > maxSectionLen ||
+			insLen > maxSectionLen || dataLen > maxSectionLen {
+			return nil, errors.New("svndiff: window section too large")
+		}
 		if sviewOffset > uint64(len(src)) || sviewLen > uint64(len(src))-sviewOffset {
 			return nil, errors.New("svndiff: source window out of bounds")
 		}
-		if p+int(insLen)+int(dataLen) > len(delta) {
+		// Compare in uint64: p is an int and insLen/dataLen are uint64, so the
+		// old int(insLen)+int(dataLen) could wrap on a 32-bit build and pass a
+		// check it should have failed.
+		if uint64(p)+insLen+dataLen > uint64(len(delta)) {
 			return nil, ioErrUnexpectedEOF
 		}
 		sview := src[sviewOffset : sviewOffset+sviewLen]
@@ -494,6 +515,14 @@ func Apply(src, delta []byte) ([]byte, error) {
 				if offset >= uint64(cur) {
 					return nil, errors.New("svndiff: target copy out of bounds")
 				}
+				// A target copy reads forward from offset while appending, so it
+				// can never produce more than cur-offset bytes. Without this
+				// bound a declared length of 2^60 spins this loop effectively
+				// forever: the window would be rejected later, but only after
+				// the process stopped responding.
+				if length > uint64(cur)-offset {
+					return nil, errors.New("svndiff: target copy too long")
+				}
 				// svn semantics: offset is an absolute position in tview
 				// (svndiff.c: memmove(tview+tpos, tview+offset, length)).
 				start := int(offset)
@@ -501,7 +530,10 @@ func Apply(src, delta []byte) ([]byte, error) {
 					tview = append(tview, tview[start+k])
 				}
 			case actionNew:
-				if npos+int(length) > len(data) {
+				// Compare in uint64 and bound length before converting: length is
+				// decoded from the delta, so npos+int(length) can wrap negative
+				// and slip past a check written in int.
+				if length > uint64(len(data)) || uint64(npos)+length > uint64(len(data)) {
 					return nil, errors.New("svndiff: new-data copy out of bounds")
 				}
 				tview = append(tview, data[npos:npos+int(length)]...)
@@ -653,11 +685,17 @@ func ApplyToSource(srcLen int64, src SourceFunc, r io.Reader, w io.Writer) error
 				if v >= cur {
 					return errors.New("svndiff: target copy out of bounds")
 				}
+				// Same bound as Apply: forward self-copy cannot exceed cur-v.
+				if length > cur-v {
+					return errors.New("svndiff: target copy too long")
+				}
 				for k := uint64(0); k < length; k++ {
 					tview = append(tview, tview[v+k])
 				}
 			case actionNew:
-				if dp+int(length) > len(data) {
+				// Bound before converting to int, and compare in uint64 so a
+				// wrapped dp+int(length) cannot pass.
+				if length > uint64(len(data)) || uint64(dp)+length > uint64(len(data)) {
 					return errors.New("svndiff: new data out of bounds")
 				}
 				tview = append(tview, data[dp:dp+int(length)]...)

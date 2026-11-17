@@ -52,6 +52,28 @@ jobs:
         run: bash scripts/svn-client.sh
         timeout-minutes: 10
 
+  fuzz:
+    # Short search plus the committed corpus. The corpus is the actual gate -
+    # each file in testdata/fuzz is a past failure, so replaying it is a
+    # regression test; the timed pass only looks for new ones.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: corpus replay
+        run: |
+          go test -run '^FuzzApply$' ./internal/svndiff/
+          go test -run '^FuzzApplyStream$' ./internal/svndiff/
+          go test -run '^FuzzParseSkel$' ./internal/server/
+          go test -run '^FuzzParseSkelNoHang$' ./internal/server/
+          go test -run '^FuzzUnmarshalFormat$' ./internal/fs/
+      - name: fuzz
+        run: go test -run XXX -fuzz '^FuzzApply$' -fuzztime 60s ./internal/svndiff/
+        timeout-minutes: 10
+
   vulncheck:
     # Separate job so a DB/network blip fails here instead of taking the unit
     # tests with it. Installs the tool explicitly: a runner image without

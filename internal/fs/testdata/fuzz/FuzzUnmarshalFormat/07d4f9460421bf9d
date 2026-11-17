@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("SVNGOBJ1\nFORMAT=1\nSEGMENT_FROM=1")

@@ -323,6 +323,14 @@ func UnmarshalFormat(b []byte) (*Format, error) {
 	if f.Version == 0 {
 		return nil, errors.New("fs: format marker has no FORMAT version")
 	}
+	// Marshal writes SEGMENTS=1 whenever SegmentFrom is set (see its condition),
+	// so a marker carrying SEGMENT_FROM but not SEGMENTS would re-read as a
+	// different format than it was: the round trip would silently switch the
+	// repository into segment mode. Normalise on read so what we parse is what
+	// we write back.
+	if f.SegmentFrom != 0 {
+		f.Segments = true
+	}
 	return f, nil
 }
 

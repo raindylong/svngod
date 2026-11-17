@@ -59,6 +59,48 @@ if [ "${CI_SKIP_RACE:-0}" != "1" ]; then
   echo "    $(printf '%s\n' "$race_out" | grep -cE '^ok  ') packages clean under -race"
 fi
 
+# Fuzzing, short. The corpus committed under testdata/fuzz is what makes this
+# cheap: each entry is a past failure, so the seed pass alone re-runs every bug
+# found so far. The timed pass is a new-input search and is kept short because
+# it is unbounded work - FUZZTIME=0s skips it and only replays the corpus.
+#
+# This found three real defects in the svndiff decoders (a slice-bounds panic, a
+# wrapped length that defeated a bounds check, and an unbounded forward-copy
+# loop that hung the process) plus a format round-trip that silently changed a
+# repository's storage mode.
+if [ "${CI_SKIP_FUZZ:-0}" != "1" ]; then
+  echo "==> fuzz (corpus replay + ${FUZZTIME:-20s} search)"
+  fuzz_fail=""
+  for target in FuzzApply FuzzApplyStream FuzzVersionAndIsDelta; do
+    out=$(CGO_ENABLED=0 go test -run "^\$target\$" ./internal/svndiff/ 2>&1) || fuzz_fail="$fuzz_fail $target(corpus)"
+  done
+  for target in FuzzParseSkel FuzzParseSkelNoHang; do
+    out=$(CGO_ENABLED=0 go test -run "^\$target\$" ./internal/server/ 2>&1) || fuzz_fail="$fuzz_fail $target(corpus)"
+  done
+  for target in FuzzUnmarshalFormat FuzzUnmarshalFormatKeepsUnknownKeys; do
+    out=$(CGO_ENABLED=0 go test -run "^\$target\$" ./internal/fs/ 2>&1) || fuzz_fail="$fuzz_fail $target(corpus)"
+  done
+  if [ -n "$fuzz_fail" ]; then
+    echo "    corpus replay failed:$fuzz_fail"
+    for t in $fuzz_fail; do
+      name=${t%%(*}
+      case "$name" in
+        FuzzApply|FuzzApplyStream|FuzzVersionAndIsDelta) pkg=./internal/svndiff/ ;;
+        FuzzParseSkel*) pkg=./internal/server/ ;;
+        *) pkg=./internal/fs/ ;;
+      esac
+      CGO_ENABLED=0 go test -run "^\$name\$" "$pkg" 2>&1 | tail -15 | sed 's/^/    /'
+    done
+    fail "fuzz corpus replay failed"
+  fi
+  if [ "${FUZZTIME:-20s}" != "0s" ]; then
+    # One target per package keeps this bounded; the corpus is the real gate.
+    CGO_ENABLED=0 go test -run XXX -fuzz '^FuzzApply$' -fuzztime "${FUZZTIME:-20s}" ./internal/svndiff/ \
+      >/tmp/svngod-fuzz.$$ 2>&1 || { tail -20 /tmp/svngod-fuzz.$$ | sed 's/^/    /'; fail "fuzzing found a new failure"; }
+  fi
+  echo "    corpus clean, no new failures"
+fi
+
 # Dependency vulnerabilities. CI is the place this must not be skippable: a
 # local run without govulncheck installs is reported as skipped, but in CI a
 # missing tool is a failure (VULNCHECK_REQUIRE_TOOL=1), otherwise the gate
