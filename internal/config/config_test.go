@@ -104,3 +104,43 @@ func TestShardedStoreParsing(t *testing.T) {
 		t.Fatal("omitted to must be nil (infinity)")
 	}
 }
+
+// TestRedactedHidesEverySecret is a leak guard for the management API: /config
+// returns Redacted(), so any secret added to Config without a case here becomes
+// readable through that endpoint.
+func TestRedactedHidesEverySecret(t *testing.T) {
+	c := &Config{
+		AdminToken:   "admin-secret",
+		MetricsToken: "metrics-secret",
+		Repos: []Repo{{
+			Name: "demo",
+			Storage: Store{
+				AccessKey: "s3-ak",
+				SecretKey: "s3-sk",
+			},
+			Auth: []Auth{{BindPassword: "ldap-pw"}},
+		}},
+	}
+	r := c.Redacted()
+	for name, got := range map[string]string{
+		"admin-token":   r.AdminToken,
+		"metrics-token": r.MetricsToken,
+	} {
+		if got != "***" {
+			t.Fatalf("%s not redacted: %q", name, got)
+		}
+	}
+	if ak := r.Repos[0].Storage.AccessKey; ak != "***" {
+		t.Fatalf("s3 access key not redacted: %q", ak)
+	}
+	if sk := r.Repos[0].Storage.SecretKey; sk != "***" {
+		t.Fatalf("s3 secret key not redacted: %q", sk)
+	}
+	if pw := r.Repos[0].Auth[0].BindPassword; pw != "***" {
+		t.Fatalf("ldap bind password not redacted: %q", pw)
+	}
+	// The original must be untouched: Redacted returns a copy.
+	if c.MetricsToken != "metrics-secret" {
+		t.Fatal("Redacted mutated the source config")
+	}
+}

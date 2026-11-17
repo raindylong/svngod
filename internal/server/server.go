@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -65,6 +67,14 @@ type Config struct {
 
 	// DisableMetrics turns off the /_metrics exposition endpoint.
 	DisableMetrics bool
+
+	// MetricsToken gates /_metrics when set. The exposition labels every series
+	// with the repository name, so leaving it open to anyone who can reach the
+	// port leaks the tenant list and their failure state. Prometheus sends it as
+	// "Authorization: Bearer <token>". When empty, a valid repository credential
+	// (Basic) is accepted instead; when no authentication is configured at all the
+	// endpoint stays open, because there would be nothing to authenticate with.
+	MetricsToken string
 
 	// Logger for request logging; nil disables.
 	Logger *log.Logger
@@ -392,6 +402,10 @@ type statusWriter struct {
 	n    int64
 }
 
+// committed reports whether a status line has already gone out. Once it has, the
+// response cannot be turned into an error, so a recovering handler must not try.
+func (s *statusWriter) committed() bool { return s.code != 0 || s.n != 0 }
+
 func (s *statusWriter) WriteHeader(code int) { s.code = code; s.ResponseWriter.WriteHeader(code) }
 func (s *statusWriter) Write(b []byte) (int, error) {
 	if s.code == 0 {
@@ -417,10 +431,6 @@ func (s *Server) Handler() http.Handler {
 
 // route is the top-level dispatcher: auth, then per-method handling.
 func (s *Server) route(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/_metrics" {
-		s.serveMetrics(w)
-		return
-	}
 	var cr *countingReadCloser
 	if r.Body != nil {
 		cr = &countingReadCloser{r: r.Body}
@@ -428,9 +438,32 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	}
 	sw := &statusWriter{ResponseWriter: w}
 	w = sw
+	// user is set after authentication and used by both the panic report and the
+	// access log; declare it here so the recover closure can see it.
+	user := ""
+	// Isolate this request. svngod serves every repository from one process, so
+	// a panic escaping a handler stops all of them at once, and the only trace
+	// is a goroutine dump with no repository context. Recovered here, it costs
+	// one request instead.
+	defer func() {
+		rec := recover()
+		if rec == nil {
+			return
+		}
+		if s.cfg.Logger != nil {
+			s.cfg.Logger.Printf("PANIC %s %s repo=%q user=%q: %v\n%s",
+				r.Method, r.URL.Path, parseResource(s.cfg.BasePath, r.URL.Path).repo, user, rec,
+				debug.Stack())
+		}
+		if sw.committed() {
+			// The status line is already out; the client gets a truncated body
+			// either way, and writing headers again would corrupt the stream.
+			return
+		}
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+	}()
 	// One summary line per request (status + user) when a logger is set; the
 	// previous unconditional line doubled the log volume of a 30k-file commit.
-	user := ""
 	start := time.Now()
 	defer func() {
 		if cr != nil {
@@ -466,6 +499,18 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 	res := parseResource(s.cfg.BasePath, r.URL.Path)
+
+	// /_metrics sits behind authentication on purpose: its labels carry every
+	// repository name. It is checked here rather than at the top of route so it
+	// cannot be served before the caller has proven who they are.
+	if r.URL.Path == "/_metrics" {
+		if !s.authorizeMetrics(w, r) {
+			return
+		}
+		user = "metrics"
+		s.serveMetrics(w)
+		return
+	}
 
 	ident, ok := s.authenticate(w, r, res.repo)
 	if !ok {
@@ -604,6 +649,107 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request, repo strin
 		return auth.Identity{}, s.unauthorized(w)
 	}
 	return id, true
+}
+
+// authorizeMetrics decides whether the caller may read /_metrics.
+//
+// Order: a configured admin/metrics token (Bearer) wins, then any repository
+// credential (Basic). If neither is configured the endpoint stays open, keeping
+// existing single-node deployments working - there is nothing to authenticate
+// against, and the operator has already opted into an unauthenticated server.
+func (s *Server) authorizeMetrics(w http.ResponseWriter, r *http.Request) bool {
+	token := s.cfg.MetricsToken
+	if token == "" {
+		token = os.Getenv("SVNGOD_METRICS_TOKEN")
+	}
+	if token != "" {
+		h := r.Header.Get("Authorization")
+		if strings.HasPrefix(h, "Bearer ") {
+			got := strings.TrimPrefix(h, "Bearer ")
+			if subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1 {
+				return true
+			}
+			w.Header().Set("WWW-Authenticate", `Bearer realm="svngod-metrics"`)
+			http.Error(w, "metrics token required", http.StatusUnauthorized)
+			return false
+		}
+	}
+	// Fall through to repository credentials: a monitoring account with a normal
+	// password is the common setup, and it should not need a second secret.
+	// authenticate() cannot be reused here: with no header it returns anonymous
+	// success (authz decides later), which for metrics would mean no protection
+	// at all. A credentialed endpoint must demand a credential.
+	chain := s.cfg.Authenticate
+	if chain == nil {
+		// Per-repo chains: accept any of them. Metrics is not repo-scoped, so
+		// there is no single chain to pick.
+		if !s.anyRepoAuth() {
+			return true // nothing configured to authenticate against
+		}
+		chain = s.firstRepoAuth()
+	}
+	h := r.Header.Get("Authorization")
+	const basic = "Basic "
+	if !strings.HasPrefix(h, basic) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="svngod-metrics"`)
+		http.Error(w, "metrics requires credentials", http.StatusUnauthorized)
+		return false
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(h, basic))
+	if err != nil {
+		s.unauthorizedMetrics(w)
+		return false
+	}
+	user, pass, ok := strings.Cut(string(raw), ":")
+	if !ok {
+		s.unauthorizedMetrics(w)
+		return false
+	}
+	if _, err := chain.Authenticate(r.Context(), user, pass); err != nil {
+		s.audit("deny", "reason", "bad_credentials", "repo", "/_metrics", "user", auditActor(user),
+			"method", r.Method, "path", r.URL.Path)
+		s.unauthorizedMetrics(w)
+		return false
+	}
+	return true
+}
+
+// unauthorizedMetrics challenges for metrics credentials without claiming the
+// repository realm.
+func (s *Server) unauthorizedMetrics(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", `Basic realm="svngod-metrics"`)
+	http.Error(w, "metrics requires credentials", http.StatusUnauthorized)
+}
+
+// firstRepoAuth returns the first per-repository auth chain, for endpoints that
+// are not scoped to one repository.
+func (s *Server) firstRepoAuth() *auth.Chain {
+	set := s.repos.Load()
+	if set == nil {
+		return nil
+	}
+	for _, rc := range set.list {
+		if rc.Authenticate != nil {
+			return rc.Authenticate
+		}
+	}
+	return nil
+}
+
+// anyRepoAuth reports whether any repository carries its own auth chain. A
+// deployment that configures auth per repo (not globally) still needs /_metrics
+// protected, and s.cfg.Authenticate alone would miss that.
+func (s *Server) anyRepoAuth() bool {
+	set := s.repos.Load()
+	if set == nil {
+		return false
+	}
+	for _, rc := range set.list {
+		if rc.Authenticate != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) unauthorized(w http.ResponseWriter) bool {
@@ -754,4 +900,19 @@ func (s *Server) auditCommit(mode, repo, user string, rev uint64, changes []fs.C
 // notImpl logs and returns 501 for methods not yet implemented.
 func (s *Server) notImpl(w http.ResponseWriter, method string) {
 	http.Error(w, method+" not yet implemented", http.StatusNotImplemented)
+}
+
+// goSafe starts a background task that survives a panic. Background work here
+// (loose reclaim, compaction, mirror repair, scrub) has no request to unwind
+// into: an unrecovered panic in any of them terminates the whole process, taking
+// every repository with it.
+func goSafe(name string, fn func()) {
+	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("PANIC in background task %q: %v\n%s", name, rec, debug.Stack())
+			}
+		}()
+		fn()
+	}()
 }

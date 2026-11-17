@@ -75,6 +75,7 @@ type options struct {
 	maxUploads     int
 	maxUserUploads int
 	metrics        bool
+	metricsToken   string
 	strictStart    bool
 	scrubInterval  time.Duration
 }
@@ -137,6 +138,7 @@ func main() {
 	fl.StringVar(&o.adminAllowCIDR, "admin-allow-cidr", "", "comma-separated CIDRs allowed to call the management API (default loopback)")
 	fl.IntVar(&o.maxUserUploads, "max-user-uploads", 4, "maximum concurrent uploads per user (0 = unlimited)")
 	fl.BoolVar(&o.metrics, "metrics", true, "expose Prometheus metrics at /_metrics")
+	fl.StringVar(&o.metricsToken, "metrics-token", "", "bearer token for /_metrics (prefer SVNGOD_METRICS_TOKEN); empty = require a repository credential")
 	fl.DurationVar(&o.scrubInterval, "scrub-interval", 10*time.Minute, "background integrity-check interval (0 = disabled)")
 	fl.StringVar(&o.basePath, "base-path", "/svn", "URL prefix for repositories")
 	fl.StringVar(&o.repoRoot, "repo-root", "./repos", "local directory holding repositories")
@@ -237,6 +239,7 @@ func main() {
 		MaxConcurrentUploads: o.maxUploads,
 		MaxUserUploads:       o.maxUserUploads,
 		DisableMetrics:       !o.metrics,
+		MetricsToken:         o.metricsToken,
 		Logger:               log.New(os.Stderr, "svngod ", log.LstdFlags),
 	})
 
@@ -396,6 +399,7 @@ func runMultiRepo(configPath string, commitBatch, commitWindowMs int, adminAddr,
 		MaxConcurrentUploads: maxUploads,
 		MaxUserUploads:       maxUserUploads,
 		DisableMetrics:       cfg.DisableMetrics,
+		MetricsToken:         cfg.MetricsToken,
 		Logger:               logger,
 	})
 	if len(buildFailures) > 0 {

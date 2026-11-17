@@ -295,7 +295,10 @@ func (m *MirrorStore) repairLoop() {
 		case <-m.stop:
 			return
 		case <-t.C:
-			m.repair()
+			// One bad pass must not end the loop: repair is the only thing that
+			// brings a standby back, and a loop that dies quietly leaves the
+			// mirror permanently degraded while the process looks healthy.
+			recoverLoop("mirror-repair", m.repair)
 		}
 	}
 }

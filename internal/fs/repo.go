@@ -2149,11 +2149,11 @@ func (r *Repo) packShardLocked(shard uint64) error {
 	// standby out of service when a 1000-key DELETE exceeded its budget, and a
 	// standby's leftover loose copies are harmless (repair lists only the
 	// active shard).
-	go func() {
+	goSafe("pack-loose-reclaim", func() {
 		if _, err := r.collectLooseShard(context.Background(), shard, false); err != nil {
 			log.Printf("pack: loose cleanup shard %d: %v", shard, err)
 		}
-	}()
+	})
 
 	r.invalidateRevPropsPack(shard)
 	r.cache.Clear()

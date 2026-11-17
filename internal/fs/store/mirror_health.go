@@ -366,7 +366,9 @@ func (m *MirrorStore) healthLoop() {
 		case <-m.stop:
 			return
 		case <-t.C:
-			m.probeOnce(fails)
+			// A failed probe round must not end the loop; a dead health loop
+			// would leave every mirror judged healthy forever.
+			recoverLoop("mirror-health", func() { m.probeOnce(fails) })
 		}
 	}
 }

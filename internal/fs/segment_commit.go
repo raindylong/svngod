@@ -252,7 +252,11 @@ func (r *Repo) enqueueCompaction(sh uint64, partial bool) {
 
 func (r *Repo) compactLoop() {
 	for job := range r.compactQ {
-		r.runCompaction(job)
+		// A panic on one shard must not end compaction for the whole
+		// repository: the loop would exit, the queue would back up, and every
+		// append would eventually block with no error to show for it.
+		job := job
+		recoverLoop("segment-compaction", func() { r.runCompaction(job) })
 	}
 }
 

@@ -46,6 +46,10 @@ type Config struct {
 	MaxUploads     int  `json:"max-uploads"`
 	MaxUserUploads int  `json:"max-user-uploads"`
 	DisableMetrics bool `json:"disable-metrics"`
+	// MetricsToken gates /_metrics. Its labels name every repository, so an
+	// unauthenticated endpoint exposes the tenant list. Empty falls back to
+	// SVNGOD_METRICS_TOKEN, then to requiring a repository credential.
+	MetricsToken string `json:"metrics-token,omitempty"`
 	// ScrubInterval enables the background integrity Verifier at this period
 	// (0 disables it). Default when unset: 10m.
 	ScrubInterval jsonDuration `json:"scrub-interval"`
@@ -603,6 +607,9 @@ func (c *Config) Redacted() *Config {
 	_ = json.Unmarshal(b, &out)
 	if out.AdminToken != "" {
 		out.AdminToken = "***"
+	}
+	if out.MetricsToken != "" {
+		out.MetricsToken = "***"
 	}
 	for i := range out.Repos {
 		redactStore(&out.Repos[i].Storage)
