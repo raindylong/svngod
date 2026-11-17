@@ -347,6 +347,13 @@ func OpenRepo(st store.Store, prefix string) (*Repo, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Refuse a repository written by a newer build. Its marker can carry fields
+	// and semantics this build does not implement; opening it would apply old
+	// rules to new data and the damage would only surface later, as corruption.
+	// Older versions stay readable: every format so far is a strict superset.
+	if err := checkFormatVersion(f); err != nil {
+		return nil, err
+	}
 	cp := cdc.DefaultParams()
 	if f.ChunkMin != 0 || f.ChunkMax != 0 || f.ChunkMask != 0 {
 		cp = cdc.Params{Min: int(f.ChunkMin), Max: int(f.ChunkMax), Mask: f.ChunkMask}.Normalize()

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -203,6 +204,31 @@ type Format struct {
 	Segments      bool
 	SegmentFrom   uint64
 	SegmentTarget uint64 // compaction target (revisions per segment)
+	// Extra holds marker lines this build does not interpret, verbatim and in
+	// their original order. Without it a read-modify-write cycle (migrate,
+	// switchFormat) would rebuild the marker from the struct alone and erase
+	// whatever a newer build had written, silently and with no error anywhere.
+	Extra []string
+}
+
+// formatVersion is the storage-format version this build writes and is willing
+// to read. A newer marker is refused by OpenRepo: the fields it carries would
+// otherwise be interpreted under rules this build does not follow.
+const formatVersion uint64 = 1
+
+// ErrFormatTooNew reports a repository written by a newer build.
+var ErrFormatTooNew = errors.New("fs: repository format version is newer than this build supports")
+
+// checkFormatVersion refuses a marker this build cannot honour. Every path that
+// is about to interpret or rewrite the marker calls it, not just OpenRepo:
+// migrate and switchFormat rewrite the marker, so they can do the same damage
+// from outside a running server.
+func checkFormatVersion(f *Format) error {
+	if f.Version > formatVersion {
+		return fmt.Errorf("%w: repository FORMAT=%d, this build supports up to %d",
+			ErrFormatTooNew, f.Version, formatVersion)
+	}
+	return nil
 }
 
 // Marshal serializes format.
@@ -227,7 +253,25 @@ func (f *Format) Marshal() []byte {
 	if f.DirBuckets {
 		out += "\nDIR_BUCKETS=1"
 	}
+	// Re-emit keys this build did not understand, so a rewrite cannot erase
+	// settings written by a newer build. They go last and verbatim: order among
+	// unknown keys is preserved, and a known key always wins over a stale copy.
+	for _, line := range f.Extra {
+		out += "\n" + line
+	}
 	return []byte(out + "\n")
+}
+
+// knownFormatKey reports whether this build interprets a format marker key.
+// Unknown keys are preserved verbatim rather than parsed, so a future field can
+// use any representation without making the marker unreadable here.
+func knownFormatKey(key string) bool {
+	switch key {
+	case "FORMAT", "SHARD_SIZE", "MAX_DELTA_CHAIN", "CHUNK_MIN", "CHUNK_MAX",
+		"CHUNK_MASK", "DIR_BUCKETS", "SEGMENTS", "SEGMENT_FROM", "SEGMENT_TARGET":
+		return true
+	}
+	return false
 }
 
 // UnmarshalFormat decodes format.
@@ -240,6 +284,13 @@ func UnmarshalFormat(b []byte) (*Format, error) {
 	for _, line := range strings.Split(s, "\n") {
 		key, val, ok := strings.Cut(line, "=")
 		if !ok {
+			continue
+		}
+		if !knownFormatKey(key) {
+			// Keep it verbatim and do not interpret it. A future field need not
+			// even be numeric, and dropping it here is the corruption path: the
+			// next read-modify-write would write back a marker missing this line.
+			f.Extra = append(f.Extra, key+"="+val)
 			continue
 		}
 		v, err := strconv.ParseUint(val, 10, 64)
@@ -268,6 +319,9 @@ func UnmarshalFormat(b []byte) (*Format, error) {
 		case "SEGMENT_TARGET":
 			f.SegmentTarget = v
 		}
+	}
+	if f.Version == 0 {
+		return nil, errors.New("fs: format marker has no FORMAT version")
 	}
 	return f, nil
 }
@@ -311,6 +365,9 @@ func UpdateFormat(st store.Store, prefix string, fn func(*Format) error) (*Forma
 		}
 		f, err := UnmarshalFormat(b)
 		if err != nil {
+			return nil, err
+		}
+		if err := checkFormatVersion(f); err != nil {
 			return nil, err
 		}
 		if err := fn(f); err != nil {

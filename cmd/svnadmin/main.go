@@ -919,6 +919,20 @@ func doInfo(o *options, repoName string) {
 	if err != nil {
 		fatal(err)
 	}
+	// Print the marker before opening the repository: a format this build
+	// refuses is exactly when an operator needs to see what is in it.
+	fmt.Printf("repo: %s\nformat-version: %d\nshard-size: %d\nmax-delta-chain: %d\n",
+		repoName, f.Version, f.ShardSize, f.MaxDeltaChain)
+	fmt.Printf("chunk-min: %d\nchunk-max: %d\nchunk-mask: %d\ndir-buckets: %v\n",
+		f.ChunkMin, f.ChunkMax, f.ChunkMask, f.DirBuckets)
+	fmt.Printf("segments: %v\nsegment-from: %d\nsegment-target: %d\n",
+		f.Segments, f.SegmentFrom, f.SegmentTarget)
+	if len(f.Extra) > 0 {
+		// Keys this build does not interpret. They are preserved on rewrite but
+		// have no effect here, which is worth stating rather than hiding.
+		fmt.Printf("unknown-format-keys: %s (preserved, not applied by this build)\n",
+			strings.Join(f.Extra, ","))
+	}
 	repo, err := fs.OpenRepo(st, prefix)
 	if err != nil {
 		fatal(err)
@@ -928,12 +942,7 @@ func doInfo(o *options, repoName string) {
 		fatal(err)
 	}
 	uuid, _ := repo.UUID()
-	fmt.Printf("repo: %s\nformat-version: %d\nshard-size: %d\nmax-delta-chain: %d\n",
-		repoName, f.Version, f.ShardSize, f.MaxDeltaChain)
-	fmt.Printf("chunk-min: %d\nchunk-max: %d\nchunk-mask: %d\ndir-buckets: %v\nhead: %d\nuuid: %s\n",
-		f.ChunkMin, f.ChunkMax, f.ChunkMask, f.DirBuckets, head, uuid)
-	fmt.Printf("segments: %v\nsegment-from: %d\nsegment-target: %d\n",
-		f.Segments, f.SegmentFrom, f.SegmentTarget)
+	fmt.Printf("head: %d\nuuid: %s\n", head, uuid)
 }
 
 // doMigrate changes opt-in format switches. Every replica must be restarted

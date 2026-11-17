@@ -100,6 +100,9 @@ func (r *Repo) switchFormat() error {
 	if err != nil {
 		return err
 	}
+	if err := checkFormatVersion(f); err != nil {
+		return err
+	}
 	f.Segments = true
 	f.SegmentFrom = 1
 	if f.SegmentTarget == 0 {
