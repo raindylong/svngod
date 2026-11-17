@@ -4,17 +4,43 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"svngod/internal/cdc"
 	"svngod/internal/fs/store"
 )
 
+// waitLooseStable waits until the loose-object count stops changing.
+//
+// PackShard reclaims a packed shard's loose copies in a background goroutine,
+// so a test that inspects them immediately after packing races that cleanup.
+// Waiting for the count to settle makes the fixture deterministic.
+func waitLooseStable(t *testing.T, st store.Store, prefix string) int {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	last := -1
+	stable := 0
+	for time.Now().Before(deadline) {
+		n := countPrefix(t, st, prefix)
+		if n == last {
+			if stable++; stable >= 3 {
+				return n
+			}
+		} else {
+			stable = 0
+			last = n
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return countPrefix(t, st, prefix)
+}
+
 // TestCollectLooseSkipsWhenPackedMarkerUnreadable covers the loose sweep's only
 // gate. isPacked decides whether a shard's loose rev/revprops objects are
-// redundant; if that probe fails and the code assumed "unpacked", the shard
-// would be skipped (safe) - but if it were ever inverted to "assume packed",
-// every loose object in the shard would be deleted while it was still the only
-// copy. The sweep must treat an unreadable marker as "cannot decide" and skip.
+// redundant; if that probe fails and the code assumed "unpacked", the sweep
+// would skip the shard (safe) - but if it were ever inverted to "assume
+// packed", every loose object in the shard would be deleted while it was still
+// the only copy. The sweep must treat an unreadable marker as "cannot decide".
 func TestCollectLooseSkipsWhenPackedMarkerUnreadable(t *testing.T) {
 	mem := store.NewMemoryStore()
 	fs := &readFaultStore{Store: mem}
@@ -27,39 +53,68 @@ func TestCollectLooseSkipsWhenPackedMarkerUnreadable(t *testing.T) {
 	if err := r.PackShard(0); err != nil {
 		t.Fatal(err)
 	}
-	// Loose revision blocks live under revs-loose/, not revs/ (which also holds
-	// the packed .done markers and the pack object).
+	// PackShard reclaims the packed shard's loose copies in the background;
+	// let that finish so the count below is not moving underneath us.
 	loosePrefix := r.keys.ListingPrefix("revs-loose")
-	before := countPrefix(t, mem, loosePrefix)
+	before := waitLooseStable(t, mem, loosePrefix)
 	if before == 0 {
 		t.Fatal("fixture left no loose objects to protect")
 	}
-
-	// The packed-done marker for shard 0 cannot be read.
+	// Everything still loose belongs to shard 1 (shard 0 was packed and its
+	// copies reclaimed), so make the unreadable marker be shard 1's.
+	r.cache.Clear()
 	fs.setFault(func(k string) bool { return strings.HasSuffix(k, ".done") })
-	if _, err := r.CollectLoose(context.Background()); err != nil {
-		t.Fatalf("CollectLoose must skip a shard it cannot classify, not fail: %v", err)
-	}
+	deleted, cerr := r.CollectLoose(context.Background())
 	fs.setFault(nil)
-	if after := countPrefix(t, mem, loosePrefix); after != before {
-		t.Fatalf("loose objects deleted while the packed marker was unreadable: %d -> %d", before, after)
+	if cerr != nil {
+		t.Fatalf("CollectLoose must skip a shard it cannot classify, not fail: %v", cerr)
 	}
+	if after := countPrefix(t, mem, loosePrefix); after != before {
+		t.Fatalf("loose objects deleted while the packed marker was unreadable: %d -> %d (deleted=%d)",
+			before, after, deleted)
+	}
+	if deleted != 0 {
+		t.Fatalf("sweep reported %d deletions with every marker unreadable", deleted)
+	}
+}
 
-	// With the fault cleared the same sweep may collect, proving the skip was
-	// caused by the unreadable marker and not by a broken fixture.
-	if _, err := r.CollectLoose(context.Background()); err != nil {
+// TestCollectLooseCollectsAfterMarkerRecovers proves the guard is a skip, not a
+// permanent block: once the marker is readable a packed shard's leftover loose
+// copies are collected.
+func TestCollectLooseCollectsAfterMarkerRecovers(t *testing.T) {
+	mem := store.NewMemoryStore()
+	r, err := CreateRepo(mem, "loose2", 4, 64)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if after := countPrefix(t, mem, loosePrefix); after >= before {
-		t.Fatalf("healthy sweep removed nothing (%d -> %d): fixture does not exercise collection", before, after)
+	commitN(t, r, 4, 2)
+	// Write loose copies for a packed shard by hand: PackShard's background
+	// cleanup would otherwise remove them before the assertion.
+	if err := r.PackShard(0); err != nil {
+		t.Fatal(err)
+	}
+	loosePrefix := r.keys.ListingPrefix("revs-loose")
+	waitLooseStable(t, mem, loosePrefix)
+	stale := r.keys.LooseRev(0, 1)
+	if err := mem.Put(context.Background(), stale, []byte("stale")); err != nil {
+		t.Fatal(err)
+	}
+	n, err := r.CollectLoose(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n == 0 {
+		t.Fatal("healthy sweep collected nothing from a packed shard")
+	}
+	if ok, _ := mem.Exists(context.Background(), stale); ok {
+		t.Fatal("stale loose object survived a healthy sweep")
 	}
 }
 
 // TestCompactSegmentsRefusesOnIndexReadFailure covers compaction, which deletes
 // source segments once the merged object and index are in place. Merging from an
-// index it could not read (or from a partially read one) would risk dropping
-// revisions: the merged object would not contain them and the old segments would
-// then be garbage.
+// index it could not read would risk dropping revisions: the merged object would
+// not contain them and the old segments would then be garbage.
 func TestCompactSegmentsRefusesOnIndexReadFailure(t *testing.T) {
 	mem := store.NewMemoryStore()
 	fs := &readFaultStore{Store: mem}
