@@ -29,6 +29,36 @@ CGO_ENABLED=0 GOOS=darwin  go build -o /dev/null ./cmd/svngod ./cmd/svnadmin ./c
 echo "==> test (native)"
 CGO_ENABLED=0 go test -count=1 -timeout 15m ./...
 
+# Race detector. The default suite runs with CGO_ENABLED=0 (the release build is
+# pure Go, static), and the race detector requires cgo - so this cannot be folded
+# into the run above. It is worth a separate pass: the fs and server packages have
+# real concurrency (group commit, mirror repair, transaction cleanup) and a race
+# there corrupts data rather than producing a wrong answer.
+#
+# ~20s on a 16-core box. Set CI_SKIP_RACE=1 only for a deliberately quick loop.
+if [ "${CI_SKIP_RACE:-0}" != "1" ]; then
+  echo "==> race detector (CGO_ENABLED=1)"
+  if ! command -v "${CC:-gcc}" >/dev/null 2>&1 && ! command -v clang >/dev/null 2>&1; then
+    fail "CGO_ENABLED=1 requires a C compiler; install gcc or clang (or set CI_SKIP_RACE=1)"
+  fi
+  # "|| rc=$?" is required: under set -e a plain assignment takes the exit status
+  # of the command substitution and aborts the script here, so the failure branch
+  # below would never run and CI would die without printing why.
+  race_rc=0
+  race_out=$(CGO_ENABLED=1 go test -race -count=1 -timeout 20m ./... 2>&1) || race_rc=$?
+  if [ "$race_rc" != "0" ]; then
+    # The report is the product here: print it whole rather than a tail, because
+    # the two stacks that matter may be far apart in the output.
+    # No pipe into `head` here: closing the pipe early kills the producer with
+    # SIGPIPE and CI reports 141 instead of the real failure. Capture, then slice.
+    race_report=$(printf '%s\n' "$race_out" | grep -A30 "WARNING: DATA RACE" || true)
+    printf '%s\n' "$race_report" | sed -n '1,60p'
+    printf '%s\n' "$race_out" | tail -20
+    fail "race detector found a data race (see above)"
+  fi
+  echo "    $(printf '%s\n' "$race_out" | grep -cE '^ok  ') packages clean under -race"
+fi
+
 # Backup/restore drill: proves the recovery runbook (docs/备份与恢复SOP.md) on
 # a two-node WAL mirror, including the negative controls that must refuse a
 # damaged backup. Fast (~5s); set CI_SKIP_DRILL=1 for a unit-tests-only run.
@@ -46,7 +76,10 @@ fi
 # unit-tests-only run. Exit 77 means svn is not installed - reported, not hidden.
 if [ "${CI_SKIP_SVN_CLIENT:-0}" != "1" ]; then
   echo "==> svn client"
-  svn_out=$(bash scripts/svn-client.sh 2>&1); svn_rc=$?
+  # Same set -e trap as the race step: without "|| rc=$?" a non-zero exit (77 for
+  # "svn not installed") aborts CI silently instead of being handled below.
+  svn_rc=0
+  svn_out=$(bash scripts/svn-client.sh 2>&1) || svn_rc=$?
   if [ "$svn_rc" = "77" ]; then
     echo "    $svn_out" | tail -1
   elif [ "$svn_rc" != "0" ]; then

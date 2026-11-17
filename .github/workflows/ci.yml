@@ -52,6 +52,23 @@ jobs:
         run: bash scripts/svn-client.sh
         timeout-minutes: 10
 
+  race:
+    # The default suite runs CGO_ENABLED=0 (release builds are pure Go and
+    # static), and the race detector needs cgo, so it cannot share that job.
+    # Worth the extra job: fs and server have real concurrency (group commit,
+    # mirror repair, txn cleanup) where a race corrupts data rather than just
+    # returning a wrong answer. ~20s on 16 cores.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: go test -race
+        run: CGO_ENABLED=1 go test -race -count=1 -timeout 20m ./...
+        timeout-minutes: 30
+
   cross-compile:
     runs-on: ubuntu-latest
     steps:
