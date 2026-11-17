@@ -41,4 +41,22 @@ if [ "${CI_SKIP_DRILL:-0}" != "1" ]; then
   tail -1 /tmp/svngod-drill.$$ | sed 's/^/    /'
 fi
 
+# Real Subversion client: the unit tests build DAV requests by hand, so they
+# cannot show that ra_serf accepts the answers. Set CI_SKIP_SVN_CLIENT=1 for a
+# unit-tests-only run. Exit 77 means svn is not installed - reported, not hidden.
+if [ "${CI_SKIP_SVN_CLIENT:-0}" != "1" ]; then
+  echo "==> svn client"
+  svn_out=$(bash scripts/svn-client.sh 2>&1); svn_rc=$?
+  if [ "$svn_rc" = "77" ]; then
+    echo "    $svn_out" | tail -1
+  elif [ "$svn_rc" != "0" ]; then
+    printf '%s\n' "$svn_out" | tail -30
+    fail "svn client regression failed"
+  else
+    # Print the verdict line, not the last line: the script's cleanup trap
+    # reports artifact paths after the result.
+    printf '%s\n' "$svn_out" | grep -E '^SVN-CLIENT OK' | sed 's/^/    /'
+  fi
+fi
+
 echo "CI OK"

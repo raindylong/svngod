@@ -37,6 +37,21 @@ jobs:
       - name: unit tests
         run: CGO_ENABLED=0 go test -count=1 -timeout 15m ./...
 
+      # The unit tests build DAV requests by hand, so they cannot show that
+      # ra_serf accepts the answers. This runs the real client.
+      - name: install subversion
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install subversion || true
+          else
+            sudo apt-get update && sudo apt-get install -y subversion
+          fi
+          svn --version --quiet
+
+      - name: svn client regression
+        run: bash scripts/svn-client.sh
+        timeout-minutes: 10
+
   cross-compile:
     runs-on: ubuntu-latest
     steps:
