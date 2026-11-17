@@ -419,7 +419,11 @@ func (r *Repo) checkChangeInTree(root *tnode, ch *Change, baseRev uint64) error 
 // success for an unpublished revision. Requests are bulk writers (baseRev 0);
 // per-path base revisions are not available, so conflicts are checked against
 // the evolving tree (add-existing / delete-missing).
-func (r *Repo) CommitBatch(reqs []BatchCommit) ([]uint64, []error, error) {
+func (r *Repo) CommitBatch(reqs []BatchCommit, opts ...BatchOption) ([]uint64, []error, error) {
+	var cfg batchConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
 	revs := make([]uint64, len(reqs))
 	errs := make([]error, len(reqs))
 	if len(reqs) == 0 {
@@ -496,6 +500,11 @@ func (r *Repo) CommitBatch(reqs []BatchCommit) ([]uint64, []error, error) {
 			}
 		}
 		if bad {
+			if cfg.allOrNothing {
+				// Nothing has been published yet: abandon the whole batch so
+				// the caller never sees a gap in the revision sequence.
+				return r.abortBatch(errs, i, "request rejected")
+			}
 			continue
 		}
 		n := N + 1
@@ -508,6 +517,9 @@ func (r *Repo) CommitBatch(reqs []BatchCommit) ([]uint64, []error, error) {
 				if errs[j] == nil {
 					errs[j] = berr
 				}
+			}
+			if cfg.allOrNothing {
+				return r.abortBatch(errs, i, "revision build failed")
 			}
 			break
 		}
@@ -680,3 +692,51 @@ func (r *Repo) readRootLocked(rev uint64) (*tnode, error) {
 // not a replay limit: a crash after the WAL record rolls the whole batch forward
 // whatever its size.
 const maxCommitBatch = 1 << 16
+
+// batchConfig carries CommitBatch options.
+type batchConfig struct {
+	allOrNothing bool
+}
+
+// BatchOption configures one CommitBatch call.
+type BatchOption func(*batchConfig)
+
+// AllOrNothing makes CommitBatch publish either every request or none.
+//
+// The default (and what the server's commit queue relies on) is per-request:
+// a rejected request is reported in errs and the rest are still applied, so
+// concurrent commits to disjoint paths merge instead of fighting. That is the
+// right semantics for interactive clients, but it leaves a gap in the revision
+// sequence when a request in the middle is rejected.
+//
+// A bulk importer cannot tolerate a gap: it replays a source history whose
+// revisions must be contiguous, and a missing number corrupts every later
+// revision's parent chain. With this option any rejection aborts the whole
+// batch before a single object is written, so the caller can retry or repair
+// the input knowing nothing was published.
+func AllOrNothing() BatchOption {
+	return func(c *batchConfig) { c.allOrNothing = true }
+}
+
+// abortBatch discards a partially built batch under AllOrNothing. Nothing has
+// reached the store at this point - revision blocks and the tree live only in
+// memory - so returning without publishing leaves the repository exactly as it
+// was. Every request is reported failed so a caller cannot mistake a zero
+// revision for a published one.
+func (r *Repo) abortBatch(errs []error, cause int, why string) ([]uint64, []error, error) {
+	revs := make([]uint64, len(errs))
+	reason := errs[cause]
+	msg := fmt.Sprintf("fs: batch abandoned before publishing (%s at request %d)", why, cause)
+	var err error
+	if reason != nil {
+		err = fmt.Errorf("%s: %w", msg, reason)
+	} else {
+		err = errors.New(msg)
+	}
+	for i := range errs {
+		if errs[i] == nil {
+			errs[i] = err
+		}
+	}
+	return revs, errs, err
+}

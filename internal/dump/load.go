@@ -150,11 +150,14 @@ func LoadRangeProgress(repo *fs.Repo, r io.Reader, from, to uint64, progress fun
 		if len(pending) == 0 {
 			return nil
 		}
-		revs, errs, err := repo.CommitBatch(pending)
+		// AllOrNothing: a rejected request must not leave a gap in the
+		// revision sequence. An import replays a source history whose
+		// revisions are contiguous and whose parents are numbered, so a
+		// missing number cannot be resumed around - only rebuilt.
+		revs, errs, err := repo.CommitBatch(pending, fs.AllOrNothing())
 		if err != nil {
-			// Whole-batch failure: nothing was published, so every buffered
-			// revision is lost. Surface the first per-request error when there is
-			// one; it names the revision that actually failed.
+			// Nothing was published, so the repository still ends at lastRev
+			// and the same dump can be retried (or resumed with --from).
 			for i := range errs {
 				if errs[i] != nil {
 					err = errs[i]
@@ -168,16 +171,13 @@ func LoadRangeProgress(repo *fs.Repo, r io.Reader, from, to uint64, progress fun
 		pending = pending[:0]
 		pendingChanges = pendingChanges[:0]
 		if err != nil {
-			return err
+			return fmt.Errorf("dump: nothing published (target head stays %d): %w", lastRev, err)
 		}
 		for i, rv := range revs {
 			if rv == 0 {
-				// Part of this batch was published and part was not. Revision
-				// numbers are contiguous, so the target now holds a prefix of
-				// the dump with a gap where this request was rejected - the
-				// history is no longer a valid import and must not be resumed
-				// blindly. Say so explicitly: the caller needs to know the
-				// repository is damaged, not merely that load stopped.
+				// Unreachable with AllOrNothing: either the whole batch
+				// published or none of it did. Keep the check as a guard in
+				// case the batch API changes underneath us.
 				reason := "unknown"
 				if i < len(errs) && errs[i] != nil {
 					reason = errs[i].Error()
