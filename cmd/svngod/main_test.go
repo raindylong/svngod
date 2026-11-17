@@ -31,7 +31,7 @@ func TestServeWithShutdownDrains(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errCh := make(chan error, 1)
-	go func() { errCh <- serveWithShutdown(ctx, hs, "", "") }()
+	go func() { errCh <- serveWithShutdown(ctx, hs, "", "", 0) }()
 
 	// Wait for the listener, then start a request and cancel while it runs.
 	for i := 0; i < 100; i++ {

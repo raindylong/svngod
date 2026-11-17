@@ -21,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -73,6 +74,7 @@ type options struct {
 	hooksDir       string
 	tlsCert        string
 	tlsKey         string
+	maxConns       int
 	maxUploads     int
 	maxUserUploads int
 	metrics        bool
@@ -141,6 +143,7 @@ func main() {
 	fl := flag.NewFlagSet("svngod", flag.ExitOnError)
 	fl.StringVar(&o.addr, "addr", ":8080", "listen address")
 	fl.IntVar(&o.maxUploads, "max-uploads", 16, "maximum concurrent PUT/bundle uploads (0 = unlimited)")
+	fl.IntVar(&o.maxConns, "max-conns", 512, "maximum simultaneous TCP connections, excess are reset (0 = unlimited)")
 	fl.IntVar(&o.commitBatch, "commit-batch", 16, "group concurrently arriving commits into batches of this size (0/1 = off)")
 	fl.IntVar(&o.commitWindowMs, "commit-window-ms", 2, "milliseconds to wait for more commits once a batch starts")
 	fl.StringVar(&o.adminAddr, "admin-addr", "", "management API listen address (empty = disabled; requires --config and a token)")
@@ -264,7 +267,7 @@ func main() {
 	if o.tlsCert != "" && o.tlsKey != "" {
 		log.Printf("serving HTTPS (cert %s)", o.tlsCert)
 	}
-	if err := serveWithShutdown(ctx, hs, o.tlsCert, o.tlsKey); err != nil {
+	if err := serveWithShutdown(ctx, hs, o.tlsCert, o.tlsKey, o.maxConns); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -274,14 +277,26 @@ func main() {
 // publish phase, a large upload) to finish before returning. Without it a
 // systemd/Kubernetes stop either ignored the signal or killed a commit in
 // flight (the WAL could roll it forward, but the client saw an error).
-func serveWithShutdown(ctx context.Context, hs *http.Server, cert, key string) error {
+func serveWithShutdown(ctx context.Context, hs *http.Server, cert, key string, maxConns int) error {
+	// Listen explicitly rather than ListenAndServe: the connection cap wraps the
+	// listener, and that is the only place a limit applies before a request
+	// exists. Limits inside a handler are already too late - the socket and its
+	// buffers are allocated by then.
+	ln, err := net.Listen("tcp", hs.Addr)
+	if err != nil {
+		return err
+	}
+	ln = limitConnections(ln, maxConns)
+	if maxConns > 0 {
+		log.Printf("connection cap: %d simultaneous connections (excess are reset)", maxConns)
+	}
 	errCh := make(chan error, 1)
 	go func() {
 		if cert != "" && key != "" {
-			errCh <- hs.ListenAndServeTLS(cert, key)
+			errCh <- hs.ServeTLS(ln, cert, key)
 			return
 		}
-		errCh <- hs.ListenAndServe()
+		errCh <- hs.Serve(ln)
 	}()
 	select {
 	case err := <-errCh:
@@ -359,6 +374,13 @@ func runMultiRepo(configPath string, commitBatch, commitWindowMs int, adminAddr,
 	if maxUploads == 0 {
 		maxUploads = 16
 	}
+	// Same default as the flag mode. Keeping them in step matters: the JSON path
+	// is what production uses, and a silent 0 here would mean "unlimited" while
+	// the flag mode caps at 512.
+	maxConns := cfg.MaxConns
+	if maxConns == 0 {
+		maxConns = 512
+	}
 	maxUserUploads := cfg.MaxUserUploads
 	if maxUserUploads == 0 {
 		maxUserUploads = 4
@@ -431,7 +453,7 @@ func runMultiRepo(configPath string, commitBatch, commitWindowMs int, adminAddr,
 	if cfg.TLSCert != "" && cfg.TLSKey != "" {
 		log.Printf("serving HTTPS (cert %s)", cfg.TLSCert)
 	}
-	if err := serveWithShutdown(ctx, hs, cfg.TLSCert, cfg.TLSKey); err != nil {
+	if err := serveWithShutdown(ctx, hs, cfg.TLSCert, cfg.TLSKey, maxConns); err != nil {
 		log.Fatal(err)
 	}
 }

@@ -43,7 +43,11 @@ type Config struct {
 	TLSCert  string `json:"tls-cert"`
 	TLSKey   string `json:"tls-key"`
 	// MaxUploads bounds concurrent PUT/bundle bodies (0 = server default 16).
-	MaxUploads     int  `json:"max-uploads"`
+	MaxUploads int `json:"max-uploads"`
+	// MaxConns caps simultaneous TCP connections. This is the only limit that
+	// applies before a request exists; the upload limit runs inside a handler,
+	// after the socket and its buffers are already allocated. 0 = unlimited.
+	MaxConns       int  `json:"max-conns,omitempty"`
 	MaxUserUploads int  `json:"max-user-uploads"`
 	DisableMetrics bool `json:"disable-metrics"`
 	// MetricsToken gates /_metrics. Its labels name every repository, so an
