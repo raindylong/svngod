@@ -59,6 +59,25 @@ if [ "${CI_SKIP_RACE:-0}" != "1" ]; then
   echo "    $(printf '%s\n' "$race_out" | grep -cE '^ok  ') packages clean under -race"
 fi
 
+# Dependency vulnerabilities. CI is the place this must not be skippable: a
+# local run without govulncheck installs is reported as skipped, but in CI a
+# missing tool is a failure (VULNCHECK_REQUIRE_TOOL=1), otherwise the gate
+# silently disappears on a runner image that happens to lack it.
+if [ "${CI_SKIP_VULNCHECK:-0}" != "1" ]; then
+  echo "==> govulncheck"
+  vuln_rc=0
+  VULNCHECK_REQUIRE_TOOL="${VULNCHECK_REQUIRE_TOOL:-0}" \
+    bash scripts/vulncheck.sh >/tmp/svngod-vuln.$$ 2>&1 || vuln_rc=$?
+  if [ "$vuln_rc" = "77" ]; then
+    echo "    skipped: $(tail -1 /tmp/svngod-vuln.$$)"
+  elif [ "$vuln_rc" != "0" ]; then
+    tail -30 /tmp/svngod-vuln.$$ | sed 's/^/    /'
+    fail "dependency vulnerabilities found (see above)"
+  else
+    grep -E '^vulncheck: reachable' /tmp/svngod-vuln.$$ | sed 's/^/    /'
+  fi
+fi
+
 # Backup/restore drill: proves the recovery runbook (docs/备份与恢复SOP.md) on
 # a two-node WAL mirror, including the negative controls that must refuse a
 # damaged backup. Fast (~5s); set CI_SKIP_DRILL=1 for a unit-tests-only run.

@@ -243,3 +243,11 @@ cmd/
 
 - `docs/Go-SVN服务器架构设计方案.md`（v1.1，含 §9.4 多库、§9.5 主备镜像）
 - `docs/Go-SVN存储引擎实现细则.md`
+
+## 许可证
+
+Apache License 2.0，全文见 [`LICENSE`](LICENSE)，版权声明与第三方依赖许可见 [`NOTICE`](NOTICE)。
+
+依赖漏洞扫描：`scripts/vulncheck.sh`（基于 govulncheck）。只对**代码可达**的漏洞
+判失败；仅存在于依赖模块中但未被调用的条目会打印出来但不阻塞——否则像
+`x/crypto` 的 openpgp（svngod 根本不用它）这类无解条目会让门槛永久红灯，最后没人看。

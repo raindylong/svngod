@@ -52,6 +52,25 @@ jobs:
         run: bash scripts/svn-client.sh
         timeout-minutes: 10
 
+  vulncheck:
+    # Separate job so a DB/network blip fails here instead of taking the unit
+    # tests with it. Installs the tool explicitly: a runner image without
+    # govulncheck must not silently drop the scan (VULNCHECK_REQUIRE_TOOL=1).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: scan
+        env:
+          VULNCHECK_REQUIRE_TOOL: "1"
+        run: bash scripts/vulncheck.sh
+        timeout-minutes: 15
+
   race:
     # The default suite runs CGO_ENABLED=0 (release builds are pure Go and
     # static), and the race detector needs cgo, so it cannot share that job.

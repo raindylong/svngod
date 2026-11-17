@@ -1,0 +1,27 @@
+svngod
+Copyright 2026 longweijin
+
+This product includes software developed at
+the svngod project (https://gz-tea.ejoy.com/SA/svngod).
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+---
+
+Third-party dependencies are listed in go.mod and remain under their own
+licenses. Run `go list -m all` for the full set. Notable direct dependencies:
+
+  github.com/minio/minio-go/v7        Apache-2.0
+  github.com/go-ldap/ldap/v3           MIT
+  github.com/pierrec/lz4/v4            BSD-3-Clause
+  golang.org/x/sys                     BSD-3-Clause
