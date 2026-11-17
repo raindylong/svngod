@@ -44,6 +44,12 @@ type Config struct {
 	TLSKey   string `json:"tls-key"`
 	// MaxUploads bounds concurrent PUT/bundle bodies (0 = server default 16).
 	MaxUploads int `json:"max-uploads"`
+	// AuthFailureBurst is the per-username failed-login budget per
+	// AuthFailureWindow. The per-address budget is 10x this, because addresses
+	// are shared behind NAT. 0 disables the limiter.
+	AuthFailureBurst  int          `json:"auth-failure-burst,omitempty"`
+	AuthFailureWindow jsonDuration `json:"auth-failure-window,omitempty"`
+
 	// MaxConns caps simultaneous TCP connections. This is the only limit that
 	// applies before a request exists; the upload limit runs inside a handler,
 	// after the socket and its buffers are already allocated. 0 = unlimited.

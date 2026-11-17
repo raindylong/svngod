@@ -74,6 +74,8 @@ type options struct {
 	hooksDir       string
 	tlsCert        string
 	tlsKey         string
+	authFailBurst  int
+	authFailWindow time.Duration
 	maxConns       int
 	maxUploads     int
 	maxUserUploads int
@@ -144,6 +146,8 @@ func main() {
 	fl.StringVar(&o.addr, "addr", ":8080", "listen address")
 	fl.IntVar(&o.maxUploads, "max-uploads", 16, "maximum concurrent PUT/bundle uploads (0 = unlimited)")
 	fl.IntVar(&o.maxConns, "max-conns", 512, "maximum simultaneous TCP connections, excess are reset (0 = unlimited)")
+	fl.IntVar(&o.authFailBurst, "auth-failure-burst", 10, "failed logins allowed per username per window before 429 (address budget is 10x; -1 disables)")
+	fl.DurationVar(&o.authFailWindow, "auth-failure-window", time.Minute, "window for the failed-login budget")
 	fl.IntVar(&o.commitBatch, "commit-batch", 16, "group concurrently arriving commits into batches of this size (0/1 = off)")
 	fl.IntVar(&o.commitWindowMs, "commit-window-ms", 2, "milliseconds to wait for more commits once a batch starts")
 	fl.StringVar(&o.adminAddr, "admin-addr", "", "management API listen address (empty = disabled; requires --config and a token)")
@@ -253,6 +257,8 @@ func main() {
 		MaxUserUploads:       o.maxUserUploads,
 		DisableMetrics:       !o.metrics,
 		MetricsToken:         o.metricsToken,
+		AuthFailureBurst:     o.authFailBurst,
+		AuthFailureWindow:    o.authFailWindow,
 		Logger:               log.New(os.Stderr, "svngod ", log.LstdFlags),
 	})
 
@@ -381,6 +387,13 @@ func runMultiRepo(configPath string, commitBatch, commitWindowMs int, adminAddr,
 	if maxConns == 0 {
 		maxConns = 512
 	}
+	// 0 in the JSON means "not set", so fall back to the flag-mode default rather
+	// than silently disabling the limiter in the path production actually uses.
+	// An operator who wants it off sets it to -1.
+	authBurst := cfg.AuthFailureBurst
+	if authBurst == 0 {
+		authBurst = 10 // unset: use the default
+	}
 	maxUserUploads := cfg.MaxUserUploads
 	if maxUserUploads == 0 {
 		maxUserUploads = 4
@@ -432,6 +445,8 @@ func runMultiRepo(configPath string, commitBatch, commitWindowMs int, adminAddr,
 		MaxUserUploads:       maxUserUploads,
 		DisableMetrics:       cfg.DisableMetrics,
 		MetricsToken:         cfg.MetricsToken,
+		AuthFailureBurst:     authBurst,
+		AuthFailureWindow:    time.Duration(cfg.AuthFailureWindow),
 		Logger:               logger,
 	})
 	if len(buildFailures) > 0 {

@@ -68,6 +68,13 @@ type Config struct {
 	// DisableMetrics turns off the /_metrics exposition endpoint.
 	DisableMetrics bool
 
+	// AuthFailureBurst is how many failed authentications from one source
+	// address, or against one username, are allowed per AuthFailureWindow before
+	// further attempts are refused with 429 until the window resets. 0 disables
+	// the limiter. Defaults to 10 per minute when unset by the caller.
+	AuthFailureBurst  int
+	AuthFailureWindow time.Duration
+
 	// MetricsToken gates /_metrics when set. The exposition labels every series
 	// with the repository name, so leaving it open to anyone who can reach the
 	// port leaks the tenant list and their failure state. Prometheus sends it as
@@ -270,6 +277,7 @@ type Server struct {
 	m            *metrics
 	scrubMu      sync.Mutex
 	scrub        scrubState // background Verifier watermark per repo
+	authFails    *authThrottle
 }
 
 // New builds a Server.
@@ -287,6 +295,7 @@ func New(cfg Config) *Server {
 		m:           newMetrics(cfg.MaxConcurrentUploads),
 		scrub:       scrubState{verified: map[string]uint64{}},
 		txnCleanup:  make(chan txnCleanupItem, 1024),
+		authFails:   newAuthThrottle(),
 	}
 	go s.txnCleanupLoop()
 	if cfg.MaxConcurrentUploads > 0 {
@@ -639,6 +648,18 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request, repo strin
 	if !ok {
 		return auth.Identity{}, s.unauthorized(w)
 	}
+	// Check the budget before the backend runs: the point is to not spend a
+	// password hash or an LDAP round trip on an attempt that is already refused.
+	window := s.authFailWindow()
+	keys := authThrottleKeys(r, user)
+	for _, k := range keys {
+		if blocked, wait := s.authFails.throttled(k, s.authFailBurstFor(k), window); blocked {
+			s.audit("deny", "reason", "auth_throttled", "repo", repo, "user", auditActor(user),
+				"remote", remoteHost(r), "retry_after", int(wait.Seconds()))
+			s.throttledAuthResponse(w, wait)
+			return auth.Identity{}, false
+		}
+	}
 	id, err := chain.Authenticate(r.Context(), user, pass)
 	if err != nil {
 		// Failed credentials are worth a record: repeated lines from one source
@@ -646,7 +667,15 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request, repo strin
 		// never logged.
 		s.audit("deny", "reason", "bad_credentials", "repo", repo, "user", auditActor(user),
 			"method", r.Method, "path", r.URL.Path)
+		for _, k := range keys {
+			s.authFails.fail(k, window)
+		}
 		return auth.Identity{}, s.unauthorized(w)
+	}
+	// Only this identity's own streak ends: another user's failures, or another
+	// address's, must not be cleared by this success.
+	for _, k := range keys {
+		s.authFails.succeed(k)
 	}
 	return id, true
 }
