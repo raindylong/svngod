@@ -178,9 +178,18 @@ func LoadRangeProgress(repo *fs.Repo, r io.Reader, from, to uint64, progress fun
 			// number that replay may already have moved past.
 			cur, herr := repo.HeadFresh()
 			if herr != nil {
-				return fmt.Errorf("dump: batch abandoned (%v); head unreadable: %w", err, herr)
+				return fmt.Errorf("dump: stopped (%v); head unreadable: %w", err, herr)
 			}
-			return fmt.Errorf("dump: batch abandoned, target head is %d (no gap introduced): %w", cur, err)
+			if cur == 0 {
+				return fmt.Errorf("dump: stopped, nothing published (target head stays 0): %w", err)
+			}
+			// Some revisions did land: a failed WAL write leaves a durable
+			// prefix that replay publishes. It is always contiguous from HEAD,
+			// so the import stopped at a clean boundary. Re-running the same
+			// dump resumes from there (revisions the target already has are
+			// skipped), which is why this is recoverable rather than fatal.
+			return fmt.Errorf("dump: stopped at revision %d (contiguous, no gap); re-run the same command to resume: %w",
+				cur, err)
 		}
 		for i, rv := range revs {
 			if rv == 0 {
