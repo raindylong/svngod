@@ -171,7 +171,16 @@ func LoadRangeProgress(repo *fs.Repo, r io.Reader, from, to uint64, progress fun
 		pending = pending[:0]
 		pendingChanges = pendingChanges[:0]
 		if err != nil {
-			return fmt.Errorf("dump: nothing published (target head stays %d): %w", lastRev, err)
+			// The batch is abandoned, so no gap is introduced. A failed WAL
+			// write cannot be undone, though: replay publishes whatever
+			// contiguous prefix is durable, which only advances HEAD. Report
+			// the head as unknown rather than stale, so nobody resumes from a
+			// number that replay may already have moved past.
+			cur, herr := repo.HeadFresh()
+			if herr != nil {
+				return fmt.Errorf("dump: batch abandoned (%v); head unreadable: %w", err, herr)
+			}
+			return fmt.Errorf("dump: batch abandoned, target head is %d (no gap introduced): %w", cur, err)
 		}
 		for i, rv := range revs {
 			if rv == 0 {

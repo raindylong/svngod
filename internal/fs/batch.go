@@ -558,8 +558,16 @@ func (r *Repo) CommitBatch(reqs []BatchCommit, opts ...BatchOption) ([]uint64, [
 	// They are independent objects; writing them concurrently keeps the batch
 	// at a few backend round trips instead of one per revision.
 	if err := r.writeBatchJournals(ctx, plans, lease.token, created); err != nil {
+		// Records are written one revision at a time, so a failure part-way
+		// leaves a durable prefix. Replay may publish that prefix, which means
+		// the batch is not wholly abandoned - and reporting the built revision
+		// numbers here would let an AllOrNothing caller believe they were
+		// rolled back. Zero them and let the caller treat the batch as failed;
+		// any prefix that does surface came from replay publishing a record
+		// that reached a quorum, and is contiguous from HEAD.
 		for _, x := range plans {
 			errs[x.idx] = err
+			revs[x.idx] = 0
 		}
 		return revs, errs, err
 	}
@@ -701,19 +709,33 @@ type batchConfig struct {
 // BatchOption configures one CommitBatch call.
 type BatchOption func(*batchConfig)
 
-// AllOrNothing makes CommitBatch publish either every request or none.
+// AllOrNothing makes CommitBatch abandon the whole batch on a rejected request
+// instead of publishing the requests around it.
 //
-// The default (and what the server's commit queue relies on) is per-request:
-// a rejected request is reported in errs and the rest are still applied, so
+// The default (and what the server's commit queue relies on) is per-request: a
+// rejected request is reported in errs and the rest are still applied, so
 // concurrent commits to disjoint paths merge instead of fighting. That is the
 // right semantics for interactive clients, but it leaves a gap in the revision
 // sequence when a request in the middle is rejected.
 //
 // A bulk importer cannot tolerate a gap: it replays a source history whose
 // revisions must be contiguous, and a missing number corrupts every later
-// revision's parent chain. With this option any rejection aborts the whole
-// batch before a single object is written, so the caller can retry or repair
-// the input knowing nothing was published.
+// revision's parent chain.
+//
+// What this guarantees, precisely:
+//
+//   - A request rejected by the tree check, or a revision that fails to build,
+//     aborts the batch before any object is written. Nothing is published and
+//     the repository is untouched.
+//   - A failure while writing the WAL cannot be taken back: records are
+//     durable objects written one revision at a time, and replay publishes
+//     whatever contiguous prefix reached a quorum. That prefix is always
+//     contiguous from HEAD (replay breaks at the first missing record or
+//     mismatched parent), so the result is a shorter batch, never a hole. revs
+//     is zeroed in that case so a caller cannot mistake it for success.
+//
+// The invariant the importer depends on - no gap in the revision sequence -
+// holds in every failure mode. "Published nothing" does not.
 func AllOrNothing() BatchOption {
 	return func(c *batchConfig) { c.allOrNothing = true }
 }
@@ -737,6 +759,18 @@ func (r *Repo) abortBatch(errs []error, cause int, why string) ([]uint64, []erro
 		if errs[i] == nil {
 			errs[i] = err
 		}
+	}
+	return revs, errs, err
+}
+
+// abortPlans marks every request failed and zeroes its revision, for a batch
+// that failed before its HEAD CAS. Nothing is visible at that point, so
+// returning the built revision numbers would let an AllOrNothing caller believe
+// the batch had been published and then rolled back.
+func abortPlans(revs []uint64, errs []error, plans []batchPlan, err error) ([]uint64, []error, error) {
+	for _, p := range plans {
+		errs[p.idx] = err
+		revs[p.idx] = 0
 	}
 	return revs, errs, err
 }

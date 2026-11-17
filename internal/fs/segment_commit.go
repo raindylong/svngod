@@ -51,17 +51,11 @@ func (r *Repo) publishSegmentPlans(ctx context.Context, lease *commitLease, cur 
 		g.sha = hex.EncodeToString(sum[:])
 		g.ref = segmentRef{First: g.first, Count: g.count, SHA256: g.sha}
 		if err := r.store.Put(ctx, r.segmentKeyFor(g.first, g.count), data); err != nil {
-			for _, p := range plans {
-				errs[p.idx] = err
-			}
-			return revs, errs, err
+			return abortPlans(revs, errs, plans, err)
 		}
 	}
 	if verr := lease.Verify(ctx, r.store); verr != nil {
-		for _, p := range plans {
-			errs[p.idx] = verr
-		}
-		return revs, errs, verr
+		return abortPlans(revs, errs, plans, verr)
 	}
 	// The shard index is a mutable object rewritten from a read-modify-write.
 	// The commit lease normally serialises those writes, but a process that
@@ -109,19 +103,13 @@ func (r *Repo) publishSegmentPlans(ctx context.Context, lease *commitLease, cur 
 				r.rollbackSegmentIndex(ctx, ref)
 			}
 		}
-		for _, p := range plans {
-			errs[p.idx] = aerr
-		}
-		return revs, errs, aerr
+		return abortPlans(revs, errs, plans, aerr)
 	}
 	if err := r.writeSegmentJournalBatch(ctx, batchFirst, batchCount, journals, lease.token, cur.Head, created); err != nil {
 		for _, ref := range written {
 			r.rollbackSegmentIndex(ctx, ref)
 		}
-		for _, p := range plans {
-			errs[p.idx] = err
-		}
-		return revs, errs, err
+		return abortPlans(revs, errs, plans, err)
 	}
 	// Chaos hook (test-only): exit after the WAL batch record but before the
 	// HEAD CAS, so a live quorum store exercises roll-forward of a whole batch.
@@ -138,7 +126,7 @@ func (r *Repo) publishSegmentPlans(ctx context.Context, lease *commitLease, cur 
 			for _, ref := range written {
 				r.rollbackSegmentIndex(ctx, ref)
 			}
-			return revs, errs, cerr
+			return abortPlans(revs, errs, plans, cerr)
 		}
 		now := cur.Head
 		if c, _, rerr := r.readCurrentStrict(); rerr == nil {
@@ -146,13 +134,19 @@ func (r *Repo) publishSegmentPlans(ctx context.Context, lease *commitLease, cur 
 		}
 		for _, g := range groups {
 			owned := now >= g.first+g.count-1 && r.segmentOwns(ctx, g.ref, lease.token, g.parent)
-			if owned {
-				continue
-			}
 			for _, p := range plans {
-				if p.rev >= g.first && p.rev < g.first+g.count && p.rev > now {
-					errs[p.idx] = store.ErrQuorumUnmet
+				if p.rev < g.first || p.rev >= g.first+g.count {
+					continue
 				}
+				if owned && p.rev <= now {
+					continue // this group is ours and published: keep the revision
+				}
+				// Either our group was never published, or the number was taken
+				// by another writer's replay. In both cases this request did not
+				// land: report it failed and clear the revision so an
+				// AllOrNothing caller cannot read it as success.
+				errs[p.idx] = store.ErrQuorumUnmet
+				revs[p.idx] = 0
 			}
 		}
 		if now < last {
