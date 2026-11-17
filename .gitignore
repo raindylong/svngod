@@ -1,3 +1,12 @@
 .bin/
+bin/
 *.log
 /tmp/
+
+# Build outputs: `go build ./cmd/...` without -o drops the binary in the
+# package directory, and `scripts/build.sh` writes to bin/. Neither belongs in
+# the repository - a committed binary is 14 MB of stale arm64 code that the next
+# reader will mistake for source of truth.
+/svngod
+/svnadmin
+/svngocli

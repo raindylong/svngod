@@ -34,6 +34,7 @@ import (
 	"svngod/internal/fs"
 	"svngod/internal/fs/store"
 	"svngod/internal/mirrorspec"
+	versionpkg "svngod/internal/version"
 )
 
 const (
@@ -173,6 +174,16 @@ func (o *options) mirrorStore(name string) (store.Store, string, error) {
 }
 
 func main() {
+	// --version is answered before anything else: every subcommand validates
+	// its arguments and this binary exits 2 with usage when they are missing, so
+	// checking later would print usage instead of a version.
+	if len(os.Args) >= 2 {
+		switch os.Args[1] {
+		case "--version", "-version", "-V", "version":
+			fmt.Println(versionpkg.Line("svnadmin"))
+			return
+		}
+	}
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)

@@ -38,6 +38,7 @@ import (
 	"svngod/internal/fs"
 	"svngod/internal/fs/store"
 	"svngod/internal/server"
+	versionpkg "svngod/internal/version"
 )
 
 type options struct {
@@ -126,6 +127,15 @@ func (o *options) buildChain() *auth.Chain {
 }
 
 func main() {
+	// Answer --version before anything else: this binary requires --repo-root or
+	// --config, and a version query must not have to supply them.
+	for _, a := range os.Args[1:] {
+		switch a {
+		case "--version", "-version", "-V":
+			fmt.Println(versionpkg.Line("svngod"))
+			return
+		}
+	}
 	cleanupStaleTempFiles()
 	var o options
 	fl := flag.NewFlagSet("svngod", flag.ExitOnError)

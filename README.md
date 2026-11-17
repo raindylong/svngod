@@ -17,9 +17,16 @@
 ## 快速开始
 
 ```bash
+# 发布构建：把版本号写进二进制（--version 才有意义）
+scripts/build.sh 1.2.3            # 输出到 ./bin，版本/commit/构建时间由 ldflags 注入
+scripts/build.sh                  # 不传版本时回退到 git describe
+
+# 或手工构建（--version 会回退到 Go 工具链记录的 VCS 信息）
 CGO_ENABLED=0 go build -o svngod ./cmd/svngod
 CGO_ENABLED=0 go build -o svnadmin ./cmd/svnadmin
 CGO_ENABLED=0 go build -o svngocli ./cmd/svngocli   # 客户端（需要本机 svn 命令）
+
+svngod --version                  # 三个二进制都支持 --version / --version
 
 # 本地单库（flag 模式）
 svnadmin create /srv/svn/demo                 # 每修订一个对象（v1）

@@ -43,12 +43,17 @@ import (
 	"time"
 
 	"svngod/internal/cdc"
+	versionpkg "svngod/internal/version"
 )
 
 var errOutOfDate = errors.New("target changed on the server")
 
+// clientVersion is injected at link time like the servers'; the User-Agent and
+// `svngocli version` both read it through internal/version so they cannot drift
+// apart.
+var version = versionpkg.Get().Version
+
 const (
-	version     = "0.2.0"
 	bundleMagic = "SVNGB1\n"
 	// The bundle body is spooled to a temp file and streamed, so file size is
 	// bounded by disk, not memory. Keep only a runaway guard for the whole
@@ -66,7 +71,7 @@ func main() {
 	case "help", "--help", "-h":
 		usage()
 	case "version", "--version", "-V":
-		fmt.Printf("svngocli %s (svngod bulk commit client)\n", version)
+		fmt.Println(versionpkg.Line("svngocli") + " (svngod bulk commit client)")
 	case "upload":
 		os.Exit(cmdUpload(args[1:]))
 	case "commit", "ci":
