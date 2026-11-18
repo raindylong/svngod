@@ -251,3 +251,10 @@ Apache License 2.0，全文见 [`LICENSE`](LICENSE)，版权声明与第三方�
 依赖漏洞扫描：`scripts/vulncheck.sh`（基于 govulncheck）。只对**代码可达**的漏洞
 判失败；仅存在于依赖模块中但未被调用的条目会打印出来但不阻塞——否则像
 `x/crypto` 的 openpgp（svngod 根本不用它）这类无解条目会让门槛永久红灯，最后没人看。
+
+## 变更记录
+
+升级前请读 [`CHANGELOG.md`](CHANGELOG.md)，特别是「升级注意事项」一节——
+近期有三项会改变既有部署的行为：`/_metrics` 需要认证、认证失败限流、
+TCP 连接数上限。数据安全与原子性的审计方法与已知边界见
+[`docs/数据安全与原子性审计清单.md`](docs/数据安全与原子性审计清单.md)。
