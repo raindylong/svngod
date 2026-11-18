@@ -372,19 +372,56 @@ func escapeLabel(s string) string {
 	return strings.NewReplacer("\\", "\\\\", "\n", "\\n", "\"", "\\\"").Replace(s)
 }
 
-// countingReadCloser counts the bytes a handler reads from the request body.
+// countingReadCloser counts the bytes a handler reads from the request body and,
+// when limit is positive, refuses to read past it.
+//
+// The limit lives here because this is the one place every request body passes
+// through. Per-handler limits already exist (1 MiB for skel bodies, 64 GiB for a
+// PUT), but nothing bounded a request as a whole: a handler added later without
+// its own limit had no backstop, and a request whose Content-Length understates
+// the body was never compared against anything. Counting as bytes arrive makes
+// the cap immune to a lying header.
 type countingReadCloser struct {
-	r io.ReadCloser
-	n int64
+	r     io.ReadCloser
+	n     int64
+	limit int64
+	// onOver fires the first time a read is refused for exceeding the cap. The
+	// router uses it to suppress the handler's own response, which would
+	// otherwise commit a 4xx for a read error it cannot classify.
+	onOver func()
 }
 
 func (c *countingReadCloser) Read(p []byte) (int, error) {
+	if c.limit <= 0 {
+		n, err := c.r.Read(p)
+		c.n += int64(n)
+		return n, err
+	}
+	// Allow reading exactly limit bytes; the cap is a maximum, not a forbidden
+	// boundary. Anything beyond that is refused on the next call, so a body of
+	// exactly limit is legal while limit+1 is not.
+	if c.n >= c.limit {
+		if c.onOver != nil {
+			c.onOver()
+		}
+		return 0, &http.MaxBytesError{Limit: c.limit}
+	}
+	remaining := c.limit - c.n
+	if int64(len(p)) > remaining {
+		p = p[:remaining]
+	}
 	n, err := c.r.Read(p)
 	c.n += int64(n)
 	return n, err
 }
 
 func (c *countingReadCloser) Close() error { return c.r.Close() }
+
+// overLimit reports whether the cap was hit, so the router can answer 413 even
+// when the handler swallowed the read error.
+func (c *countingReadCloser) overLimit() bool {
+	return c.limit > 0 && c.n >= c.limit
+}
 
 // noteRepoRecovered counts a repository becoming ready after having been down.
 func (m *metrics) noteRepoRecovered(name string) {

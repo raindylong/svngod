@@ -76,6 +76,7 @@ type options struct {
 	tlsKey         string
 	authFailBurst  int
 	authFailWindow time.Duration
+	maxBodyBytes   int64
 	maxConns       int
 	maxUploads     int
 	maxUserUploads int
@@ -146,6 +147,7 @@ func main() {
 	fl.StringVar(&o.addr, "addr", ":8080", "listen address")
 	fl.IntVar(&o.maxUploads, "max-uploads", 16, "maximum concurrent PUT/bundle uploads (0 = unlimited)")
 	fl.IntVar(&o.maxConns, "max-conns", 512, "maximum simultaneous TCP connections, excess are reset (0 = unlimited)")
+	fl.Int64Var(&o.maxBodyBytes, "max-body-bytes", 0, "cap on any request body in bytes (0 = built-in 1 TiB; -1 = unlimited)")
 	fl.IntVar(&o.authFailBurst, "auth-failure-burst", 10, "failed logins allowed per username per window before 429 (address budget is 10x; -1 disables)")
 	fl.DurationVar(&o.authFailWindow, "auth-failure-window", time.Minute, "window for the failed-login budget")
 	fl.IntVar(&o.commitBatch, "commit-batch", 16, "group concurrently arriving commits into batches of this size (0/1 = off)")
@@ -259,6 +261,7 @@ func main() {
 		MetricsToken:         o.metricsToken,
 		AuthFailureBurst:     o.authFailBurst,
 		AuthFailureWindow:    o.authFailWindow,
+		MaxBodyBytes:         o.maxBodyBytes,
 		Logger:               log.New(os.Stderr, "svngod ", log.LstdFlags),
 	})
 
@@ -447,6 +450,7 @@ func runMultiRepo(configPath string, commitBatch, commitWindowMs int, adminAddr,
 		MetricsToken:         cfg.MetricsToken,
 		AuthFailureBurst:     authBurst,
 		AuthFailureWindow:    time.Duration(cfg.AuthFailureWindow),
+		MaxBodyBytes:         cfg.MaxBodyBytes,
 		Logger:               logger,
 	})
 	if len(buildFailures) > 0 {

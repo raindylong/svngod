@@ -44,6 +44,10 @@ type Config struct {
 	TLSKey   string `json:"tls-key"`
 	// MaxUploads bounds concurrent PUT/bundle bodies (0 = server default 16).
 	MaxUploads int `json:"max-uploads"`
+	// MaxBodyBytes caps any request body. 0 uses the built-in default; -1
+	// disables the cap. Per-endpoint limits are stricter and unchanged.
+	MaxBodyBytes int64 `json:"max-body-bytes,omitempty"`
+
 	// AuthFailureBurst is the per-username failed-login budget per
 	// AuthFailureWindow. The per-address budget is 10x this, because addresses
 	// are shared behind NAT. 0 disables the limiter.

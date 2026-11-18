@@ -23,6 +23,14 @@ import (
 	"svngod/internal/fs/store"
 )
 
+// defaultMaxBodyBytes is the global request-body cap.
+//
+// It must sit above every per-handler limit or legitimate traffic breaks: a PUT
+// allows 64 GiB, and a bundle may stream up to 1 TiB. This value is the ceiling
+// for everything else, chosen to be above the largest legitimate single request
+// while still refusing an unbounded body.
+const defaultMaxBodyBytes int64 = 1 << 40 // 1 TiB, matching the bundle stream limit
+
 // RepoOpener opens (and caches) a repository by name.
 type RepoOpener func(name string) (*fs.Repo, error)
 
@@ -67,6 +75,13 @@ type Config struct {
 
 	// DisableMetrics turns off the /_metrics exposition endpoint.
 	DisableMetrics bool
+
+	// MaxBodyBytes caps the size of any request body, in bytes. Per-handler
+	// limits already exist for each endpoint, but nothing bounded a request as a
+	// whole: a handler added later had no backstop, and a body whose
+	// Content-Length understated it was never compared against anything. 0 uses
+	// defaultMaxBodyBytes; a negative value disables the cap.
+	MaxBodyBytes int64
 
 	// AuthFailureBurst is how many failed authentications from one source
 	// address, or against one username, are allowed per AuthFailureWindow before
@@ -409,14 +424,28 @@ type statusWriter struct {
 	http.ResponseWriter
 	code int
 	n    int64
+	// suppressed drops everything the handler writes after the request was
+	// refused for an oversized body. A handler that already mapped the read
+	// error to its own 4xx would otherwise commit that status before the router
+	// could answer 413, and a committed status cannot be taken back.
+	suppressed bool
 }
 
 // committed reports whether a status line has already gone out. Once it has, the
 // response cannot be turned into an error, so a recovering handler must not try.
 func (s *statusWriter) committed() bool { return s.code != 0 || s.n != 0 }
 
-func (s *statusWriter) WriteHeader(code int) { s.code = code; s.ResponseWriter.WriteHeader(code) }
+func (s *statusWriter) WriteHeader(code int) {
+	if s.suppressed {
+		return
+	}
+	s.code = code
+	s.ResponseWriter.WriteHeader(code)
+}
 func (s *statusWriter) Write(b []byte) (int, error) {
+	if s.suppressed {
+		return len(b), nil
+	}
 	if s.code == 0 {
 		s.code = 200
 	}
@@ -440,13 +469,21 @@ func (s *Server) Handler() http.Handler {
 
 // route is the top-level dispatcher: auth, then per-method handling.
 func (s *Server) route(w http.ResponseWriter, r *http.Request) {
-	var cr *countingReadCloser
-	if r.Body != nil {
-		cr = &countingReadCloser{r: r.Body}
-		r.Body = cr
-	}
+	// sw must exist before the body wrapper: the wrapper's over-limit hook flips
+	// sw.suppressed while a handler is reading.
 	sw := &statusWriter{ResponseWriter: w}
 	w = sw
+	var cr *countingReadCloser
+	if r.Body != nil {
+		// One cap for every path. It is applied where the bytes are already
+		// counted rather than in each handler, so a new endpoint inherits it.
+		cr = &countingReadCloser{r: r.Body, limit: s.maxBodyBytes()}
+		// Fires while the handler is reading: suppress whatever it writes for
+		// the read error so the router can answer 413 instead of the handler's
+		// guess at what a short read means.
+		cr.onOver = func() { sw.suppressed = true }
+		r.Body = cr
+	}
 	// user is set after authentication and used by both the panic report and the
 	// access log; declare it here so the recover closure can see it.
 	user := ""
@@ -483,6 +520,18 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.m.observe(r.Method, sw.code, elapsed)
 		if r.Method == "MERGE" {
 			s.m.observeCommit(elapsed)
+		}
+		// A body over the cap surfaces as http.MaxBytesError while a handler is
+		// reading. Handlers map read errors inconsistently (400, or silently
+		// truncate), so the router answers 413 whenever the cap was hit and the
+		// handler has not already committed a *successful* response. A 4xx the
+		// handler wrote is replaced: the real cause is the oversized body.
+		if cr != nil && cr.overLimit() {
+			// Re-enable writing for this one response: the handler's output was
+			// dropped, so nothing has been committed to the client yet.
+			sw.suppressed = false
+			sw.code = 0
+			http.Error(sw, "request body too large", http.StatusRequestEntityTooLarge)
 		}
 		if s.cfg.Logger != nil {
 			s.cfg.Logger.Printf("HTTP %d %s %s user=%q %v", sw.code, r.Method, r.URL.Path, user, time.Since(start).Round(time.Microsecond))
@@ -745,6 +794,18 @@ func (s *Server) authorizeMetrics(w http.ResponseWriter, r *http.Request) bool {
 
 // unauthorizedMetrics challenges for metrics credentials without claiming the
 // repository realm.
+// maxBodyBytes resolves the configured body cap. 0 means the default; a
+// negative value disables the cap entirely.
+func (s *Server) maxBodyBytes() int64 {
+	if s.cfg.MaxBodyBytes == 0 {
+		return defaultMaxBodyBytes
+	}
+	if s.cfg.MaxBodyBytes < 0 {
+		return 0
+	}
+	return s.cfg.MaxBodyBytes
+}
+
 func (s *Server) unauthorizedMetrics(w http.ResponseWriter) {
 	w.Header().Set("WWW-Authenticate", `Basic realm="svngod-metrics"`)
 	http.Error(w, "metrics requires credentials", http.StatusUnauthorized)
