@@ -413,6 +413,12 @@ const repairListTimeout = 90 * time.Second
 // continues from the missing-object counts.
 const repairCopyTimeout = 10 * time.Minute
 
+// repairJoinGrace is how long a repair pass waits for workers to drain after
+// their context has expired. The workers hold no lock the caller needs, and
+// partial progress is already recorded, so the pass reports what it got rather
+// than waiting for a store that ignores cancellation.
+const repairJoinGrace = 30 * time.Second
+
 // isMutableKey reports whether an object's content must always be mirrored
 // from the primary (the only mutable object today is the HEAD `current`).
 func isMutableKey(key string) bool {

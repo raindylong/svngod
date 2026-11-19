@@ -57,6 +57,21 @@
   `wg.Wait()` 无上限——提交路径上即 commit lease 永不释放，后续提交全部排队。
   现在聚合等待有界（15s + 3s grace），未 ack 的副本按 hung 处理并强制下次 repair
   枚举对象，返回值仍是 `ErrQuorumUnmet`（没 ack 不是已 ack）。
+- **健康检查返回常量，无法反映真实就绪状态**：`/_api/v1/health` 原来无条件返回
+  200 `ok`，即使所有仓库 self-check 失败。放在 LB / Kubernetes readiness 后面会把流量
+  导向不能服务的实例。现在任一仓库未就绪即返回 503 `not_ready` 并列出仓库名与原因；
+  无就绪记录的仓库按未就绪处理；零仓库配置仍返回 ok。
+- **镜像临时文件落在 /tmp，清理正则还漏了 4 类前缀**：镜像写要把整个对象缓冲一份
+  （上限 64 GiB），`os.CreateTemp("", ...)` 即 `os.TempDir()`——容器里常是 tmpfs（吃
+  内存）或小分区（ENOSPC），且要等到有人提交大文件才暴露。新增 `-temp-dir`（启动时设
+  `TMPDIR`，一处覆盖全部 7 个调用点，并真实写探针验证可写）。同时补全清理正则：
+  `svngod-mirror-fast-`、`svngod-stream-`、`svngod-repair-`、`svngod-recover-` 此前
+  **永不回收**（无报错无日志，只是磁盘慢慢满）。
+- **镜像修复的两个 join 没有上限**：listing 后的 `wg.Wait()` 与复制后的 `cw.Wait()`
+  只受逐项超时约束，join 本身无界；忽略取消的存储会让整轮修复永久挂住，而修复是备机
+  恢复的唯一机制。改为有界 join，**超时即放弃本轮**——继续读 `sets[]`/`reachable[]`/
+  `missing[]` 会与仍在运行的 worker 竞争，还可能把半观测状态当成完整状态（实测触发 6
+  处数据竞争）。
 - **Bundle 分块上传可能卡住请求，超时还会谎报成功**：`handleBundleChunks`（16 worker）
   与 `storeChunksParallel`（8 worker）共 7 处裸 `wg.Wait()`，ctx 来自
   `context.Background()`，服务端不设 `ReadTimeout`/`WriteTimeout`。worker 卡在存储里时

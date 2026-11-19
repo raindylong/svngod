@@ -58,6 +58,13 @@ type MirrorStore struct {
 	// acknowledged while too few replicas are reachable.
 	writeQuorum int
 
+	// repair timeouts are per-instance so a test can exercise the bounded join
+	// without racing a background repair loop in another test. Zero means the
+	// package defaults below.
+	listTimeout time.Duration
+	copyTimeout time.Duration
+	joinGrace   time.Duration
+
 	// repoPrefix scopes repair/listing to one repository. Without it, mirrors
 	// sharing a bucket or a local root would copy every other repository's
 	// objects into this repository's backends during repair.

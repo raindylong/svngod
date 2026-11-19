@@ -505,6 +505,55 @@ func (m *MirrorStore) upToDate() bool {
 	return true
 }
 
+// The accessors read the per-instance override, falling back to the package
+// default. Per-instance rather than a mutable global: a test that shortened a
+// package variable raced the background repair loops of other tests.
+func (m *MirrorStore) listBudget() time.Duration {
+	if m.listTimeout > 0 {
+		return m.listTimeout
+	}
+	return repairListTimeout
+}
+
+func (m *MirrorStore) copyBudget() time.Duration {
+	if m.copyTimeout > 0 {
+		return m.copyTimeout
+	}
+	return repairCopyTimeout
+}
+
+func (m *MirrorStore) joinBudget() time.Duration {
+	if m.joinGrace > 0 {
+		return m.joinGrace
+	}
+	return repairJoinGrace
+}
+
+// joinBounded waits for wg but never longer than d. A bare wg.Wait() has no
+// upper bound, and a repair pass has two of them (listing, then copying).
+// Workers call into the store, and a store that ignores cancellation keeps its
+// goroutine parked forever - so an unbounded join stops the only mechanism that
+// heals a standby, silently, while the process still looks healthy.
+//
+// Returning false does not leak anything that matters: the workers hold no lock
+// the caller needs, the missing-object counters they update are mutex-guarded,
+// and the next pass resumes from those counters. Reports false on timeout.
+func joinBounded(wg *sync.WaitGroup, d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-done:
+		return true
+	case <-t.C:
+		return false
+	}
+}
+
 // repairInternal is one repair pass; callers coordinate with repairOnce.
 //
 // It is deliberately symmetric: every reachable mirror is treated as a source
@@ -534,7 +583,7 @@ func (m *MirrorStore) repairInternal() {
 			// longer than a couple of seconds even for a tiny list, so the probe
 			// gets 30s; it then receives the normal full-listing budget. The
 			// previous 5s probe kept a live restarting standby failing forever.
-			timeout := repairListTimeout
+			timeout := m.listBudget()
 			if !m.isHealthy(i) {
 				pctx, pcancel := context.WithTimeout(context.Background(), 30*time.Second)
 				perr := m.probeReachable(pctx, i)
@@ -555,7 +604,23 @@ func (m *MirrorStore) repairInternal() {
 			sets[i] = ks
 		}(i)
 	}
-	wg.Wait()
+	// The loop above gives each mirror its own deadline, but nothing bounded the
+	// join: a store that ignores cancellation parks its goroutine, and this pass
+	// is the only thing that brings a standby back. One listing budget plus the
+	// grace covers the slowest legitimate case (a mirror that used its whole
+	// budget) and still returns.
+	//
+	// Abandoning the pass on timeout is deliberate, not lazy. reachable[] and
+	// sets[] are written by the goroutines above; once the join gives up, one of
+	// them may still be mid-write, so reading them here would be a data race and
+	// could also treat a half-filled listing as complete - which would mark a
+	// mirror that lacks objects as healthy. Nothing is lost by stopping: the next
+	// pass re-lists from scratch.
+	if !joinBounded(&wg, m.listBudget()+m.joinBudget()) {
+		log.Printf("repair %s: listing did not finish within %v; abandoning this pass (next pass re-lists)",
+			strings.Trim(m.repoPrefix, "/"), m.listBudget()+m.joinBudget())
+		return
+	}
 	if dbg {
 		log.Printf("repair %s: listed reachable=%v", strings.Trim(m.repoPrefix, "/"), reachable)
 	}
@@ -582,7 +647,7 @@ func (m *MirrorStore) repairInternal() {
 	}
 	failed := make([]bool, n)
 
-	ctx, cancel := context.WithTimeout(context.Background(), repairCopyTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), m.copyBudget())
 	defer cancel()
 
 	// Mutable objects (the HEAD pointer) are reconciled first and serially:
@@ -634,7 +699,16 @@ send:
 		}
 	}
 	close(jobs)
-	cw.Wait()
+	// Same hazard as the listing join, and the same answer: ctx bounds the work,
+	// not the wait. missing[] and failed[] are written by these workers, so once
+	// the join gives up, reading them below would be a data race and could report
+	// a mirror healthy on half-observed counters. Stop the pass; the next one
+	// recomputes everything.
+	if !joinBounded(&cw, m.joinBudget()) {
+		log.Printf("repair %s: copy workers still running after %v; abandoning this pass (next pass resumes)",
+			strings.Trim(m.repoPrefix, "/"), m.joinBudget())
+		return
+	}
 	if dbg {
 		log.Printf("repair %s: copy done", strings.Trim(m.repoPrefix, "/"))
 	}

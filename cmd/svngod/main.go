@@ -71,6 +71,7 @@ type options struct {
 	adminToken     string
 	adminAllowCIDR string
 
+	tempDir        string
 	hooksDir       string
 	tlsCert        string
 	tlsKey         string
@@ -161,6 +162,7 @@ func main() {
 	fl.DurationVar(&o.scrubInterval, "scrub-interval", 10*time.Minute, "background integrity-check interval (0 = disabled)")
 	fl.StringVar(&o.basePath, "base-path", "/svn", "URL prefix for repositories")
 	fl.StringVar(&o.repoRoot, "repo-root", "./repos", "local directory holding repositories")
+	fl.StringVar(&o.tempDir, "temp-dir", "", "directory for transfer temp files (default os.TempDir(); set this when /tmp is tmpfs or small)")
 	fl.StringVar(&o.passwd, "passwd", "", "local password file (plain/{SHA}/{CRYPT})")
 	fl.StringVar(&o.authzFile, "authz", "", "authz file")
 	fl.StringVar(&o.ldapURL, "ldap-url", "", "ldap://host:port or ldaps://host:port")
@@ -183,6 +185,13 @@ func main() {
 	fl.StringVar(&configPath, "config", "", "JSON config file (multi-repo; overrides flags)")
 	fl.BoolVar(&o.strictStart, "strict-start", false, "refuse to start when a configured repository is unreadable")
 	_ = fl.Parse(os.Args[1:])
+
+	// Before any branch that can write: both the single-repo and the config path
+	// create temp files, and the whole point is to move them off /tmp. Ignoring
+	// the cleanup is deliberate - the process lives with this setting.
+	if _, err := applyTempDir(o.tempDir); err != nil {
+		log.Fatalf("--temp-dir: %v", err)
+	}
 
 	if configPath != "" {
 		runMultiRepo(configPath, o.commitBatch, o.commitWindowMs, o.adminAddr, o.adminToken, o.adminAllowCIDR, o.strictStart)
@@ -542,9 +551,59 @@ func startAdmin(configPath string, cfg *config.Config, cfgs map[string]*server.R
 	}()
 }
 
+// applyTempDir routes temporary transfer files to dir.
+//
+// Mirror writes buffer a whole object through os.CreateTemp so a standby gets
+// the same bytes twice, and those objects reach 64 GiB. os.TempDir() is /tmp,
+// which in a container is commonly tmpfs (a large commit then consumes memory)
+// or a small partition (ENOSPC), and neither surfaces until someone commits
+// something big. Setting TMPDIR moves every call site at once because that is
+// what os.TempDir() reads.
+//
+// An empty dir keeps the default. The directory is created if missing and
+// probed with a real write, because a path that exists but is not writable
+// would otherwise fail at the first large commit instead of at startup.
+//
+// The returned cleanup restores the previous TMPDIR; production ignores it.
+func applyTempDir(dir string) (cleanup func(), err error) {
+	prev, had := os.LookupEnv("TMPDIR")
+	restore := func() {
+		if had {
+			os.Setenv("TMPDIR", prev)
+			return
+		}
+		os.Unsetenv("TMPDIR")
+	}
+	if dir == "" {
+		return restore, nil
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("temp dir %q: %w", dir, err)
+	}
+	probe, err := os.CreateTemp(dir, ".svngod-probe-")
+	if err != nil {
+		return nil, fmt.Errorf("temp dir %q is not writable: %w", dir, err)
+	}
+	probeName := probe.Name()
+	probe.Close()
+	os.Remove(probeName)
+	os.Setenv("TMPDIR", dir)
+	return restore, nil
+}
+
 // staleTempRe matches temp files created by server/mirror transfers, which
-// embed the owning process id: svngod-<kind>-<pid>-<random>.
-var staleTempRe = regexp.MustCompile(`^svngod-(?:body|delta|text|txn|put|mirror)-(\d+)-`)
+// embed the owning process id.
+//
+// Two shapes exist because os.CreateTemp appends its random suffix to whatever
+// pattern it is given:
+//
+//	svngod-<kind>-<pid>-<random>   kind in body|delta|text|txn|put|mirror|mirror-fast|stream
+//	svngod-<kind>-<pid>            kind in repair|recover (pattern ends at pid)
+//
+// Every prefix listed here must correspond to a real os.CreateTemp call. A
+// missed one leaves files that can be as large as the object being repaired
+// half-written on disk forever, which is how a disk fills up over months.
+var staleTempRe = regexp.MustCompile(`^svngod-(?:(?:mirror-fast|body|delta|text|txn|put|mirror|stream)-(\d+)-|(?:repair|recover)-(\d+))`)
 
 // cleanupStaleTempFiles removes transfer temp files left behind by processes
 // that no longer exist (a crash or kill during an upload). The running
@@ -566,7 +625,13 @@ func cleanupStaleTempFilesIn(dir string, alive func(int) bool) {
 		if m == nil {
 			continue
 		}
-		pid, err := strconv.Atoi(m[1])
+		// Exactly one of the two alternatives matched, so exactly one group is
+		// non-empty.
+		digits := m[1]
+		if digits == "" {
+			digits = m[2]
+		}
+		pid, err := strconv.Atoi(digits)
 		if err != nil || pid == os.Getpid() || alive(pid) {
 			continue
 		}

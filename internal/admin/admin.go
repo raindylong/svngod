@@ -121,10 +121,49 @@ func (s *Service) audit(r *http.Request, action, repo, result string) {
 	s.logger.Printf("admin action=%s repo=%q result=%s remote=%s", action, repo, result, r.RemoteAddr)
 }
 
+// health reports whether this instance can actually serve.
+//
+// It used to return a constant "ok", which made it useless as a readiness
+// probe: an instance whose stores were all unreachable still answered 200, so a
+// load balancer or Kubernetes kept routing traffic to a process that could not
+// serve one request. That is the failure mode that looks like a good deploy.
+//
+// One unready repository fails the whole probe. Serving with a partially broken
+// repository means some tenants get errors while the orchestrator sees a healthy
+// instance and keeps sending them; failing out is the honest signal, and the
+// operator gets a name and a reason instead of having to scrape /_metrics.
+//
+// A configuration with no repositories stays "ok": a fresh install must be able
+// to become ready before anything is added.
 func (s *Service) health(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status": "ok", "generation": s.gen, "repos": s.srv.RepoNames(),
-	})
+	names := []string{}
+	ready := map[string]bool{}
+	reasons := map[string]string{}
+	if s.srv != nil {
+		names = s.srv.RepoNames()
+		ready, reasons = s.srv.RepoReadySnapshot()
+	}
+	unready := make([]map[string]any, 0)
+	for _, n := range names {
+		// A repository with no readiness entry has never been checked. Treat
+		// that as unready rather than healthy: the probe must not pass on an
+		// assumption.
+		if ok, known := ready[n]; !known || !ok {
+			unready = append(unready, map[string]any{"repo": n, "reason": reasons[n]})
+		}
+	}
+	body := map[string]any{
+		"generation": s.gen,
+		"repos":      names,
+	}
+	if len(unready) > 0 {
+		body["status"] = "not_ready"
+		body["unready"] = unready
+		writeJSON(w, http.StatusServiceUnavailable, body)
+		return
+	}
+	body["status"] = "ok"
+	writeJSON(w, http.StatusOK, body)
 }
 
 func (s *Service) getStatus(w http.ResponseWriter, r *http.Request) {
