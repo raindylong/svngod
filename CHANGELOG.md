@@ -57,6 +57,13 @@
   `wg.Wait()` 无上限——提交路径上即 commit lease 永不释放，后续提交全部排队。
   现在聚合等待有界（15s + 3s grace），未 ack 的副本按 hung 处理并强制下次 repair
   枚举对象，返回值仍是 `ErrQuorumUnmet`（没 ack 不是已 ack）。
+- **Bundle 分块上传可能卡住请求，超时还会谎报成功**：`handleBundleChunks`（16 worker）
+  与 `storeChunksParallel`（8 worker）共 7 处裸 `wg.Wait()`，ctx 来自
+  `context.Background()`，服务端不设 `ReadTimeout`/`WriteTimeout`。worker 卡在存储里时
+  投递循环先阻塞（缓冲满），等待永远到不了。`storeChunksParallel` 有 5 处等待在**错误
+  清理路径**上，校验和失败也会挂住。7 处改走 `waitBounded`，投递进 `select`。
+  **超时后不再返回 `firstErr`（可能是 nil 而分块未落盘），查询超时返回 503 而非部分
+  `missing` 列表——后者会让客户端跳过上传、静默丢数据。**
 - **事务变更片段并行读可能卡住提交请求**：`loadChangeFragments` 用
   `fragmentParallelism=32` 并行读后 `wg.Wait()`，而调用方传 `context.Background()`
   且服务端故意不设 `ReadTimeout`/`WriteTimeout`。存储卡住时请求永不返回、goroutine 滞留。

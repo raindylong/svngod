@@ -44,6 +44,13 @@ const (
 	maxBundleTotal   = 1 << 40
 	maxBundleChanges = 500000
 	bundleClaimTTL   = 5 * time.Minute
+
+	// bundleChunkTimeout bounds one chunk batch (existence query or store) so a
+	// store that stops responding cannot park an upload request and its workers
+	// forever. The request itself carries no deadline: handleBundleCommit uses
+	// context.Background() and http.Server sets no ReadTimeout/WriteTimeout, by
+	// design, because bundles may be many gigabytes.
+	bundleChunkTimeout = 30 * time.Second
 )
 
 type bundleChange struct {
@@ -608,9 +615,14 @@ func (s *Server) handleBundleChunks(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "too many chunks", http.StatusBadRequest)
 		return
 	}
-	ctx := context.Background()
-	// Existence checks are round trips on object storage; run them on a
-	// bounded pool instead of serialising hundreds of HEADs.
+	// Bounded pool: existence checks are round trips on object storage, so
+	// hundreds of them are worth parallelising. The batch gets its own deadline
+	// because the request ctx has none (see bundleChunkTimeout), and the
+	// producer's send is covered by the same deadline: with every worker parked
+	// in the store the channel fills and the send below would block forever,
+	// never reaching wg.Wait() - bounding the wait alone would be dead code.
+	ctx, cancel := context.WithTimeout(r.Context(), bundleChunkTimeout)
+	defer cancel()
 	valid := make([]string, 0, len(req.Hashes))
 	for _, h := range req.Hashes {
 		h = strings.ToLower(h)
@@ -641,11 +653,22 @@ func (s *Server) handleBundleChunks(w http.ResponseWriter, r *http.Request) {
 			}
 		}()
 	}
+feed:
 	for _, h := range valid {
-		ch <- h
+		select {
+		case ch <- h:
+		case <-ctx.Done():
+			break feed
+		}
 	}
 	close(ch)
-	wg.Wait()
+	if !waitBounded(ctx, &wg) && firstErr == nil {
+		// Some hashes were never checked, or a check is still in flight. The
+		// "missing" list would be a subset, and the client would conclude the
+		// rest are present. Refuse rather than answer partially.
+		http.Error(w, "chunk query timed out", http.StatusServiceUnavailable)
+		return
+	}
 	if firstErr != nil {
 		http.Error(w, firstErr.Error(), http.StatusInternalServerError)
 		return
@@ -659,9 +682,39 @@ var (
 	errBundleChunkStore   = errors.New("bundle: chunk store")
 )
 
+// waitBounded waits for wg but never past ctx's deadline. A bare wg.Wait() has
+// no upper bound: the workers call into the store, which may be wedged, and the
+// bundle request carries no deadline of its own, so the wait would park the
+// request and every goroutine it spawned indefinitely.
+//
+// Returning early does not leak the workers - they finish whenever the store
+// releases them - and the shared state they touch is mutex-guarded. On timeout
+// the caller reports a store error, which is the honest outcome: chunks did not
+// all land.
+func waitBounded(ctx context.Context, wg *sync.WaitGroup) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 // storeChunksParallel reads the missing chunks from body in manifest order
 // and writes them on a small pool; non-missing chunks must already exist.
 func storeChunksParallel(ctx context.Context, repo *fs.Repo, refs []cdc.Ref, missing map[string]bool, body io.Reader) error {
+	// The caller passes a ctx with no deadline (handleBundleCommit uses
+	// context.Background()), so bound this batch here. Every wg.Wait() below -
+	// the final one and the five error-path cleanup ones - goes through
+	// waitBounded: a checksum mismatch is detected while workers are mid-Put, so
+	// even the early-return path would otherwise wait on a stuck store.
+	ctx, cancel := context.WithTimeout(ctx, bundleChunkTimeout)
+	defer cancel()
 	const workers = 8
 	type job struct {
 		key  string
@@ -692,31 +745,44 @@ func storeChunksParallel(ctx context.Context, repo *fs.Repo, refs []cdc.Ref, mis
 			data := make([]byte, ref.Size)
 			if _, rerr := io.ReadFull(body, data); rerr != nil {
 				close(jobs)
-				wg.Wait()
+				waitBounded(ctx, &wg)
 				return fmt.Errorf("short chunk: %w", rerr)
 			}
 			if sum := sha256.Sum256(data); sum != ref.Hash {
 				close(jobs)
-				wg.Wait()
+				waitBounded(ctx, &wg)
 				return errors.New("chunk checksum mismatch")
 			}
-			jobs <- job{key: repo.Keys().Chunk(hexh), data: data}
+			select {
+			case jobs <- job{key: repo.Keys().Chunk(hexh), data: data}:
+			case <-ctx.Done():
+				close(jobs)
+				waitBounded(ctx, &wg)
+				return fmt.Errorf("%w: deadline exceeded while dispatching chunks", errBundleChunkStore)
+			}
 			continue
 		}
 		ok, eerr := repo.Store().Exists(ctx, repo.Keys().Chunk(hexh))
 		if eerr != nil {
 			close(jobs)
-			wg.Wait()
+			waitBounded(ctx, &wg)
 			return fmt.Errorf("%w: %v", errBundleChunkStore, eerr)
 		}
 		if !ok {
 			close(jobs)
-			wg.Wait()
+			waitBounded(ctx, &wg)
 			return errBundleChunkMissing
 		}
 	}
 	close(jobs)
-	wg.Wait()
+	if !waitBounded(ctx, &wg) {
+		// Workers are still in the store. firstErr may be nil, so returning it
+		// would report a successful upload whose chunks may not have landed.
+		if firstErr != nil {
+			return firstErr
+		}
+		return fmt.Errorf("%w: deadline exceeded waiting for chunk writes", errBundleChunkStore)
+	}
 	return firstErr
 }
 
