@@ -65,6 +65,11 @@ func (m *MirrorStore) ackedCopy() []byte {
 // to be acknowledged (a 100MiB body over a LAN takes a couple of seconds).
 const quorumWriteTimeout = 15 * time.Second
 
+// quorumWriteGrace is how long past a single copy's budget the aggregate wait
+// allows before giving up on stragglers. It absorbs scheduling jitter without
+// extending the commit path's worst case by more than a few seconds.
+const quorumWriteGrace = 3 * time.Second
+
 // quorumRegisterTimeout bounds one replica operation on a lease-sized object
 // (the commit lock is a few dozen bytes). It is shorter than the data budget
 // so a hung-but-still-"healthy" replica costs seconds, not a failed commit.
@@ -78,6 +83,7 @@ func (m *MirrorStore) quorumMirror(ctx context.Context, pi, quorum int, key stri
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	ok := 0
+	acked := map[int]bool{} // per-index, so a straggler can be identified below
 	for i, s := range m.mirrors {
 		if i == pi {
 			continue
@@ -105,12 +111,51 @@ func (m *MirrorStore) quorumMirror(ctx context.Context, pi, quorum int, key stri
 			m.noteWrite(i)
 			mu.Lock()
 			ok++
+			acked[i] = true
 			mu.Unlock()
 		}(i, s)
 	}
-	wg.Wait()
-	if 1+ok < quorum {
-		return fmt.Errorf("%w: %d of %d copies (need %d)", ErrQuorumUnmet, 1+ok, len(m.mirrors), quorum)
+	// wg.Wait() alone is not a bound: the per-copy context only works if fn
+	// honours cancellation, and a backend that blocks in a syscall or an SDK
+	// call ignoring ctx makes WithTimeout a no-op. Waiting on it then holds the
+	// commit lease forever and every later commit queues behind it. Give up on
+	// the stragglers and report what we actually have - a copy that has not
+	// acked is not an acked copy.
+	//
+	// The wait is one copy timeout longer than a single copy's budget so a
+	// merely slow-but-honest replica is not cut off early.
+	waitDone := make(chan struct{})
+	go func() { wg.Wait(); close(waitDone) }()
+	select {
+	case <-waitDone:
+	case <-time.After(quorumWriteTimeout + quorumWriteGrace):
+		// A replica still blocked after its own budget plus grace is treated as
+		// hung, the same way a timed-out health probe is: markDownHung also
+		// forces the next repair to enumerate objects instead of trusting the
+		// pending delta, because a write "into the socket" may never have been
+		// processed.
+		mu.Lock()
+		pending := make([]int, 0, len(m.mirrors))
+		for i := range m.mirrors {
+			if i != pi && !acked[i] {
+				pending = append(pending, i)
+			}
+		}
+		mu.Unlock()
+		for _, i := range pending {
+			m.markDownHung(i)
+			m.noteError(i, fmt.Errorf("store: replica %d did not acknowledge within %v",
+				i, quorumWriteTimeout+quorumWriteGrace))
+		}
+	}
+	// Snapshot under the lock: on the timeout path the goroutines are still
+	// running and will keep incrementing ok/acked, so reading them bare would be
+	// a data race (and could report a count that never held at one instant).
+	mu.Lock()
+	got := 1 + ok
+	mu.Unlock()
+	if got < quorum {
+		return fmt.Errorf("%w: %d of %d copies (need %d)", ErrQuorumUnmet, got, len(m.mirrors), quorum)
 	}
 	return nil
 }

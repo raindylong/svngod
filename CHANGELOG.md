@@ -52,6 +52,11 @@
   即停表、SDK 只重试传输错误、调用方 ctx 无 deadline）。一次卡顿会永久占住 goroutine，
   提交路径上还占着 commit lease。现在 `Get`/`GetTo`/`Head` 都按**读空闲**设上限（30s，
   每次成功读重置），512 MiB 大对象不受影响。
+- **quorum 写可能永久挂死**：`quorumMirror` 给每个副本 15s 的 context 后 `wg.Wait()`，
+  但单副本超时只在后端**响应取消**时有效。副本卡在不轮询 ctx 的 syscall 里时
+  `wg.Wait()` 无上限——提交路径上即 commit lease 永不释放，后续提交全部排队。
+  现在聚合等待有界（15s + 3s grace），未 ack 的副本按 hung 处理并强制下次 repair
+  枚举对象，返回值仍是 `ErrQuorumUnmet`（没 ack 不是已 ack）。
 - **依赖漏洞**：`x/net`、`x/crypto`、`x/text`、`x/sys`、`klauspost/compress` 升级到
   已修复版本。其中 `compress/s2` 的越界读（GO-2026-5841）原本就挂在存储层的导入链上。
 
