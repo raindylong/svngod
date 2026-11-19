@@ -57,6 +57,11 @@
   `wg.Wait()` 无上限——提交路径上即 commit lease 永不释放，后续提交全部排队。
   现在聚合等待有界（15s + 3s grace），未 ack 的副本按 hung 处理并强制下次 repair
   枚举对象，返回值仍是 `ErrQuorumUnmet`（没 ack 不是已 ack）。
+- **事务变更片段并行读可能卡住提交请求**：`loadChangeFragments` 用
+  `fragmentParallelism=32` 并行读后 `wg.Wait()`，而调用方传 `context.Background()`
+  且服务端故意不设 `ReadTimeout`/`WriteTimeout`。存储卡住时请求永不返回、goroutine 滞留。
+  现在派发与等待共享一个 30s 预算——**只给等待加超时不够**：信号量获取在派发循环里，
+  32 个 worker 全卡住时主循环会阻塞在 `sem <-`，后面的超时根本执行不到。
 - **依赖漏洞**：`x/net`、`x/crypto`、`x/text`、`x/sys`、`klauspost/compress` 升级到
   已修复版本。其中 `compress/s2` 的越界读（GO-2026-5841）原本就挂在存储层的导入链上。
 

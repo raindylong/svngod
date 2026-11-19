@@ -509,6 +509,15 @@ func (s *Server) loadTxnChanges(repo *fs.Repo, repoName, txid string) {
 // independent immutable objects, so they are read in parallel.
 const fragmentParallelism = 32
 
+// fragmentReadTimeout bounds the parallel fragment batch. Reads are individual
+// object GETs against a store that may stop responding; without a bound a single
+// stalled GET parks the whole commit request, because this path runs under
+// context.Background() and wg.Wait() alone has no limit.
+//
+// 30s is far above a healthy read (milliseconds on a LAN) yet short enough that
+// a wedged replica fails the request instead of hanging it.
+const fragmentReadTimeout = 30 * time.Second
+
 // loadChangeFragments reads every persisted change of one activity.
 func loadChangeFragments(ctx context.Context, repo *fs.Repo, actID string) []persistedChange {
 	prefix := activityChangesPrefix(repo, actID)
@@ -530,11 +539,37 @@ func loadChangeFragments(ctx context.Context, repo *fs.Repo, actID string) []per
 	}
 	out := make([]persistedChange, len(keys))
 	ok := make([]bool, len(keys))
+	// Guards out/ok: on the timeout path the workers are still running and keep
+	// writing them, so the merge below must not read them unguarded.
+	var resMu sync.Mutex
 	sem := make(chan struct{}, fragmentParallelism)
 	var wg sync.WaitGroup
+	// Give up on the batch as a whole, not just on each worker. Acquiring a
+	// semaphore slot blocks the dispatch loop, so with fragmentParallelism
+	// workers all stalled the loop itself parks on sem and never reaches the
+	// wait below - the timeout would be dead code.
+	// A context rather than time.After: the Done channel can be observed by both
+	// the dispatch loop and the wait below, whereas a time.After channel delivers
+	// its single value to whichever select wins and leaves the other waiting
+	// forever.
+	batchCtx, batchCancel := context.WithTimeout(ctx, fragmentReadTimeout)
+	defer batchCancel()
+	dispatched := 0
+dispatch:
 	for i, key := range keys {
+		select {
+		case sem <- struct{}{}:
+		case <-batchCtx.Done():
+			// Not an error: the fragments that did not start are simply absent
+			// from the result, and the caller treats a missing change like an
+			// unreadable one (the transaction is rejected, not silently
+			// truncated).
+			log.Printf("txn: %s: dispatched %d of %d fragment reads within %v; continuing with those",
+				actID, dispatched, len(keys), fragmentReadTimeout)
+			break dispatch
+		}
+		dispatched++
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(i int, key string) {
 			defer wg.Done()
 			defer func() { <-sem }()
@@ -549,17 +584,42 @@ func loadChangeFragments(ctx context.Context, repo *fs.Repo, actID string) []per
 			if err := json.Unmarshal(data, &pc); err != nil || pc.Path == "" {
 				return
 			}
+			resMu.Lock()
 			out[i] = pc
 			ok[i] = true
+			resMu.Unlock()
 		}(i, key)
 	}
-	wg.Wait()
-	frags := out[:0]
+	// A bare wg.Wait() has no bound: the store call above takes the caller's
+	// ctx, and this path is entered with context.Background() from
+	// loadTxnChanges. A store that blocks (wedged gateway, SDK ignoring ctx) then
+	// parks this function forever and the commit request with it.
+	//
+	// The deadline is applied here rather than to ctx because the caller may
+	// legitimately be unbounded (restore walks history); what must be bounded is
+	// this parallel batch.
+	// One budget for the whole batch, not one per phase: reusing a fresh
+	// fragmentReadTimeout here would make the worst case two timeouts back to
+	// back (dispatch + wait), doubling how long a wedged store holds the request.
+	waitDone := make(chan struct{})
+	go func() { wg.Wait(); close(waitDone) }()
+	select {
+	case <-waitDone:
+	case <-batchCtx.Done():
+		// Read what completed so far. The mutex is required: stragglers keep
+		// writing out[i]/ok[i] after we stop waiting, so an unguarded read would
+		// be a data race and could report a fragment that is mid-write.
+		log.Printf("txn: %s: fragment reads still running after %v; proceeding with what completed",
+			actID, fragmentReadTimeout)
+	}
+	resMu.Lock()
+	frags := make([]persistedChange, 0, len(out))
 	for i := range out {
 		if ok[i] {
 			frags = append(frags, out[i])
 		}
 	}
+	resMu.Unlock()
 	return frags
 }
 
