@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -91,7 +92,13 @@ func TestS3StorePrimitives(t *testing.T) {
 		t.Fatalf("head: %q exists=%v err=%v", etag, exists, err)
 	}
 	// missing object
-	if _, err := st.Get(ctx, "nope", nil); err != ErrNotFound {
+	//
+	// errors.Is, not ==: Get wraps the sentinel with the key so callers can see
+	// which object was missing ("store: object not found: <key>"). The equality
+	// check this replaced had never run against a live gateway (the test skips
+	// without S3_ENDPOINT), so it was asserting something the code never
+	// promised.
+	if _, err := st.Get(ctx, "nope", nil); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 	if _, exists, err := st.Head(ctx, "nope"); err != nil || exists {
@@ -200,5 +207,58 @@ func TestS3StoreCASConcurrent(t *testing.T) {
 	wg.Wait()
 	if okCount != 1 {
 		t.Fatalf("successful CAS=%d, want exactly 1", okCount)
+	}
+}
+
+// TestLiveS3ReadIdleTimeoutGuard is the real-gateway counterpart to
+// TestS3GetReturnsForHealthyResponse: it proves the idle-timeout plumbing added
+// for stalled bodies does not disturb ordinary Put/Get/Head round trips.
+//
+// A stub cannot stand in for this. minio validates the response against headers
+// derived from the signed request, so a hand-written handler either gets
+// rejected (body never reaches the caller) or has to reimplement enough of S3 to
+// stop testing our code. Runs only when S3_ENDPOINT is set.
+func TestLiveS3ReadIdleTimeoutGuard(t *testing.T) {
+	cfg, ok := s3TestEnv(t)
+	if !ok {
+		t.Skip("S3_ENDPOINT not set")
+	}
+	ensureBucket(t, cfg)
+	cfg.RepoPrefix = "idle-probe"
+	st, err := NewS3Store(cfg)
+	if err != nil {
+		t.Fatalf("NewS3Store: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	key := fmt.Sprintf("idle-%d", time.Now().UnixNano())
+	payload := []byte("read-idle-timeout-roundtrip")
+	if err := st.Put(ctx, key, payload); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	got, err := st.Get(ctx, key, nil)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("round trip mismatch: got %q want %q", got, payload)
+	}
+	etag, exists, err := st.Head(ctx, key)
+	if err != nil || !exists || etag == "" {
+		t.Fatalf("Head: etag=%q exists=%v err=%v", etag, exists, err)
+	}
+	// Streaming path shares the idle-timeout reader.
+	var sink bytes.Buffer
+	n, err := st.GetTo(ctx, key, &sink)
+	if err != nil {
+		t.Fatalf("GetTo: %v", err)
+	}
+	if n != int64(len(payload)) || !bytes.Equal(sink.Bytes(), payload) {
+		t.Fatalf("GetTo returned %d bytes %q", n, sink.String())
+	}
+	if err := st.Delete(ctx, []string{key}); err != nil {
+		t.Logf("cleanup Delete: %v", err)
 	}
 }

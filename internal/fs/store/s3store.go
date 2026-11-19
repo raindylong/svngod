@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -143,7 +144,16 @@ func retry(ctx context.Context, op func() error) error {
 	backoff := 100 * time.Millisecond
 	for attempt := 0; ; attempt++ {
 		err := op()
-		if err == nil || attempt >= 4 || !isTransient(err) {
+		// A cancelled or expired context means we already gave up on this call;
+		// retrying multiplies the wait (each attempt gets its own read deadline),
+		// turning one 30s stall into minutes. Stop immediately.
+		if err == nil || ctx.Err() != nil || attempt >= 4 || !isTransient(err) {
+			if err == nil {
+				return nil
+			}
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
 			return err
 		}
 		select {
@@ -158,6 +168,12 @@ func retry(ctx context.Context, op func() error) error {
 // isTransient reports whether an S3 error is worth retrying.
 func isTransient(err error) bool {
 	if err == nil {
+		return false
+	}
+	// Explicitly non-retryable: partial output already written, or a stalled
+	// read whose retry would just wait the same timeout again.
+	var nr *noRetryError
+	if errors.As(err, &nr) {
 		return false
 	}
 	if errors.Is(err, ErrNotFound) || errors.Is(err, ErrPreconditionFailed) {
@@ -189,6 +205,65 @@ func seekableReader(r io.Reader) io.ReadSeeker {
 		return s
 	}
 	return nil
+}
+
+// readIdleTimeout bounds how long a read may stall while still making no
+// progress. It exists because every S3 call takes the caller's ctx, and the fs
+// layer frequently passes context.Background() - with no deadline, a gateway
+// that sends headers and then wedges the body leaves the call hanging forever.
+// http.Transport.ResponseHeaderTimeout does not cover this (its timer stops when
+// headers arrive) and the SDK retry layer only retries transport errors.
+//
+// The bound is on *inactivity*, not total time: a 512 MiB object legitimately
+// takes minutes, so a single deadline would either be useless or break large
+// reads. Each successful read resets the timer.
+const readIdleTimeout = 30 * time.Second
+
+// idleTimeoutReader cancels the request when no bytes arrive for the timeout.
+// It distinguishes "slow but progressing" (fine for a 512 MiB object) from
+// "stalled" (a wedged gateway), which a single whole-request deadline cannot.
+type idleTimeoutReader struct {
+	r       io.Reader
+	cancel  context.CancelFunc
+	timer   *time.Timer
+	timeout time.Duration
+	fired   atomic.Bool // set when the stall timer cancelled the request
+}
+
+func newIdleTimeoutReader(r io.Reader, cancel context.CancelFunc, timeout time.Duration) *idleTimeoutReader {
+	t := &idleTimeoutReader{r: r, cancel: cancel, timeout: timeout}
+	t.timer = time.AfterFunc(timeout, func() {
+		t.fired.Store(true)
+		cancel()
+	})
+	return t
+}
+
+func (t *idleTimeoutReader) Read(p []byte) (int, error) {
+	n, err := t.r.Read(p)
+	if n > 0 {
+		// Progress was made: push the deadline out.
+		t.timer.Reset(t.timeout)
+	}
+	return n, err
+}
+
+// Close stops the timer. Callers must call it or the timer fires later against a
+// cancelled context that no longer belongs to anything.
+func (t *idleTimeoutReader) Close() error {
+	t.timer.Stop()
+	return nil
+}
+
+// withReadDeadline derives a context for a read whose ctx may have no deadline.
+// The caller's earlier deadline wins, so an explicit short timeout is respected.
+func withReadDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
+	c, cancel := context.WithCancel(ctx)
+	if dl, ok := ctx.Deadline(); ok && time.Until(dl) <= readIdleTimeout {
+		// The caller already bounds us more tightly than the idle timer would.
+		return c, cancel
+	}
+	return c, cancel
 }
 
 // singlePut is used for every object: one PUT up to 5 GiB instead of a
@@ -234,13 +309,24 @@ func (s *S3Store) getOnce(ctx context.Context, key string, rng *Range) ([]byte, 
 			return nil, err
 		}
 	}
-	obj, err := s.client.GetObject(ctx, s.bucket, s.key(key), opt)
+	// GetObject returns before the body is read, so a wedged gateway shows up
+	// here rather than at the call above.
+	rctx, cancel := withReadDeadline(ctx)
+	defer cancel()
+	obj, err := s.client.GetObject(rctx, s.bucket, s.key(key), opt)
 	if err != nil {
 		return nil, err
 	}
 	defer obj.Close()
-	buf, err := io.ReadAll(obj)
+	idle := newIdleTimeoutReader(obj, cancel, readIdleTimeout)
+	defer idle.Close()
+	buf, err := io.ReadAll(idle)
 	if err != nil {
+		if idle.fired.Load() {
+			// Report the stall as a distinct, non-retryable condition: the
+			// gateway is wedged, so retrying only repeats the same 30s wait.
+			return nil, &noRetryError{fmt.Errorf("store: s3 read stalled for %v: %w", readIdleTimeout, err)}
+		}
 		return nil, err
 	}
 	return buf, nil
@@ -294,13 +380,18 @@ func (s *S3Store) Exists(ctx context.Context, key string) (bool, error) {
 func (s *S3Store) GetTo(ctx context.Context, key string, w io.Writer) (int64, error) {
 	var n int64
 	err := retry(ctx, func() error {
-		obj, gerr := s.client.GetObject(ctx, s.bucket, s.key(key), minio.GetObjectOptions{})
+		rctx, rcancel := context.WithCancel(ctx)
+		defer rcancel()
+		obj, gerr := s.client.GetObject(rctx, s.bucket, s.key(key), minio.GetObjectOptions{})
 		if gerr != nil {
 			return gerr
 		}
 		defer obj.Close()
+		// Same stall hazard as Get: io.Copy never returns if the body stops.
+		idle := newIdleTimeoutReader(obj, rcancel, readIdleTimeout)
+		defer idle.Close()
 		var cerr error
-		n, cerr = io.Copy(w, obj)
+		n, cerr = io.Copy(w, idle)
 		if cerr != nil && n > 0 {
 			// Bytes already reached w; a retry would duplicate them.
 			return &noRetryError{cerr}
@@ -328,8 +419,14 @@ func (e *noRetryError) Unwrap() error { return e.err }
 
 func (s *S3Store) Head(ctx context.Context, key string) (string, bool, error) {
 	var etag string
-	err := retry(ctx, func() error {
-		info, err := s.client.StatObject(ctx, s.bucket, s.key(key), minio.StatObjectOptions{})
+	// StatObject reads its (empty) response body; a wedged gateway can stall
+	// that too, so bound it the same way as a data read.
+	hctx, hcancel := context.WithCancel(ctx)
+	defer hcancel()
+	htimer := time.AfterFunc(readIdleTimeout, hcancel)
+	defer htimer.Stop()
+	err := retry(hctx, func() error {
+		info, err := s.client.StatObject(hctx, s.bucket, s.key(key), minio.StatObjectOptions{})
 		if err != nil {
 			if isNotFound(err) {
 				etag = ""

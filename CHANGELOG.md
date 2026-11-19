@@ -47,6 +47,11 @@
   - `npos+int(length)` 溢出绕过边界检查 → **panic**
   - `actionTarget` 的 `length` 无上限，前向自拷贝循环可能跑 2^60 次 → **进程挂死**
   - `SEGMENT_FROM` 单独出现时 `Marshal` 会补 `SEGMENTS=1`，改写后仓库**存储模式静默变化**
+- **S3 读可能永久挂死**：`internal/fs` 常以 `context.Background()`（无 deadline）调用存储层，
+  而网关「发完响应头就卡住 body」时三种既有保护都失效（`ResponseHeaderTimeout` 在头到达时
+  即停表、SDK 只重试传输错误、调用方 ctx 无 deadline）。一次卡顿会永久占住 goroutine，
+  提交路径上还占着 commit lease。现在 `Get`/`GetTo`/`Head` 都按**读空闲**设上限（30s，
+  每次成功读重置），512 MiB 大对象不受影响。
 - **依赖漏洞**：`x/net`、`x/crypto`、`x/text`、`x/sys`、`klauspost/compress` 升级到
   已修复版本。其中 `compress/s2` 的越界读（GO-2026-5841）原本就挂在存储层的导入链上。
 
