@@ -68,6 +68,14 @@ type Repo struct {
 	// cancelled the merge halfway through.
 	compactQ    chan compactJob
 	compactOnce sync.Once
+	// packQ carries shards whose auto-pack failed to the background packer.
+	// Packing happens only on the commit that closes a shard, so without a
+	// retry a single transient backend error would leave that shard's loose
+	// objects behind forever (GC only removes loose copies of shards that are
+	// ALREADY packed). The queue is the same idea as compactQ for segment
+	// repositories.
+	packQ    chan uint64
+	packOnce sync.Once
 	// segMetas caches parsed row tables; segDecoded caches whole decoded
 	// segments for sequential scans. Named separately from cache (which holds
 	// raw revision blocks) so a scan does not evict the block working set.
@@ -1391,9 +1399,21 @@ func (r *Repo) commitTxn(baseRev uint64, changes []Change, revProps map[string]s
 	// shard, its predecessor shard is complete and gets packed. This keeps the
 	// repository at ~O(shards) loose objects instead of O(revisions) — required
 	// to scale to millions of revisions.
+	//
+	// A pack failure must NOT fail the commit. By this point the revision is
+	// durable and HEAD has moved: the commit happened, and reporting an error
+	// would tell the client to retry something already applied, which either
+	// gets rejected as out-of-date or creates a duplicate successor. Packing is
+	// a pure consolidation step - it rewrites loose objects into the packed
+	// form, is idempotent (isPacked short-circuits), and can be re-run at any
+	// time by svnadmin pack/verify - so the correct response is to log it and
+	// let the next pack pass (or the background scrub) finish the work. The
+	// batch path already treats it this way.
 	if N > 0 && N%r.shardSz == 0 {
 		if err := r.packShardLocked(r.shard(N) - 1); err != nil {
-			return N, err
+			log.Printf("commit: revision %d published, pack shard %d failed; queued for retry: %v",
+				N, r.shard(N)-1, err)
+			r.enqueuePack(r.shard(N) - 1)
 		}
 	}
 	return N, nil
@@ -2070,6 +2090,70 @@ func deepCopy(t *tnode) *tnode {
 }
 
 var _ = strings.TrimSpace
+
+// enqueuePack schedules a shard whose auto-pack failed. The job is dropped when
+// the queue is full: packing is an optimisation and the next shard boundary (or
+// an operator running verify/gc) picks the work up again. Dropping is logged so
+// a persistently failing backend is visible.
+func (r *Repo) enqueuePack(shard uint64) {
+	r.packOnce.Do(func() {
+		r.packQ = make(chan uint64, 64)
+		go r.packLoop()
+	})
+	select {
+	case r.packQ <- shard:
+	default:
+		log.Printf("pack: retry queue full, shard %d postponed", shard)
+	}
+}
+
+// packLoop retries failed packs in the background, so a transient error at the
+// shard boundary does not permanently leave the shard unpacked.
+//
+// Retries are bounded and backed off. An unbounded requeue would spin forever
+// while another writer holds the commit lease (the common case right after a
+// commit) and would keep the goroutine and its queue alive for the life of the
+// process. After the attempts are spent the shard is left unpacked and logged:
+// the loose objects are still correct and readable, and the next commit that
+// closes a shard, or an operator, can pack it.
+func (r *Repo) packLoop() {
+	const maxAttempts = 5
+	for shard := range r.packQ {
+		shard := shard
+		// One shard failing must not end the loop, or every later failure would
+		// go unreported and the queue would back up silently.
+		recoverLoop("pack-retry", func() {
+			backoff := time.Second
+			for attempt := 1; attempt <= maxAttempts; attempt++ {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+				lease, err := r.acquireCommitLease(ctx)
+				if err == nil {
+					perr := r.packShardLocked(shard)
+					lease.Release(r.store)
+					cancel()
+					if perr == nil {
+						return
+					}
+					log.Printf("pack: retry shard %d failed (attempt %d/%d): %v", shard, attempt, maxAttempts, perr)
+				} else {
+					cancel()
+					// The lease is held by a live writer; that is expected right
+					// after a commit, so wait rather than counting this as the
+					// shard's own failure.
+					if attempt == maxAttempts {
+						log.Printf("pack: shard %d left unpacked, commit lease still held: %v", shard, err)
+						return
+					}
+				}
+				time.Sleep(backoff)
+				if backoff < 30*time.Second {
+					backoff *= 2
+				}
+			}
+			log.Printf("pack: shard %d left unpacked after %d attempts", shard, maxAttempts)
+		})
+	}
+}
 
 // PackShard consolidates a completed shard's loose revision objects into a
 // single immutable pack + idx + revprops pack, then switches the shard to

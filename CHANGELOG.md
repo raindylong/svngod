@@ -117,6 +117,14 @@
 - **`Redacted()` 漏掉嵌套 store**：`redactStore` 只递归 `Mirrors`，漏 `Local`/`Remote`/
   `ShardMeta`/`ShardRanges[].Store` 与 `SecretKeyFile`。geo/sharded 仓库虽被 `Validate()` 拒绝，
   但配置加载失败时原始 cfg 仍交给管理服务，嵌套密钥可经 `/_api/v1/config` 读到。
+- **打包失败会把成功提交报成失败**：`commitTxn` 在 HEAD CAS 之后执行 shard 自动打包，
+  失败时 `return N, err`——修订已持久且可见，客户端却收到错误，重试会得到 out-of-date
+  或产生重复后继。现在打包失败只记日志并报成功（与 batch 路径一致），并补了**有界**的
+  后台重试队列：打包只在关闭 shard 的那次提交触发，GC 只清理已打包 shard 的 loose 对象，
+  不补重试的话该 shard 会永久留着 loose 对象。
+- **v1 `CommitBatch` 在 CAS 竞争时报出未发布的修订号**：非自己拥有的 plan 只设了 `errs`
+  而未清零 `revs`（段库路径是清零的）。`svnadmin load` 只检查 `err` 与 `rv == 0`，
+  于是把从未写入的修订当成成功，恢复时静默丢历史。现已对齐段库行为。
 - **慢客户端不在读 deadline 上留下残骸**：`countingReadCloser` 在每个成功读之后推进读
   deadline，并在 `Close` 时清掉。`statusWriter` 原先没有 `Unwrap()`，`http.ResponseController`
   穿不透它，`SetReadDeadline` 静默返回 `ErrNotSupported`——即读 deadline 看起来装上了、实际

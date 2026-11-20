@@ -589,7 +589,17 @@ func (r *Repo) CommitBatch(reqs []BatchCommit, opts ...BatchOption) ([]uint64, [
 			if own[i] {
 				continue
 			}
+			// Not ours: either a peer's replay never published it, or the
+			// number was taken by someone else's revision. Either way this
+			// request did not land, so clear the revision as well as setting
+			// the error. An AllOrNothing caller (svnadmin load) reads only
+			// err and rv == 0, so a nonzero rev here would be recorded as a
+			// published revision that does not exist - silent history loss on
+			// restore. The segmented path
+			// (segment_commit.go, "revs[p.idx] = 0") already does this; the v1
+			// path set errs only.
 			errs[p.idx] = store.ErrQuorumUnmet
+			revs[p.idx] = 0
 		}
 		if now < N {
 			// Continue from wherever the replay stopped: the unpublished tail
@@ -605,7 +615,11 @@ func (r *Repo) CommitBatch(reqs []BatchCommit, opts ...BatchOption) ([]uint64, [
 	for s := r.shard(cur.Head); s <= r.shard(N); s++ {
 		if uint64(s+1)*r.shardSz <= N {
 			if perr := r.packShardLocked(s); perr != nil {
-				log.Printf("batch: pack shard %d: %v", s, perr)
+				// Packing is a consolidation step, not part of the commit:
+				// the revision is already durable and visible. Log and queue a
+				// retry rather than failing the batch.
+				log.Printf("batch: pack shard %d failed; queued for retry: %v", s, perr)
+				r.enqueuePack(s)
 			}
 		}
 	}
