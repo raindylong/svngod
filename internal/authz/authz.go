@@ -6,6 +6,7 @@ package authz
 import (
 	"bufio"
 	"fmt"
+	"path"
 	"strings"
 )
 
@@ -191,16 +192,15 @@ func normalizePath(p string) string {
 	if p == "" {
 		return "/"
 	}
-	parts := strings.Split(p, "/")
-	out := make([]string, 0, len(parts))
-	for _, part := range parts {
-		if part == "" || part == "." {
-			continue
-		}
-		out = append(out, part)
-	}
-	if len(out) == 0 {
+	// Resolve ".." and collapse separators. This must match what the filesystem
+	// layer resolves, or authz and the handler disagree about which path is
+	// being authorized: fs.segments drops ".." (it never walks up), so keeping
+	// the literal ".." here meant a request for "/../private/x" was checked
+	// against "/../private/x" (no rule matches, falls back to root) while the
+	// handler read "/private/x". path.Clean makes the two agree by construction.
+	p = path.Clean("/" + strings.Trim(p, "/"))
+	if p == "." || p == "" {
 		return "/"
 	}
-	return "/" + strings.Join(out, "/")
+	return p
 }

@@ -211,3 +211,30 @@ func TestAuthzMaxSemantics(t *testing.T) {
 		t.Fatal("star must match authenticated alice for read")
 	}
 }
+
+// TestAuthorizeResolvesDotDot pins the layer that must not depend on the HTTP
+// layer's normalization. parseResource cleans the URL, so an integration test
+// still passes if authz alone regresses - the two would have to be broken
+// together. This test calls Authorize with a raw ".." path and asserts the deny
+// rule wins, which is what makes authz safe on its own.
+func TestAuthorizeResolvesDotDot(t *testing.T) {
+	cfg, err := Parse([]byte("[/]\n* = r\n[/private]\n* =\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{
+		"/../private/secret.txt",
+		"/./private/secret.txt",
+		"//private/secret.txt",
+		"/private/../private/secret.txt",
+		"/a/../../private/secret.txt",
+	} {
+		if cfg.Authorize("", "demo", p, false) {
+			t.Fatalf("Authorize(%q) allowed a path that resolves under /private", p)
+		}
+	}
+	// And the canonical form still allows what it should.
+	if !cfg.Authorize("", "demo", "/public/readme.txt", false) {
+		t.Fatal("Authorize denied an allowed path")
+	}
+}

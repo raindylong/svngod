@@ -106,6 +106,17 @@
   后台任务用 `goSafe`、后台长循环用 `recoverLoop`（单轮 panic 不影响下一轮）。
 - **批次失败不再谎报修订号**：`CommitBatch` 在发布前失败时不再返回修订号。
 - **`load` 中断报出停止位置**，而非笼统的"已放弃"。
+- **鉴权路径穿越（严重）**：授权检查用的路径与处理器解析用的路径对 `..` 处理不一致——
+  authz 保留 `..`（匹配不到拒绝规则，回落到根规则放行），fs 丢弃 `..`（实际读到目标）。
+  `GET /svn/demo/../private/secret.txt` 在 `[/private]` 拒绝规则下返回 **200 + 明文内容**，
+  写入形态同样可绕（`PUT .../../private/x` → 201）。已用真实服务对照验证修复前后行为。
+  修复：`splitPath` 与 `authz.normalizePath` 都改用 `path.Clean`，让授权与解析看到同一个字符串。
+- **管理接口泄露存储凭据**：`GET /_api/v1/repos/<name>` 返回活的 `config.Repo`，
+  明文序列化 `access-key`/`secret-key`/`bind-password`（同服务的 `/_api/v1/config` 是脱敏的）。
+  改为返回 `Redacted()` 副本。
+- **`Redacted()` 漏掉嵌套 store**：`redactStore` 只递归 `Mirrors`，漏 `Local`/`Remote`/
+  `ShardMeta`/`ShardRanges[].Store` 与 `SecretKeyFile`。geo/sharded 仓库虽被 `Validate()` 拒绝，
+  但配置加载失败时原始 cfg 仍交给管理服务，嵌套密钥可经 `/_api/v1/config` 读到。
 - **慢客户端不在读 deadline 上留下残骸**：`countingReadCloser` 在每个成功读之后推进读
   deadline，并在 `Close` 时清掉。`statusWriter` 原先没有 `Unwrap()`，`http.ResponseController`
   穿不透它，`SetReadDeadline` 静默返回 `ErrNotSupported`——即读 deadline 看起来装上了、实际

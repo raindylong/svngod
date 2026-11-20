@@ -654,15 +654,36 @@ func (c *Config) Redacted() *Config {
 	return &out
 }
 
+// redactStore clears every credential a store can carry, including the stores
+// nested inside geo (Local/Remote) and sharded (ShardMeta/ShardRanges) specs.
+//
+// Redacting only AccessKey/SecretKey/Mirrors was not enough: a geo or sharded
+// store holds its own S3 keys one level down, and both shapes are reachable
+// through /_api/v1/config - a repo using one is rejected by Validate(), but the
+// raw config is still loaded and handed to the admin service, so the nested
+// credentials were printed verbatim. redactSecretKeyFile is covered too: a path
+// to a key file is as sensitive as the key it holds.
 func redactStore(s *Store) {
+	if s == nil {
+		return
+	}
 	if s.AccessKey != "" {
 		s.AccessKey = "***"
 	}
 	if s.SecretKey != "" {
 		s.SecretKey = "***"
 	}
+	if s.SecretKeyFile != "" {
+		s.SecretKeyFile = "***"
+	}
 	for i := range s.Mirrors {
 		redactStore(&s.Mirrors[i])
+	}
+	redactStore(s.Local)
+	redactStore(s.Remote)
+	redactStore(s.ShardMeta)
+	for i := range s.ShardRanges {
+		redactStore(s.ShardRanges[i].Store)
 	}
 }
 

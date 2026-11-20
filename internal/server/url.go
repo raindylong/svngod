@@ -1,6 +1,7 @@
 package server
 
 import (
+	"path"
 	"strconv"
 	"strings"
 )
@@ -120,6 +121,18 @@ func parseResource(basePath, reqPath string) resource {
 }
 
 func splitPath(p string) []string {
+	// Clean first: ".." must be resolved before the segments are used as an svn
+	// path, because the two consumers disagree about it otherwise. fs.segments
+	// drops ".." outright (it never walks up), so a request for
+	// "/repo/../private/x" reads "/private/x" from the repository - while authz
+	// used to keep the literal "/../private/x" and fail to match a [/private]
+	// deny rule, letting the read through. Resolving ".." once, here, means
+	// every consumer downstream sees the same path the fs will resolve.
+	//
+	// path.Clean also collapses "//", "./" and a trailing "/", so the string
+	// authz matches and the string the handler serves are identical by
+	// construction rather than by three implementations agreeing.
+	p = path.Clean("/" + strings.Trim(p, "/"))
 	var out []string
 	for _, s := range strings.Split(strings.Trim(p, "/"), "/") {
 		if s != "" {

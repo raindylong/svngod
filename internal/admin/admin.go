@@ -309,9 +309,15 @@ func (s *Service) repoByName(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		s.mu.Lock()
 		rp := s.findRepo(name)
+		// Marshal a redacted copy, never the live entry: config.Repo serializes
+		// access-key, secret-key and bind-password verbatim, so returning it
+		// would disclose the storage and LDAP credentials to anyone holding a
+		// token meant only to manage repositories. /_api/v1/config already goes
+		// through Redacted() for the same reason; this endpoint was the outlier.
 		var view any
 		if rp != nil {
-			view = rp
+			one := &config.Config{Repos: []config.Repo{*rp}}
+			view = one.Redacted().Repos[0]
 		}
 		s.mu.Unlock()
 		if rp == nil {
