@@ -48,6 +48,24 @@ type Config struct {
 	// disables the cap. Per-endpoint limits are stricter and unchanged.
 	MaxBodyBytes int64 `json:"max-body-bytes,omitempty"`
 
+	// TempDir holds transfer temp files. Unset uses os.TempDir(). This matters
+	// most for the config-driven deployments (systemd, containers), where /tmp is
+	// commonly a small tmpfs and one large commit would consume its bytes in RAM.
+	TempDir string `json:"temp-dir,omitempty"`
+
+	// MinBodyRate is the floor for a request body's average speed in bytes per
+	// second, judged after BodyRateGrace. A size cap bounds how much a client may
+	// send, not how long it may take: a trickling client stays under the cap and
+	// holds its connection and upload slot indefinitely. 0 disables the check.
+	MinBodyRate int64 `json:"min-body-rate,omitempty"`
+	// BodyRateGrace is how long a body may run before MinBodyRate is applied.
+	// Unset uses the server default (30s).
+	BodyRateGrace jsonDuration `json:"body-rate-grace,omitempty"`
+	// BodyStallTimeout aborts a body read that receives no bytes for this long,
+	// which is what a silently departed client looks like. Unset uses the server
+	// default (2m); "-1s" disables it.
+	BodyStallTimeout jsonDuration `json:"body-stall-timeout,omitempty"`
+
 	// AuthFailureBurst is the per-username failed-login budget per
 	// AuthFailureWindow. The per-address budget is 10x this, because addresses
 	// are shared behind NAT. 0 disables the limiter.

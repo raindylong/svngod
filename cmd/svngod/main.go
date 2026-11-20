@@ -78,6 +78,9 @@ type options struct {
 	authFailBurst  int
 	authFailWindow time.Duration
 	maxBodyBytes   int64
+	minBodyRate    int64
+	bodyRateGrace  time.Duration
+	bodyStall      time.Duration
 	maxConns       int
 	maxUploads     int
 	maxUserUploads int
@@ -149,6 +152,9 @@ func main() {
 	fl.IntVar(&o.maxUploads, "max-uploads", 16, "maximum concurrent PUT/bundle uploads (0 = unlimited)")
 	fl.IntVar(&o.maxConns, "max-conns", 512, "maximum simultaneous TCP connections, excess are reset (0 = unlimited)")
 	fl.Int64Var(&o.maxBodyBytes, "max-body-bytes", 0, "cap on any request body in bytes (0 = built-in 1 TiB; -1 = unlimited)")
+	fl.Int64Var(&o.minBodyRate, "min-body-rate", 0, "minimum average request-body speed in bytes/sec after the grace window (0 = disabled)")
+	fl.DurationVar(&o.bodyRateGrace, "body-rate-grace", 30*time.Second, "how long a body may run before its average speed is judged")
+	fl.DurationVar(&o.bodyStall, "body-stall-timeout", 2*time.Minute, "abort a body read that receives no bytes for this long (0 = default, -1 = disabled)")
 	fl.IntVar(&o.authFailBurst, "auth-failure-burst", 10, "failed logins allowed per username per window before 429 (address budget is 10x; -1 disables)")
 	fl.DurationVar(&o.authFailWindow, "auth-failure-window", time.Minute, "window for the failed-login budget")
 	fl.IntVar(&o.commitBatch, "commit-batch", 16, "group concurrently arriving commits into batches of this size (0/1 = off)")
@@ -271,6 +277,9 @@ func main() {
 		AuthFailureBurst:     o.authFailBurst,
 		AuthFailureWindow:    o.authFailWindow,
 		MaxBodyBytes:         o.maxBodyBytes,
+		MinBodyRate:          o.minBodyRate,
+		BodyRateGrace:        o.bodyRateGrace,
+		BodyStallTimeout:     o.bodyStall,
 		Logger:               log.New(os.Stderr, "svngod ", log.LstdFlags),
 	})
 
@@ -356,6 +365,12 @@ func runMultiRepo(configPath string, commitBatch, commitWindowMs int, adminAddr,
 		log.Fatalf("load config: %v", err)
 	}
 	fs.ConfigureCommitBatch(commitBatch, commitWindowMs)
+	// The config file is the documented way to deploy (systemd, containers), and
+	// it is exactly where /tmp is a small tmpfs. Applying the flag-only setting
+	// here closes the gap that made -temp-dir unusable for those deployments.
+	if _, err := applyTempDir(cfg.TempDir); err != nil {
+		log.Fatalf("config temp-dir: %v", err)
+	}
 	repos, cfgs, err := cfg.BuildRepos(nil, nil)
 	buildFailures := map[string]string{}
 	if err != nil {
@@ -460,6 +475,9 @@ func runMultiRepo(configPath string, commitBatch, commitWindowMs int, adminAddr,
 		AuthFailureBurst:     authBurst,
 		AuthFailureWindow:    time.Duration(cfg.AuthFailureWindow),
 		MaxBodyBytes:         cfg.MaxBodyBytes,
+		MinBodyRate:          cfg.MinBodyRate,
+		BodyRateGrace:        cfg.BodyRateGrace.Std(),
+		BodyStallTimeout:     cfg.BodyStallTimeout.Std(),
 		Logger:               logger,
 	})
 	if len(buildFailures) > 0 {

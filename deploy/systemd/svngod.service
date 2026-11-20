@@ -1,0 +1,63 @@
+[Unit]
+Description=svngod SVN server
+Documentation=https://gz-tea.ejoy.com/SA/svngod
+After=network-online.target
+Wants=network-online.target
+
+# A bad config otherwise restarts every 2s forever and buries the real error in
+# the journal. Five attempts in 60s, then the unit stops and stays failed where
+# `systemctl status` shows it. These belong in [Unit] on modern systemd.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=svngod
+Group=svngod
+ExecStart=/usr/local/bin/svngod --config /etc/svngod/svngod.json
+
+Restart=always
+RestartSec=2
+
+# svngod drains in-flight requests for up to 30s after SIGTERM (a commit in the
+# publish phase, a multi-gigabyte upload). A shorter TimeoutStopSec would SIGKILL
+# it mid-drain, which is the exact failure the graceful path exists to avoid, so
+# this must stay above 30.
+TimeoutStopSec=45
+KillSignal=SIGTERM
+
+# One descriptor per connection, plus uploads and the S3 client's keep-alive
+# pool. The default soft limit of 1024 is far too low for a build farm.
+LimitNOFILE=1048576
+
+# The process needs its own state and its configured repositories, nothing else.
+# These restrictions make a wrong path in svngod.json fail loudly at boot rather
+# than silently write somewhere unexpected.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+# ProtectSystem=strict makes everything read-only except these paths. svngod
+# logs to stdout (journal), so it needs no log directory of its own.
+ReadWritePaths=/var/lib/svngod
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+# Transfer temp files must not land on a tmpfs: one large commit would consume
+# its bytes in RAM (an image write buffers the whole object, up to 64 GiB).
+# PrivateTmp gives this unit its own /tmp; also set "temp-dir" in svngod.json to
+# real disk. There is no environment variable for it - only the flag and the
+# config field.
+StandardOutput=journal
+StandardError=journal
+
+# Secrets do not belong in this file: unit files are world-readable. The admin
+# and metrics tokens are read from the environment, so keep them in a 0600 file.
+#EnvironmentFile=/etc/svngod/env
+
+[Install]
+WantedBy=multi-user.target

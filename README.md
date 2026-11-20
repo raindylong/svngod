@@ -198,6 +198,22 @@ svngod -temp-dir /var/lib/svngod/tmp ...
 
 只探进程存活（不依赖任何后端）请用 `GET /_metrics` 之外的 TCP 探测，或直接探端口。
 
+### 慢客户端与请求体
+
+请求体有三条互不重叠的界限：`-max-body-bytes`（多大）、`-body-stall-timeout`
+（一次读多久没字节就放弃，默认 2m）、`-min-body-rate`（平均速度下限，默认关闭）。
+没有后两条时，一个每秒发 1 字节的客户端永远在大小限额内，却能无限期占用连接与上传槽位；
+静默客户端和拖沓客户端需要不同手段（读 deadline vs 平均速率），超限都回 `408`。
+调参与适用场景见 [`docs/配置与多实例部署.md`](docs/配置与多实例部署.md) §8.3。
+
+### 部署产物
+
+- systemd：[`deploy/systemd/svngod.service`](deploy/systemd/svngod.service)
+- 容器：[`deploy/docker/Dockerfile`](deploy/docker/Dockerfile)（distroless，非 root）
+
+两者的约束条件（为什么 `TimeoutStopSec` 必须 > 30s、为什么只有大小上限不够）写在
+[`docs/配置与多实例部署.md`](docs/配置与多实例部署.md) §8.1–8.3。
+
 ## 管理 API（热加载）
 
 管理员可以在独立端口上增删改仓库配置并热加载，无需重启（需要 `--config` 文件模式）：

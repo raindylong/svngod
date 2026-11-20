@@ -1,9 +1,11 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -389,13 +391,94 @@ type countingReadCloser struct {
 	// router uses it to suppress the handler's own response, which would
 	// otherwise commit a 4xx for a read error it cannot classify.
 	onOver func()
+	// onSlow fires the first time a read is refused for falling under the rate
+	// floor, or abandoned for stalling. Same purpose as onOver but a different
+	// status, so the router must be able to tell the two apart.
+	onSlow func()
+
+	// minRate is the floor for the body's average speed, in bytes per second,
+	// measured from the first read. 0 disables the check.
+	//
+	// A size cap does not bound time: a client trickling one byte at a time is
+	// always under the cap and never blocked, yet holds its goroutine, its
+	// connection slot and (for uploads) an upload slot. Every Read returns, so a
+	// read deadline alone cannot catch it; only averaging can.
+	minRate int64
+	// grace is how long the body may run before the average is judged. Without
+	// it the first read of a slow-starting connection would fail the floor on
+	// almost no evidence.
+	grace time.Duration
+	// stall is how long a single Read may block before it is abandoned. 0
+	// disables the deadline. This covers the case averaging cannot: a client
+	// that sends nothing at all blocks inside Read, where no counter moves.
+	stall time.Duration
+	// now and setReadDeadline are seams for tests; production leaves them nil.
+	now             func() time.Time
+	setReadDeadline func(time.Time) error
+
+	// start is the timestamp of the first read; zero until then so a body that
+	// is never read (GET, OPTIONS) never starts the clock.
+	start       time.Time
+	tooSlowFlag bool
+}
+
+// errSlowBody is returned when a request body falls under the rate floor. The
+// router maps it to 408 rather than 413: the client sent a legal amount of data,
+// just too slowly, and 413 would send operators after the wrong limit.
+var errSlowBody = errors.New("request body below the minimum rate")
+
+func (c *countingReadCloser) clock() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+// tooSlow reports whether the floor was violated, so the router can answer 408
+// even if a handler swallowed the read error.
+func (c *countingReadCloser) tooSlow() bool { return c.tooSlowFlag }
+
+// checkRate applies the average floor. It reports false before the grace window
+// has elapsed: a slow first read is not evidence of a slow body.
+func (c *countingReadCloser) checkRate() bool {
+	if c.minRate <= 0 {
+		return true
+	}
+	elapsed := c.clock().Sub(c.start)
+	if elapsed < c.grace {
+		return true
+	}
+	// Compare against the floor with the elapsed time as denominator. Integer
+	// maths avoids a division that a very short elapsed time would blow up.
+	if float64(c.n)/elapsed.Seconds() >= float64(c.minRate) {
+		return true
+	}
+	c.tooSlowFlag = true
+	if c.onSlow != nil {
+		c.onSlow()
+	}
+	return false
+}
+
+// armStall pushes the read deadline out by the stall window. Called before each
+// read so the window is measured from the last successful byte, not from the
+// start of the request - a multi-gigabyte upload legitimately takes minutes.
+func (c *countingReadCloser) armStall() {
+	if c.stall <= 0 || c.setReadDeadline == nil {
+		return
+	}
+	_ = c.setReadDeadline(c.clock().Add(c.stall))
 }
 
 func (c *countingReadCloser) Read(p []byte) (int, error) {
+	if c.start.IsZero() {
+		c.start = c.clock()
+	}
+	if !c.checkRate() {
+		return 0, errSlowBody
+	}
 	if c.limit <= 0 {
-		n, err := c.r.Read(p)
-		c.n += int64(n)
-		return n, err
+		return c.readAndCount(p)
 	}
 	// Allow reading exactly limit bytes; the cap is a maximum, not a forbidden
 	// boundary. Anything beyond that is refused on the next call, so a body of
@@ -410,12 +493,43 @@ func (c *countingReadCloser) Read(p []byte) (int, error) {
 	if int64(len(p)) > remaining {
 		p = p[:remaining]
 	}
+	return c.readAndCount(p)
+}
+
+// readAndCount performs one read with the stall window armed, and turns a
+// deadline expiry into the same "too slow" verdict as a failed average. The two
+// are the same client behaviour from the server's side; keeping one flag means
+// the router has one status to answer with.
+func (c *countingReadCloser) readAndCount(p []byte) (int, error) {
+	c.armStall()
 	n, err := c.r.Read(p)
 	c.n += int64(n)
+	if err != nil && n == 0 {
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			if !c.tooSlowFlag {
+				c.tooSlowFlag = true
+				if c.onSlow != nil {
+					c.onSlow()
+				}
+			}
+			return 0, errSlowBody
+		}
+	}
 	return n, err
 }
 
-func (c *countingReadCloser) Close() error { return c.r.Close() }
+// Close clears the read deadline before closing, because the deadline belongs to
+// the connection rather than to this request. net/http also resets it when it
+// starts reading the next request, so this is not what keeps keep-alive working;
+// it is here so the wrapper does not leave state behind that only someone else's
+// cleanup makes safe.
+func (c *countingReadCloser) Close() error {
+	if c.stall > 0 && c.setReadDeadline != nil {
+		_ = c.setReadDeadline(time.Time{})
+	}
+	return c.r.Close()
+}
 
 // overLimit reports whether the cap was hit, so the router can answer 413 even
 // when the handler swallowed the read error.

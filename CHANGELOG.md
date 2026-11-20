@@ -29,6 +29,18 @@
 - **`/_metrics` 认证**：新增 `-metrics-token`（或环境变量 `SVNGOD_METRICS_TOKEN`）。
 - **请求体总大小上限** `-max-body-bytes`（默认 1 TiB，`0` = 默认，`-1` = 不限）：
   超限返回 `413`。这是全局兜底——各 endpoint 原有的更严格限额不变。
+- **请求体最低吞吐** `--min-body-rate`（默认 0 = 关闭）、`--body-rate-grace`（默认 30s）、
+  `--body-stall-timeout`（默认 2m，`-1s` = 关闭）。大小上限管不住**时间**：每秒发 1 字节的
+  客户端永远合法规、却能长期占用连接、goroutine 与上传槽位。静默客户端（完全不发数据）由
+  读 deadline 切断，拖沓客户端由平均速度发现，两者都回 `408` 而非 `413`。
+  同一组字段也可写在配置文件的 `min-body-rate` / `body-rate-grace` / `body-stall-timeout`。
+- **配置文件的 `temp-dir`**：`-temp-dir` 此前只是 flag，而 `--config` 是文档推荐的生产部署方式
+  （systemd unit、容器 entrypoint 都用它）——最需要把临时文件移出 `/tmp` 的部署形态反而设不了。
+  现在 JSON 顶层 `temp-dir` 生效，与 flag 语义一致（创建 + 真实写入探针）。
+- **部署产物**：`deploy/systemd/svngod.service`（含 `TimeoutStopSec=45` 以覆盖 30s 排空、
+  `LimitNOFILE`、`ProtectSystem=strict` + `ReadWritePaths`）与 `deploy/docker/Dockerfile`
+  （多阶段构建，distroless static 运行层，非 root）。配套 `.dockerignore` 防止把 `.git`、
+  本地二进制带进构建上下文。
 - **LICENSE**（Apache-2.0）与 **NOTICE**（三方依赖许可）。
 
 ### 修复
@@ -94,6 +106,10 @@
   后台任务用 `goSafe`、后台长循环用 `recoverLoop`（单轮 panic 不影响下一轮）。
 - **批次失败不再谎报修订号**：`CommitBatch` 在发布前失败时不再返回修订号。
 - **`load` 中断报出停止位置**，而非笼统的"已放弃"。
+- **慢客户端不在读 deadline 上留下残骸**：`countingReadCloser` 在每个成功读之后推进读
+  deadline，并在 `Close` 时清掉。`statusWriter` 原先没有 `Unwrap()`，`http.ResponseController`
+  穿不透它，`SetReadDeadline` 静默返回 `ErrNotSupported`——即读 deadline 看起来装上了、实际
+  完全没生效。这是实测真实连接后才发现的：内存 recorder 没有连接，只有真 socket 能暴露。
 
 ### 变更
 
@@ -170,6 +186,23 @@ scrape_configs:
 
 需要收紧可设小值（如 `-max-body-bytes 104857600` 限制 100 MiB）；要关闭用 `-1`。
 超限返回 `413`——如果客户端报这个，说明请求体确实比配置大。
+
+### 4b. 请求体静默超时（**默认开启，2 分钟**）
+
+`body-stall-timeout` 默认 `2m`：一次读 body 连续 2 分钟没有任何字节到达，连接会被切断并返回 `408`。
+它针对的是**已经不再发数据的客户端**（拔网线、进程被冻、NAT 表项过期），正常客户端不会触发——
+客户端在发送前的停顿（计算哈希、读盘）不表现在这种形式上，因为那时请求通常还没开始发 body。
+
+以下部署需要显式放宽或关闭：
+
+- 客户端位于会长时间缓冲的代理之后，且代理先完成握手再慢慢取数据；
+- 用 `svn` 直接传**单个超大文件**且链路极慢的站点——注意这里计的是**两次读之间**的间隔，
+  不是总耗时，所以只要数据在流动就不受影响。
+
+关闭用 `"body-stall-timeout": "-1s"`（配置文件）或 `-body-stall-timeout -1s`（flag）。
+
+`min-body-rate` 默认**关闭**，不会影响任何现有部署。要开启请先实测正常提交的平均速度
+（见《配置与多实例部署》8.3），取明显低于实测最低值的数；开启后超限同样回 `408`。
 
 ### 5. 格式兼容：**不要降级**
 

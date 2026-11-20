@@ -1,0 +1,16 @@
+# Keep the build context to what the image actually compiles. Without this,
+# COPY . . pulls in .git (the whole history), local binaries and test scratch,
+# which slows every build and can leak a developer's tree into the builder layer.
+
+.git
+.gitignore
+bin/
+.bin/
+_shots
+*.log
+# Local build outputs (mirrors .gitignore); they would shadow nothing but bloat
+# the context with stale architectures.
+/svngod
+/svnadmin
+/svngocli
+deltatest/

@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // Mirror transfers buffer a whole object through os.CreateTemp so a standby can
@@ -94,4 +97,67 @@ func TestApplyTempDirEmptyIsNoop(t *testing.T) {
 // proves the code path, not just os.TempDir().
 func createTempForTest() (*os.File, error) {
 	return os.CreateTemp("", "svngod-body-"+itoa(os.Getpid())+"-")
+}
+
+// TestConfigTempDirIsAppliedOnStartup covers the deployment path, not the flag.
+//
+// The documented production setup is `svngod --config ...` (the systemd unit and
+// the container entrypoint both use it), and -temp-dir is a flag - so before this
+// was wired up, the one deployment shape that most needs temp files off /tmp
+// could not set them at all.
+//
+// The check is the directory itself: applyTempDir creates and write-probes it,
+// so a directory that appears at the configured path proves the config value
+// reached it. That is stronger than asserting a parsed struct field, which would
+// pass even if nothing ever called applyTempDir.
+func TestConfigTempDirIsAppliedOnStartup(t *testing.T) {
+	if os.Getenv("SVNGOD_TEST_TEMPDIR_CHILD") == "1" {
+		// Child: behave as the real entrypoint and never return on success.
+		args := os.Args[len(os.Args)-1:]
+		runMultiRepo(args[0], 16, 2, "", "", "", false)
+		return
+	}
+
+	dir := t.TempDir()
+	tempDir := filepath.Join(dir, "t", "nested") // must be created, not just used
+	repoRoot := filepath.Join(dir, "repos")
+	if err := os.MkdirAll(repoRoot, 0o700); err != nil {
+		t.Fatalf("mkdir repos: %v", err)
+	}
+	cfgPath := filepath.Join(dir, "svngod.json")
+	// addr on port 0: the test does not care where it listens, only that startup
+	// gets far enough to apply the temp dir.
+	content := `{"addr":"127.0.0.1:0","base-path":"/svn","temp-dir":"` + tempDir + `","repos":[{"name":"demo","storage":{"type":"file","root":"` + repoRoot + `"}}]}`
+	if err := os.WriteFile(cfgPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("executable: %v", err)
+	}
+	cmd := exec.Command(exe, "-test.run=TestConfigTempDirIsAppliedOnStartup", "--", cfgPath)
+	cmd.Env = append(os.Environ(), "SVNGOD_TEST_TEMPDIR_CHILD=1")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start child: %v", err)
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	}()
+
+	// applyTempDir runs during startup, before the listener; poll briefly for it.
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if fi, err := os.Stat(tempDir); err == nil && fi.IsDir() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("configured temp-dir %q was never created; startup output:\n%s", tempDir, out.String())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }

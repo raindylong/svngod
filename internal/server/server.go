@@ -31,6 +31,17 @@ import (
 // while still refusing an unbounded body.
 const defaultMaxBodyBytes int64 = 1 << 40 // 1 TiB, matching the bundle stream limit
 
+// defaultBodyRateGrace is how long a body may run before its average speed is
+// judged. It has to cover connection setup, a TLS handshake and the client's
+// first disk read; a proxy that opens the connection early makes that longer
+// than it looks.
+const defaultBodyRateGrace = 30 * time.Second
+
+// defaultBodyStallTimeout is the longest a body read may block with no bytes
+// arriving. It is deliberately generous: a client pausing to hash a 2 GB file
+// before sending it is normal, a client that has silently gone away is not.
+const defaultBodyStallTimeout = 2 * time.Minute
+
 // RepoOpener opens (and caches) a repository by name.
 type RepoOpener func(name string) (*fs.Repo, error)
 
@@ -82,6 +93,22 @@ type Config struct {
 	// Content-Length understated it was never compared against anything. 0 uses
 	// defaultMaxBodyBytes; a negative value disables the cap.
 	MaxBodyBytes int64
+
+	// MinBodyRate is the floor for a request body's average speed in bytes per
+	// second. A size cap bounds how much a client may send but not how long it
+	// may take; without a floor a trickling client holds its connection,
+	// goroutine and upload slot indefinitely. 0 disables the check.
+	MinBodyRate int64
+
+	// BodyRateGrace is how long a body may run before its average is judged.
+	// 0 uses defaultBodyRateGrace.
+	BodyRateGrace time.Duration
+
+	// BodyStallTimeout is how long a single body read may block with no bytes
+	// arriving. This catches the client that sends nothing at all, which no
+	// average can detect because the counter never moves. 0 uses
+	// defaultBodyStallTimeout; a negative value disables the deadline.
+	BodyStallTimeout time.Duration
 
 	// AuthFailureBurst is how many failed authentications from one source
 	// address, or against one username, are allowed per AuthFailureWindow before
@@ -435,6 +462,12 @@ type statusWriter struct {
 // response cannot be turned into an error, so a recovering handler must not try.
 func (s *statusWriter) committed() bool { return s.code != 0 || s.n != 0 }
 
+// Unwrap exposes the wrapped writer so http.ResponseController can reach the
+// connection beneath it. Without this, SetReadDeadline resolves to nothing and
+// fails with ErrNotSupported - silently, since a request body that never ends
+// looks exactly like a slow one.
+func (s *statusWriter) Unwrap() http.ResponseWriter { return s.ResponseWriter }
+
 func (s *statusWriter) WriteHeader(code int) {
 	if s.suppressed {
 		return
@@ -477,11 +510,27 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	if r.Body != nil {
 		// One cap for every path. It is applied where the bytes are already
 		// counted rather than in each handler, so a new endpoint inherits it.
-		cr = &countingReadCloser{r: r.Body, limit: s.maxBodyBytes()}
+		cr = &countingReadCloser{
+			r:       r.Body,
+			limit:   s.maxBodyBytes(),
+			minRate: s.minBodyRate(),
+			grace:   s.bodyRateGrace(),
+			stall:   s.bodyStallTimeout(),
+		}
+		// The stall window is enforced through the connection, so a Read that
+		// would block forever is interrupted. ResponseController reaches the
+		// Connection: a plain http.ResponseWriter in a test has none, and the
+		// setter reports that, which armStall ignores.
+		rc := http.NewResponseController(w)
+		cr.setReadDeadline = rc.SetReadDeadline
 		// Fires while the handler is reading: suppress whatever it writes for
 		// the read error so the router can answer 413 instead of the handler's
 		// guess at what a short read means.
 		cr.onOver = func() { sw.suppressed = true }
+		// A slow body gets the same treatment for the same reason: the handler
+		// will map the read error to its own status, and the real cause is the
+		// rate, not whatever the handler guessed.
+		cr.onSlow = func() { sw.suppressed = true }
 		r.Body = cr
 	}
 	// user is set after authentication and used by both the panic report and the
@@ -532,6 +581,13 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 			sw.suppressed = false
 			sw.code = 0
 			http.Error(sw, "request body too large", http.StatusRequestEntityTooLarge)
+		} else if cr != nil && cr.tooSlow() {
+			// Same shape, different cause and different status: the body was a
+			// legal size, it just arrived too slowly. Answering 413 here would
+			// send operators after the size cap.
+			sw.suppressed = false
+			sw.code = 0
+			http.Error(sw, "request body too slow", http.StatusRequestTimeout)
 		}
 		if s.cfg.Logger != nil {
 			s.cfg.Logger.Printf("HTTP %d %s %s user=%q %v", sw.code, r.Method, r.URL.Path, user, time.Since(start).Round(time.Microsecond))
@@ -804,6 +860,37 @@ func (s *Server) maxBodyBytes() int64 {
 		return 0
 	}
 	return s.cfg.MaxBodyBytes
+}
+
+// minBodyRate resolves the body rate floor. 0 means disabled.
+func (s *Server) minBodyRate() int64 {
+	if s.cfg.MinBodyRate < 0 {
+		return 0
+	}
+	return s.cfg.MinBodyRate
+}
+
+// bodyRateGrace resolves the window before the rate floor is judged.
+func (s *Server) bodyRateGrace() time.Duration {
+	if s.cfg.BodyRateGrace == 0 {
+		return defaultBodyRateGrace
+	}
+	if s.cfg.BodyRateGrace < 0 {
+		return 0
+	}
+	return s.cfg.BodyRateGrace
+}
+
+// bodyStallTimeout resolves the per-read stall deadline. A negative configured
+// value disables it.
+func (s *Server) bodyStallTimeout() time.Duration {
+	if s.cfg.BodyStallTimeout < 0 {
+		return 0
+	}
+	if s.cfg.BodyStallTimeout == 0 {
+		return defaultBodyStallTimeout
+	}
+	return s.cfg.BodyStallTimeout
 }
 
 func (s *Server) unauthorizedMetrics(w http.ResponseWriter) {
