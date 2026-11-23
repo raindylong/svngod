@@ -94,7 +94,7 @@ func (s *Server) handlePostMe(w http.ResponseWriter, r *http.Request) {
 	case "update-report":
 		// HTTPv2 sends the update report as POST to the session URL. The
 		// v1 REPORT implementation already parses this exact body.
-		s.reportUpdate(w, repo, s.absURL(r, name, "/"), name, body)
+		s.reportUpdate(w, r, repo, s.absURL(r, name, "/"), name, body)
 	default:
 		http.Error(w, "unsupported POST: "+root.XMLName.Local, http.StatusNotImplemented)
 	}
@@ -147,7 +147,7 @@ func (s *Server) postMeSkel(w http.ResponseWriter, r *http.Request, repo *fs.Rep
 		}
 		s.commitV2Txn(w, r, name, txnName)
 	case "update-report":
-		s.reportUpdate(w, repo, s.absURL(r, name, "/"), name, body)
+		s.reportUpdate(w, r, repo, s.absURL(r, name, "/"), name, body)
 	default:
 		http.Error(w, "unsupported POST: "+cmd, http.StatusNotImplemented)
 	}

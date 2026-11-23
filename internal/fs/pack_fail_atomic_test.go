@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,14 +26,19 @@ type packFailStore struct {
 	// single injected failure lands on one of them and a retry that reaches a
 	// different key would succeed - the test would then pass without the retry
 	// logic existing at all.
-	failPackUntilCleared bool
+	// Both fields are accessed from the server's background pack-retry
+	// goroutine as well as from the test goroutine, so they must be atomic.
+	// Plain bools here were a real data race - caught by `-race` in CI, not by
+	// the assertions, because the assertions only look at the values and the
+	// race is between the writes themselves.
+	failPackUntilCleared atomic.Bool
 	// sawPackWrite records that the injected path was reached.
-	sawPackWrite bool
+	sawPackWrite atomic.Bool
 }
 
 func (s *packFailStore) Put(ctx context.Context, key string, data []byte) error {
-	if s.failPackUntilCleared && isPackKey(key) {
-		s.sawPackWrite = true
+	if s.failPackUntilCleared.Load() && isPackKey(key) {
+		s.sawPackWrite.Store(true)
 		return errors.New("injected: backend write failed during pack")
 	}
 	return s.Store.Put(ctx, key, data)
@@ -65,18 +71,18 @@ func TestCommitReportedFailureMustNotHavePublished(t *testing.T) {
 
 	// Fail the pack writes of the next commit only. Cleared right after so the
 	// background retry (if any) can succeed and does not keep the store failing.
-	st.failPackUntilCleared = true
+	st.failPackUntilCleared.Store(true)
 
 	rev, err := repo.CommitTxn(1, []Change{
 		{Path: "/b.txt", Action: ActionAdd, Kind: KindFile, Data: []byte("2")},
 	}, map[string]string{"svn:log": "two"})
 
-	st.failPackUntilCleared = false
+	st.failPackUntilCleared.Store(false)
 
 	// The injection must actually have fired, or the test proves nothing about
 	// pack failures: a fault that never reaches the pack path would make the
 	// "reported success" branch trivially true.
-	if !st.sawPackWrite {
+	if !st.sawPackWrite.Load() {
 		t.Fatal("the injected pack failure never fired; the test did not exercise the pack path")
 	}
 
@@ -122,14 +128,14 @@ func TestFailedPackIsRetriedInBackground(t *testing.T) {
 	// and is the one that fails. Asserting on shard 0 would check a shard that
 	// was already packed by the seed commit - the test would pass without any
 	// retry existing.
-	st.failPackUntilCleared = true
+	st.failPackUntilCleared.Store(true)
 	if _, err := repo.CommitTxn(1, []Change{
 		{Path: "/b.txt", Action: ActionAdd, Kind: KindFile, Data: []byte("2")},
 	}, map[string]string{"svn:log": "two"}); err != nil {
 		// The commit itself must succeed; pack failure is not a commit failure.
 		t.Fatalf("commit failed although only the post-CAS pack was injected: %v", err)
 	}
-	if !st.sawPackWrite {
+	if !st.sawPackWrite.Load() {
 		t.Fatal("the injected pack failure never fired")
 	}
 	// Confirm the shard really is unpacked at this point, so the assertion below
@@ -139,7 +145,7 @@ func TestFailedPackIsRetriedInBackground(t *testing.T) {
 	}
 
 	// Let the retry succeed.
-	st.failPackUntilCleared = false
+	st.failPackUntilCleared.Store(false)
 
 	deadline := time.Now().Add(15 * time.Second)
 	for {
@@ -171,13 +177,13 @@ func TestAbandonedPackLeavesRepositoryReadable(t *testing.T) {
 	}, map[string]string{"svn:log": "one"}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	st.failPackUntilCleared = true // every pack attempt fails
+	st.failPackUntilCleared.Store(true) // every pack attempt fails
 	if _, err := repo.CommitTxn(1, []Change{
 		{Path: "/b.txt", Action: ActionAdd, Kind: KindFile, Data: []byte("beta")},
 	}, map[string]string{"svn:log": "two"}); err != nil {
 		t.Fatalf("commit must succeed even though its pack will fail: %v", err)
 	}
-	st.failPackUntilCleared = false
+	st.failPackUntilCleared.Store(false)
 
 	// Both revisions must read back intact from their loose objects.
 	for _, tc := range []struct {

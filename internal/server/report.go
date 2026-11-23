@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"svngod/internal/authz"
 	"svngod/internal/fs"
 	"svngod/internal/svndiff"
 )
@@ -55,9 +56,19 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request, res resour
 		return
 	}
 	base := s.absURL(r, res.repo, "/")
+	// REPORT bodies name their own targets: <S:path> (log/file-revs/mergeinfo/
+	// locks), <S:src-path> and <S:dst-path> (update). The request URL may carry
+	// no path at all (/!svn/me), in which case `authorized()` only checked "/",
+	// so every one of those targets was reachable by anyone allowed to read the
+	// repository root. Authorize each named path here, before any handler can
+	// read it, and before it can appear in the response.
+	if !s.authorizeReportTargets(r, res, root, base) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
 	switch root.XMLName.Local {
 	case "update-report":
-		s.reportUpdate(w, repo, base, res.repo, body)
+		s.reportUpdate(w, r, repo, base, res.repo, body)
 	case "log-report":
 		s.reportLog(w, repo, res.path, body)
 	case "list-report":
@@ -75,6 +86,56 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request, res resour
 	default:
 		http.Error(w, "unsupported REPORT: "+root.XMLName.Local, http.StatusBadRequest)
 	}
+}
+
+// authorizeReportTargets checks every path a REPORT body names against authz.
+//
+// REPORT is dispatched on the request body, and the URL it arrives on often
+// carries no path at all: svn v2 posts reports to /!svn/me, which parseResource
+// turns into resMe with an empty path. `authorized()` therefore evaluated "/"
+// and let the request through, after which the handler read whatever path the
+// body named - <S:path> for log/file-revs/mergeinfo/locks, <S:src-path> and
+// <S:dst-path> for update/switch. A user with read on "/" and no access to
+// [/private] could therefore read that subtree's file contents (get-file-revs
+// returns the text itself), its log messages, and a full checkout of it.
+//
+// Failing closed is the right default here: if a report names a path the user
+// cannot read, answer 403 rather than silently omitting it. Omitting is what
+// update-report does for individual children (see updateWalkDir), but a report
+// whose ROOT is denied has nothing legitimate left to answer.
+func (s *Server) authorizeReportTargets(r *http.Request, res resource, root xmlEl, base string) bool {
+	az := s.authzFor(res.repo)
+	if az == nil {
+		return true
+	}
+	user := IdentityFrom(r.Context()).Username
+	check := func(p string) bool {
+		if p == "" {
+			p = "/"
+		}
+		return az.Authorize(user, res.repo, p, false)
+	}
+	// <S:path>: log-report, get-file-revs, get-locations, get-mergeinfo,
+	// get-locks. The content is a repository path ("/trunk/x"), not a URL.
+	if c, ok := root.child("path"); ok {
+		if p := strings.TrimSpace(c.Content); p != "" {
+			if !check("/" + strings.Trim(p, "/")) {
+				return false
+			}
+		}
+	}
+	// <S:src-path> / <S:dst-path>: update / switch / diff-between-URLs. Both are
+	// full URLs; extractReposPath maps them to a repository path.
+	for _, tag := range []string{"src-path", "dst-path"} {
+		if c, ok := root.child(tag); ok {
+			if p, ok := extractReposPath(strings.TrimSpace(c.Content), base); ok {
+				if !check(p) {
+					return false
+				}
+			}
+		}
+	}
+	return true
 }
 
 // xmlEl is a generic XML node used to inspect REPORT request bodies.
@@ -105,7 +166,8 @@ func (e xmlEl) child(local string) (xmlEl, bool) {
 
 // --- update-report (svn checkout / update) ---
 
-func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name string, body []byte) {
+func (s *Server) reportUpdate(w http.ResponseWriter, r *http.Request, repo *fs.Repo, base, name string, body []byte) {
+	acc := s.newReportAccess(name, IdentityFrom(r.Context()).Username)
 	if os.Getenv("SVNGOD_DEBUG_REPORT") == "1" {
 		log.Printf("update-report body:\n%s", body)
 	}
@@ -211,7 +273,7 @@ func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name s
 		rp, _ := repo.GetRevProps(rev)
 		uuid, _ := repo.UUID()
 		b.WriteString("  <S:open-directory rev=\"" + strconv.FormatUint(anchorRev, 10) + "\">\n")
-		if err := s.updateWalkDir(&b, repo, base, rev, newPath, "open-directory", true, rp, uuid, walkWB, 0, limit, filesOnly, explicitDepth, copyFloorFor(repo, rev, newPath), updateTarget, oldPath, sendAll); err != nil {
+		if err := s.updateWalkDir(&b, repo, base, rev, newPath, "open-directory", true, rp, uuid, walkWB, 0, limit, filesOnly, explicitDepth, copyFloorFor(repo, rev, newPath), updateTarget, oldPath, sendAll, acc); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -233,7 +295,7 @@ func (s *Server) reportUpdate(w http.ResponseWriter, repo *fs.Repo, base, name s
 	b.WriteString("  <S:target-revision rev=\"" + strconv.FormatUint(rev, 10) + "\"/>\n")
 	rp, _ := repo.GetRevProps(rev)
 	uuid, _ := repo.UUID()
-	if err := s.updateWalkDir(&b, repo, base, rev, rootPath, "open-directory", true, rp, uuid, wb, 0, limit, filesOnly, explicitDepth, copyFloorFor(repo, rev, rootPath), "", rootPath, sendAll); err != nil {
+	if err := s.updateWalkDir(&b, repo, base, rev, rootPath, "open-directory", true, rp, uuid, wb, 0, limit, filesOnly, explicitDepth, copyFloorFor(repo, rev, rootPath), "", rootPath, sendAll, acc); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -475,7 +537,46 @@ func (w *wcBaseline) entryDepthLevel(path string) (int, bool) {
 // baseline decision comes from the client's per-path <S:entry> revisions
 // (wcBaseline), so mixed-revision WCs update correctly. Paths present in the
 // client's baseline but absent from the target are reported as delete-entry.
-func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, rev uint64, path, openEl string, wrap bool, rp *fs.RevProps, uuid string, wb *wcBaseline, level, limit int, filesOnly, explicitDepth bool, copyFloor uint64, wrapName, wcPath string, sendAll bool) error {
+// reportAccess decides which paths a REPORT may disclose. It exists because
+// update-report walks a tree and emits one element per child, so authorization
+// has to be applied per child, not once for the report root.
+//
+// A nil *reportAccess (no authz configured) allows everything, matching the
+// existing behaviour of a repository without authz rules.
+type reportAccess struct {
+	az    *authz.Config
+	repo  string
+	user  string
+	cache map[string]bool
+}
+
+// allow reports whether path may appear in the response. Results are memoized:
+// a deep checkout re-asks about the same path once per level it descends.
+func (ra *reportAccess) allow(path string) bool {
+	if ra == nil || ra.az == nil {
+		return true
+	}
+	if path == "" {
+		path = "/"
+	}
+	if v, ok := ra.cache[path]; ok {
+		return v
+	}
+	v := ra.az.Authorize(ra.user, ra.repo, path, false)
+	ra.cache[path] = v
+	return v
+}
+
+// newReportAccess builds the per-request filter; nil when authz is off.
+func (s *Server) newReportAccess(repoName, user string) *reportAccess {
+	az := s.authzFor(repoName)
+	if az == nil {
+		return nil
+	}
+	return &reportAccess{az: az, repo: repoName, user: user, cache: map[string]bool{}}
+}
+
+func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, rev uint64, path, openEl string, wrap bool, rp *fs.RevProps, uuid string, wb *wcBaseline, level, limit int, filesOnly, explicitDepth bool, copyFloor uint64, wrapName, wcPath string, sendAll bool, acc *reportAccess) error {
 	outRev := rev
 	if br, ok := wb.revFor(wcPath); ok {
 		outRev = br
@@ -527,6 +628,13 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 		}
 		cpath := joinWCPath(path, c.Name)
 		cwcPath := joinWCPath(wcPath, c.Name)
+		// Never disclose a child the user cannot read. This is the same rule
+		// propChildren applies to PROPFIND depth listings: skipping the child
+		// entirely (rather than 403-ing the whole checkout) keeps a readable
+		// parent usable while hiding the subtree.
+		if !acc.allow(cpath) {
+			continue
+		}
 		baseRev, inBase := wb.revFor(cwcPath)
 		if c.Kind == fs.KindDir {
 			// A revision inherited from an ancestor entry does not prove the
@@ -577,7 +685,7 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 				// children first and drop the whole element when nothing came
 				// out and the directory's own node and props are unchanged.
 				var sub strings.Builder
-				if err := s.updateWalkDir(&sub, repo, base, rev, cpath, "open-directory", false, rp, uuid, wb, childLevel, cl, false, explicitDepth, copyFloor, "", cwcPath, sendAll); err != nil {
+				if err := s.updateWalkDir(&sub, repo, base, rev, cpath, "open-directory", false, rp, uuid, wb, childLevel, cl, false, explicitDepth, copyFloor, "", cwcPath, sendAll, acc); err != nil {
 					return err
 				}
 				needsEmit := sub.Len() > 0 || dirRev > baseRev
@@ -618,7 +726,7 @@ func (s *Server) updateWalkDir(b *strings.Builder, repo *fs.Repo, base string, r
 					b.WriteString("    </S:add-directory>\n")
 					continue
 				}
-				if err := s.updateWalkDir(b, repo, base, rev, cpath, "add-directory", false, rp, uuid, wb, childLevel, cl, false, explicitDepth, copyFloor, "", cwcPath, sendAll); err != nil {
+				if err := s.updateWalkDir(b, repo, base, rev, cpath, "add-directory", false, rp, uuid, wb, childLevel, cl, false, explicitDepth, copyFloor, "", cwcPath, sendAll, acc); err != nil {
 					return err
 				}
 				b.WriteString("    </S:add-directory>\n")

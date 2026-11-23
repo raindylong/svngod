@@ -125,6 +125,17 @@
 - **v1 `CommitBatch` 在 CAS 竞争时报出未发布的修订号**：非自己拥有的 plan 只设了 `errs`
   而未清零 `revs`（段库路径是清零的）。`svnadmin load` 只检查 `err` 与 `rv == 0`，
   于是把从未写入的修订当成成功，恢复时静默丢历史。现已对齐段库行为。
+- **`REPORT /!svn/me` 越权读取被拒绝的子树（严重）**：REPORT 由请求 body 决定动作，
+  而 `/!svn/me` 的 URL 不带路径，`authorized()` 只校验了 `/`。于是 body 里 `<S:path>` /
+  `<S:src-path>` / `<S:dst-path>` 指向的路径从未被检查：
+  - `get-file-revs` 直接返回文件**内容**（`<S:txdelta>` 解出 `TOP SECRET`）；
+  - `log-report` 泄露路径名、作者、提交说明；
+  - `update-report` 可整棵检出被拒绝的子树；
+  - `get-locations` / `get-mergeinfo` / `get-locks` 同样可达。
+  修复两层：分发前统一校验 body 里所有命名路径（不通过即 403），并给 `updateWalkDir`
+  加逐子节点过滤（根可读时不再列出不可读子树，与 `propChildren` 的既有规则一致）。
+  实测：直接读 403，`/!svn/me` 打 private 也 403；真实 `svn log`/`svn co` 正常，
+  checkout 只拿到可读的 `public`。
 - **hook 继承服务进程的完整环境（凭据泄露）**：`cmd.Env = os.Environ()` 让每个 hook
   都能读到 `SVNGOD_ADMIN_TOKEN`、`SVNGOD_METRICS_TOKEN`、`AWS_*` 等。管理 token 按推荐
   放在 systemd 的 `EnvironmentFile` 里，而 hook 通常是仓库团队写的、常包一层第三方脚本，
