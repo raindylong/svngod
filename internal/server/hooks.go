@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -54,10 +54,7 @@ func runHookArgs(dir, name string, args []string, env map[string]string, stdin [
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, path, args...)
-	cmd.Env = os.Environ()
-	for k, v := range env {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
+	cmd.Env = hookEnv(env)
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
@@ -77,4 +74,40 @@ func runHookArgs(dir, name string, args []string, env map[string]string, stdin [
 	return nil
 }
 
-var _ = fmt.Sprintf
+// hookEnv builds the environment a hook runs with: the documented SVN_*
+// variables plus a minimal PATH, and nothing else.
+//
+// Hooks used to inherit os.Environ(), which handed every operator secret to
+// them - SVNGOD_ADMIN_TOKEN and SVNGOD_METRICS_TOKEN (the systemd unit puts
+// those in an EnvironmentFile precisely because the environment is where they
+// live), and AWS_*/RUSTFS_* when the S3 client uses environment credentials.
+// Hooks are usually written by repository teams and often wrap third-party
+// scripts, so "trusted because the operator installed it" is not a safe
+// assumption for credentials that grant control of the whole server.
+//
+// PATH is inherited deliberately: hooks are shell scripts and need to resolve
+// sh, grep, awk. An empty PATH breaks every existing hook, which would be a
+// worse regression than the leak. Nothing else is inherited - a hook's
+// behaviour now depends only on its arguments and the SVN_* contract, not on
+// how the server happened to be launched.
+func hookEnv(env map[string]string) []string {
+	path := os.Getenv("PATH")
+	if path == "" {
+		// A PATH-less environment is broken for scripts; fall back to the
+		// directories a hook realistically needs rather than leaving it unset.
+		path = "/usr/local/bin:/usr/bin:/bin"
+	}
+	// Sorted and explicit: map iteration order is random, and an environment
+	// that reorders between runs makes hook behaviour harder to reproduce.
+	out := make([]string, 0, len(env)+1)
+	out = append(out, "PATH="+path)
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		out = append(out, k+"="+env[k])
+	}
+	return out
+}

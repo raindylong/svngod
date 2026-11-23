@@ -125,6 +125,14 @@
 - **v1 `CommitBatch` 在 CAS 竞争时报出未发布的修订号**：非自己拥有的 plan 只设了 `errs`
   而未清零 `revs`（段库路径是清零的）。`svnadmin load` 只检查 `err` 与 `rv == 0`，
   于是把从未写入的修订当成成功，恢复时静默丢历史。现已对齐段库行为。
+- **hook 继承服务进程的完整环境（凭据泄露）**：`cmd.Env = os.Environ()` 让每个 hook
+  都能读到 `SVNGOD_ADMIN_TOKEN`、`SVNGOD_METRICS_TOKEN`、`AWS_*` 等。管理 token 按推荐
+  放在 systemd 的 `EnvironmentFile` 里，而 hook 通常是仓库团队写的、常包一层第三方脚本，
+  "运维装的所以可信"不能覆盖"它不该拿到整个服务器的控制权"。现在只透传文档化的 `SVN_*`
+  与 `PATH`（未设置时回退 `/usr/local/bin:/usr/bin:/bin`），且顺序固定。
+  连带效果：hook 行为不再随服务启动方式变化。
+  **升级注意**：hook 里若依赖 `HOME`/`LANG`/`TZ` 等继承变量会失效，需在脚本内自行设置；
+  契约见《配置与多实例部署》§7.1。
 - **慢客户端不在读 deadline 上留下残骸**：`countingReadCloser` 在每个成功读之后推进读
   deadline，并在 `Close` 时清掉。`statusWriter` 原先没有 `Unwrap()`，`http.ResponseController`
   穿不透它，`SetReadDeadline` 静默返回 `ErrNotSupported`——即读 deadline 看起来装上了、实际
