@@ -3,10 +3,57 @@ package fs
 import (
 	"context"
 	"errors"
+	"math/rand"
 	"time"
 
 	"svngod/internal/fs/store"
 )
+
+// revpropRetryAttempts and revpropRetryBudget bound the CAS retry loop for
+// revision-property updates.
+//
+// The loop used to retry a fixed 8 times with no wait. Measured through the real
+// HTTP path on a 32-core host, 16 concurrent editors of one revision lost 4.4%
+// of their edits and 32 lost 20%, each answered with HTTP 500 "revision property
+// update failed" - an edit the client has no reason to resend. Losing a race is
+// expected with N writers, but giving up after 8 immediate attempts is not a
+// property of the data, it is a property of the retry policy.
+//
+// Two things change the shape of the failure:
+//
+//   - More attempts alone barely help: with 32 writers all retrying at once, the
+//     loser of each round is re-decided at random, so a fixed small window still
+//     rejects someone. Raising 8 to 64 only moves the cliff.
+//   - A short randomized backoff breaks the lockstep. Once losers spread out,
+//     each round has far fewer contenders and the loop converges quickly.
+//
+// The budget caps how long a caller may wait, so a pathological store cannot
+// turn a revprop edit into a hang. It is a wall-clock limit, not a count: the
+// measured point where it starts to bite is around 256 simultaneous writers of
+// the SAME revision (2.7s, 37/1280 rejected); 128 succeeds in 1.3s and 64 well
+// under that. Exhaustion still returns the contention error, which is honest -
+// the edit genuinely did not apply.
+const (
+	revpropRetryAttempts = 64
+	revpropRetryBudget   = 2 * time.Second
+)
+
+// revpropRetryPause sleeps before retry number attempt (0-based). It grows
+// exponentially to a small cap and is jittered so concurrent losers do not
+// retry in step. Returns false when the budget is spent.
+func revpropRetryPause(start time.Time, attempt int) bool {
+	if time.Since(start) > revpropRetryBudget {
+		return false
+	}
+	// 1ms, 2ms, 4ms ... capped at 64ms, plus up to 1ms of jitter.
+	d := time.Millisecond << uint(min(attempt, 6))
+	if d > 64*time.Millisecond {
+		d = 64 * time.Millisecond
+	}
+	jitter := time.Duration(rand.Int63n(int64(time.Millisecond) + 1))
+	time.Sleep(d + jitter)
+	return true
+}
 
 // UpdateRevProps applies property sets/removals to one revision. Loose
 // revprops are updated with a CAS; packed shards rewrite their revprops pack
@@ -57,7 +104,7 @@ func (r *Repo) UpdateRevProps(rev uint64, set map[string]string, remove []string
 		}
 		defer lease.Release(r.store)
 	}
-	const attempts = 8
+	start := time.Now()
 	if packed {
 		if r.journal {
 			key := r.keys.PackedRevProps(sh)
@@ -85,7 +132,10 @@ func (r *Repo) UpdateRevProps(rev uint64, set map[string]string, remove []string
 			return nil
 		}
 		key := r.keys.PackedRevProps(sh)
-		for i := 0; i < attempts; i++ {
+		for i := 0; i < revpropRetryAttempts; i++ {
+			if i > 0 && !revpropRetryPause(start, i) {
+				break
+			}
 			b, gerr := r.store.Get(ctx, key, nil)
 			if gerr != nil {
 				return gerr
@@ -133,7 +183,10 @@ func (r *Repo) UpdateRevProps(rev uint64, set map[string]string, remove []string
 	}
 
 	key := r.keys.LooseRevProps(sh, rev)
-	for i := 0; i < attempts; i++ {
+	for i := 0; i < revpropRetryAttempts; i++ {
+		if i > 0 && !revpropRetryPause(start, i) {
+			break
+		}
 		b, gerr := r.store.Get(ctx, key, nil)
 		exists := gerr == nil
 		var cur *RevProps

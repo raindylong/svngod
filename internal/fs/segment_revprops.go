@@ -140,8 +140,11 @@ func (r *Repo) updateSegRevProps(rev uint64, set map[string]string, remove []str
 		}
 		return out
 	}
-	const attempts = 8
-	for i := 0; i < attempts; i++ {
+	start := time.Now()
+	for i := 0; i < revpropRetryAttempts; i++ {
+		if i > 0 && !revpropRetryPause(start, i) {
+			break
+		}
 		raw, exists, err := r.loadSegRevPropsRaw(ctx, sh, rev)
 		if err != nil {
 			return err
